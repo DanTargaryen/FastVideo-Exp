@@ -73,6 +73,7 @@ class ComponentLoader(ABC):
             "scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
             "transformer_2": (TransformerLoader, "diffusers"),
+            "controlnet": (ControlNetLoader, "diffusers"),
             "vae": (VAELoader, "diffusers"),
             "text_encoder": (TextEncoderLoader, "transformers"),
             "text_encoder_2": (TextEncoderLoader, "transformers"),
@@ -505,6 +506,68 @@ class TransformerLoader(ComponentLoader):
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         assert next(model.parameters()).dtype == default_dtype, "Model dtype does not match default dtype"
+
+        model = model.eval()
+        return model
+
+
+class ControlNetLoader(ComponentLoader):
+    """Loader for ControlNet-like DiT components (diffusers-format)."""
+
+    def load(self, model_path: str, fastvideo_args: FastVideoArgs):
+        config = get_diffusers_config(model=model_path)
+        hf_config = deepcopy(config)
+        cls_name = config.pop("_class_name")
+        if cls_name is None:
+            raise ValueError(
+                "Model config does not contain a _class_name attribute. "
+                "Only diffusers format is supported.")
+
+        logger.info("controlnet cls_name: %s", cls_name)
+        fastvideo_args.model_paths["controlnet"] = model_path
+
+        # Important: do NOT mutate pipeline_config.dit_config in-place (ControlNet arch differs).
+        controlnet_config = deepcopy(fastvideo_args.pipeline_config.dit_config)
+        # Diffusers ControlNet configs often contain extra keys that are not part of WanVideoArchConfig.
+        # FastVideo's ModelConfig.update_model_arch is strict, so filter to supported arch fields.
+        from dataclasses import fields
+        valid_fields = {f.name for f in fields(controlnet_config.arch_config)}
+        filtered = {k: v for k, v in config.items() if k in valid_fields}
+        ignored = sorted([k for k in config.keys() if k not in valid_fields])
+        if ignored:
+            logger.info("Ignoring %d unsupported ControlNet config keys (e.g. %s)",
+                        len(ignored), ignored[:5])
+        controlnet_config.update_model_arch(filtered)
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+
+        safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {model_path}")
+
+        default_dtype = PRECISION_TO_TYPE[
+            fastvideo_args.pipeline_config.dit_precision] if fastvideo_args.pipeline_config.dit_precision else torch.bfloat16
+
+        model = maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params={
+                "config": controlnet_config,
+                "hf_config": hf_config
+            },
+            weight_dir_list=safetensors_list,
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
+            hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
+            cpu_offload=fastvideo_args.dit_cpu_offload,
+            pin_cpu_memory=fastvideo_args.pin_cpu_memory,
+            fsdp_inference=fastvideo_args.use_fsdp_inference,
+            default_dtype=default_dtype,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=None,
+            training_mode=fastvideo_args.training_mode,
+            enable_torch_compile=fastvideo_args.enable_torch_compile,
+            torch_compile_kwargs=fastvideo_args.torch_compile_kwargs)
 
         model = model.eval()
         return model

@@ -445,6 +445,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                 current_start: int = 0,
                 cache_start: int = 0,
                 start_frame: int = 0,
+                block_controlnet_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
                 **kwargs) -> torch.Tensor:
         r"""
         Run the diffusion model with kv caching.
@@ -509,6 +510,11 @@ class CausalWanTransformer3DModel(BaseDiT):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
+        control_interval = None
+        if block_controlnet_hidden_states is not None and len(
+                block_controlnet_hidden_states) > 0:
+            control_interval = len(self.blocks) / float(
+                len(block_controlnet_hidden_states))
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 causal_kwargs = {
@@ -532,6 +538,12 @@ class CausalWanTransformer3DModel(BaseDiT):
                 hidden_states = block(hidden_states, encoder_hidden_states,
                                         timestep_proj, freqs_cis,
                                         **causal_kwargs)
+            if control_interval is not None:
+                control_index = int(block_index / control_interval)
+                control_index = min(control_index,
+                                    len(block_controlnet_hidden_states) - 1)
+                hidden_states = hidden_states + block_controlnet_hidden_states[
+                    control_index].to(hidden_states.dtype)
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
@@ -551,6 +563,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                 encoder_hidden_states_image: torch.Tensor | list[torch.Tensor]
                 | None = None,
                 start_frame: int = 0,
+                block_controlnet_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
                 **kwargs) -> torch.Tensor:
 
         orig_dtype = hidden_states.dtype
@@ -618,17 +631,36 @@ class CausalWanTransformer3DModel(BaseDiT):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
+        control_interval = None
+        if block_controlnet_hidden_states is not None and len(
+                block_controlnet_hidden_states) > 0:
+            control_interval = len(self.blocks) / float(
+                len(block_controlnet_hidden_states))
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states,
                     timestep_proj, freqs_cis,
                     block_mask=self.block_mask)
+                if control_interval is not None:
+                    control_index = int(block_index / control_interval)
+                    control_index = min(
+                        control_index,
+                        len(block_controlnet_hidden_states) - 1)
+                    hidden_states = hidden_states + block_controlnet_hidden_states[
+                        control_index].to(hidden_states.dtype)
         else:
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
                 hidden_states = block(hidden_states, encoder_hidden_states,
                                         timestep_proj, freqs_cis,
                                         block_mask=self.block_mask)
+                if control_interval is not None:
+                    control_index = int(block_index / control_interval)
+                    control_index = min(
+                        control_index,
+                        len(block_controlnet_hidden_states) - 1)
+                    hidden_states = hidden_states + block_controlnet_hidden_states[
+                        control_index].to(hidden_states.dtype)
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

@@ -725,6 +725,10 @@ class TrainingArgs(FastVideoArgs):
     # DMD model paths - separate paths for each network
     real_score_model_path: str = ""  # path for real score (teacher) model
     fake_score_model_path: str = ""  # path for fake score (critic) model
+    # Optional ControlNet paths (diffusers-format component dirs)
+    controlnet_model_path: str = ""  # student/generator controlnet
+    real_score_controlnet_model_path: str = ""  # teacher controlnet (frozen)
+    fake_score_controlnet_model_path: str = ""  # critic controlnet
 
     # diffusion setting
     ema_decay: float = 0.0
@@ -936,6 +940,18 @@ class TrainingArgs(FastVideoArgs):
             "--fake-score-model-path",
             type=str,
             help="Path to fake score (critic) model for DMD distillation")
+        parser.add_argument(
+            "--controlnet-model-path",
+            type=str,
+            help="Path to ControlNet (student/generator) model (diffusers component dir)")
+        parser.add_argument(
+            "--real-score-controlnet-model-path",
+            type=str,
+            help="Path to real score (teacher) ControlNet model (diffusers component dir)")
+        parser.add_argument(
+            "--fake-score-controlnet-model-path",
+            type=str,
+            help="Path to fake score (critic) ControlNet model (diffusers component dir)")
 
         # Diffusion settings
         parser.add_argument("--ema-decay",

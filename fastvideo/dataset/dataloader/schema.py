@@ -81,6 +81,42 @@ pyarrow_schema_t2v = pa.schema([
 ])
 
 
+# TI2V + ControlNet (48ch control latent) schema.
+# Intended for self-forcing distillation where we may not store ground-truth video latents
+# (use `--simulate_generator_forward`), but we still need:
+# - prompt text embeddings
+# - first frame latent (TI2V conditioning)
+# - control latent (depth + masked_rgb + mask), already VAE-encoded and concatenated on channel dim
+pyarrow_schema_ti2v_controlnet = pa.schema([
+    pa.field("id", pa.string()),
+    # --- Text encoder output ---
+    pa.field("text_embedding_bytes", pa.binary()),
+    pa.field("text_embedding_shape", pa.list_(pa.int64())),
+    pa.field("text_embedding_dtype", pa.string()),
+    # --- Optional video VAE latents (can be empty when simulate_generator_forward=True) ---
+    pa.field("vae_latent_bytes", pa.binary()),
+    pa.field("vae_latent_shape", pa.list_(pa.int64())),
+    pa.field("vae_latent_dtype", pa.string()),
+    # --- TI2V: first frame latent ---
+    pa.field("first_frame_latent_bytes", pa.binary()),
+    pa.field("first_frame_latent_shape", pa.list_(pa.int64())),
+    pa.field("first_frame_latent_dtype", pa.string()),
+    # --- ControlNet conditioning latent (48 channels) ---
+    pa.field("control_latent_bytes", pa.binary()),
+    pa.field("control_latent_shape", pa.list_(pa.int64())),
+    pa.field("control_latent_dtype", pa.string()),
+    # --- Metadata ---
+    pa.field("file_name", pa.string()),
+    pa.field("caption", pa.string()),
+    pa.field("media_type", pa.string()),
+    pa.field("width", pa.int64()),
+    pa.field("height", pa.int64()),
+    pa.field("num_frames", pa.int64()),
+    pa.field("duration_sec", pa.float64()),
+    pa.field("fps", pa.float64()),
+])
+
+
 pyarrow_schema_ode_trajectory_text_only = pa.schema([
     pa.field("id", pa.string()),
     # --- Text encoder output tensor ---

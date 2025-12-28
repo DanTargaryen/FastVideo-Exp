@@ -28,6 +28,9 @@ _TEXT_TO_VIDEO_DIT_MODELS = {
     ("dits", "hunyuanvideo15", "HunyuanVideo15Transformer3DModel"),
     "WanTransformer3DModel": ("dits", "wanvideo", "WanTransformer3DModel"),
     "CausalWanTransformer3DModel": ("dits", "causal_wanvideo", "CausalWanTransformer3DModel"),
+    # Wan ControlNet (diffusers-format) -> FastVideo-native causal controlnet
+    "WanControlnet": ("dits", "causal_wancontrolnet", "CausalWanControlnet3DModel"),
+    "CausalWanControlnet3DModel": ("dits", "causal_wancontrolnet", "CausalWanControlnet3DModel"),
     "StepVideoModel": ("dits", "stepvideo", "StepVideoModel"),
     "CosmosTransformer3DModel": ("dits", "cosmos", "CosmosTransformer3DModel"),
     "LongCatVideoTransformer3DModel": ("dits", "longcat_video_dit", "LongCatVideoTransformer3DModel"),  # Wrapper (Phase 1)

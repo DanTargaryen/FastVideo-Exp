@@ -626,6 +626,7 @@ class WanTransformer3DModel(CachableDiT):
                 timestep: torch.LongTensor,
                 encoder_hidden_states_image: torch.Tensor | list[torch.Tensor]
                 | None = None,
+                block_controlnet_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
                 guidance=None,
                 **kwargs) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
@@ -715,6 +716,11 @@ class WanTransformer3DModel(CachableDiT):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
+        control_interval = None
+        if block_controlnet_hidden_states is not None and len(
+                block_controlnet_hidden_states) > 0:
+            control_interval = len(self.blocks) / float(
+                len(block_controlnet_hidden_states))
         # if caching is enabled, we might be able to skip the forward pass
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb)
@@ -728,14 +734,28 @@ class WanTransformer3DModel(CachableDiT):
                 original_hidden_states = hidden_states.clone()
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                for block in self.blocks:
+                for block_index, block in enumerate(self.blocks):
                     hidden_states = self._gradient_checkpointing_func(
                         block, hidden_states, encoder_hidden_states,
                         timestep_proj, freqs_cis, attention_mask)
+                    if control_interval is not None:
+                        control_index = int(block_index / control_interval)
+                        control_index = min(
+                            control_index,
+                            len(block_controlnet_hidden_states) - 1)
+                        hidden_states = hidden_states + block_controlnet_hidden_states[
+                            control_index].to(hidden_states.dtype)
             else:
-                for block in self.blocks:
+                for block_index, block in enumerate(self.blocks):
                     hidden_states = block(hidden_states, encoder_hidden_states,
                                           timestep_proj, freqs_cis, attention_mask)
+                    if control_interval is not None:
+                        control_index = int(block_index / control_interval)
+                        control_index = min(
+                            control_index,
+                            len(block_controlnet_hidden_states) - 1)
+                        hidden_states = hidden_states + block_controlnet_hidden_states[
+                            control_index].to(hidden_states.dtype)
             # if teacache is enabled, we need to cache the original hidden states
 
             if enable_teacache:

@@ -254,6 +254,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         cache_frames = num_generated_frames + num_input_frames
         self.kv_cache1, self.crossattn_cache = self._initialize_simulation_caches(
             batch_size, dtype, self.device, max_num_frames=cache_frames)
+        self._init_additional_simulation_caches(batch_size, dtype, self.device,
+                                                cache_frames)
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -268,18 +270,15 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     training_batch.conditional_dict, training_batch)
                 # we process the image latent with self.transformer_2 (low-noise expert)
                 current_model = self.transformer_2 if self.transformer_2 is not None else self.transformer
-                current_model(
-                    hidden_states=training_batch_temp.
-                    input_kwargs['hidden_states'],
-                    encoder_hidden_states=training_batch_temp.
-                    input_kwargs['encoder_hidden_states'],
-                    timestep=training_batch_temp.input_kwargs['timestep'],
-                    encoder_hidden_states_image=training_batch_temp.
-                    input_kwargs.get('encoder_hidden_states_image'),
+                _ = self._simulation_model_forward_raw(
+                    model=current_model,
+                    training_batch_temp=training_batch_temp,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
-                    start_frame=current_start_frame)
+                    current_start_frame=current_start_frame,
+                    start_frame=current_start_frame,
+                    current_num_frames=1,
+                )
             current_start_frame += 1
 
         # Step 3: Temporal denoising loop
@@ -320,21 +319,15 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                             noisy_input, timestep,
                             training_batch.conditional_dict, training_batch)
 
-                        pred_flow = current_model(
-                            hidden_states=training_batch_temp.
-                            input_kwargs['hidden_states'],
-                            encoder_hidden_states=training_batch_temp.
-                            input_kwargs['encoder_hidden_states'],
-                            timestep=training_batch_temp.
-                            input_kwargs['timestep'],
-                            encoder_hidden_states_image=training_batch_temp.
-                            input_kwargs.get('encoder_hidden_states_image'),
+                        pred_flow = self._simulation_predict_flow(
+                            model=current_model,
+                            training_batch_temp=training_batch_temp,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame *
-                            self.frame_seq_length,
-                            start_frame=current_start_frame).permute(
-                                0, 2, 1, 3, 4)
+                            current_start_frame=current_start_frame,
+                            start_frame=current_start_frame,
+                            current_num_frames=current_num_frames,
+                        )
 
                         denoised_pred = pred_noise_to_pred_video(
                             pred_noise=pred_flow.flatten(0, 1),
@@ -360,41 +353,29 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                 noisy_input, timestep,
                                 training_batch.conditional_dict, training_batch)
 
-                            pred_flow = current_model(
-                                hidden_states=training_batch_temp.
-                                input_kwargs['hidden_states'],
-                                encoder_hidden_states=training_batch_temp.
-                                input_kwargs['encoder_hidden_states'],
-                                timestep=training_batch_temp.
-                                input_kwargs['timestep'],
-                                encoder_hidden_states_image=training_batch_temp.
-                                input_kwargs.get('encoder_hidden_states_image'),
+                            pred_flow = self._simulation_predict_flow(
+                                model=current_model,
+                                training_batch_temp=training_batch_temp,
                                 kv_cache=self.kv_cache1,
                                 crossattn_cache=self.crossattn_cache,
-                                current_start=current_start_frame *
-                                self.frame_seq_length,
-                                start_frame=current_start_frame).permute(
-                                    0, 2, 1, 3, 4)
+                                current_start_frame=current_start_frame,
+                                start_frame=current_start_frame,
+                                current_num_frames=current_num_frames,
+                            )
                     else:
                         training_batch_temp = self._build_distill_input_kwargs(
                             noisy_input, timestep,
                             training_batch.conditional_dict, training_batch)
 
-                        pred_flow = current_model(
-                            hidden_states=training_batch_temp.
-                            input_kwargs['hidden_states'],
-                            encoder_hidden_states=training_batch_temp.
-                            input_kwargs['encoder_hidden_states'],
-                            timestep=training_batch_temp.
-                            input_kwargs['timestep'],
-                            encoder_hidden_states_image=training_batch_temp.
-                            input_kwargs.get('encoder_hidden_states_image'),
+                        pred_flow = self._simulation_predict_flow(
+                            model=current_model,
+                            training_batch_temp=training_batch_temp,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame *
-                            self.frame_seq_length,
-                            start_frame=current_start_frame).permute(
-                                0, 2, 1, 3, 4)
+                            current_start_frame=current_start_frame,
+                            start_frame=current_start_frame,
+                            current_num_frames=current_num_frames,
+                        )
 
                     denoised_pred = pred_noise_to_pred_video(
                         pred_noise=pred_flow.flatten(0, 1),
@@ -405,6 +386,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     break
 
             # Step 3.2: record the model's output
+            denoised_pred = self._simulation_postprocess_chunk_output(
+                denoised_pred,
+                training_batch=training_batch,
+                current_start_frame=current_start_frame,
+                current_num_frames=current_num_frames,
+            )
             output[:, current_start_frame:current_start_frame +
                    current_num_frames] = denoised_pred
 
@@ -422,18 +409,15 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
                 # context_timestep is 0 so we use transformer_2
                 current_model = self.transformer_2 if self.transformer_2 is not None else self.transformer
-                current_model(
-                    hidden_states=training_batch_temp.
-                    input_kwargs['hidden_states'],
-                    encoder_hidden_states=training_batch_temp.
-                    input_kwargs['encoder_hidden_states'],
-                    timestep=training_batch_temp.input_kwargs['timestep'],
-                    encoder_hidden_states_image=training_batch_temp.
-                    input_kwargs.get('encoder_hidden_states_image'),
+                _ = self._simulation_model_forward_raw(
+                    model=current_model,
+                    training_batch_temp=training_batch_temp,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
-                    start_frame=current_start_frame)
+                    current_start_frame=current_start_frame,
+                    start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
@@ -526,8 +510,78 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         assert self.kv_cache1 is not None
         assert self.crossattn_cache is not None
         self._reset_simulation_caches(self.kv_cache1, self.crossattn_cache)
+        self._reset_additional_simulation_caches()
 
         return final_output if gradient_mask is not None else pred_image_or_video
+
+    def _simulation_postprocess_chunk_output(self,
+                                             denoised_pred: torch.Tensor,
+                                             *,
+                                             training_batch: TrainingBatch,
+                                             current_start_frame: int,
+                                             current_num_frames: int
+                                             ) -> torch.Tensor:
+        """Hook for subclasses to postprocess each generated chunk output before caching/updating."""
+        return denoised_pred
+
+    def _init_additional_simulation_caches(self, batch_size: int,
+                                           dtype: torch.dtype,
+                                           device: torch.device,
+                                           max_num_frames: int) -> None:
+        """Hook for subclasses to initialize extra KV caches (e.g. ControlNet)."""
+        return
+
+    def _reset_additional_simulation_caches(self) -> None:
+        """Hook for subclasses to reset extra KV caches (e.g. ControlNet)."""
+        return
+
+    def _simulation_model_forward_raw(
+        self,
+        *,
+        model,
+        training_batch_temp: TrainingBatch,
+        kv_cache: list[dict[str, Any]],
+        crossattn_cache: list[dict[str, Any]],
+        current_start_frame: int,
+        start_frame: int,
+        current_num_frames: int,
+    ) -> torch.Tensor:
+        """Hookable model forward used by the self-forcing generator simulation."""
+        return model(
+            hidden_states=training_batch_temp.input_kwargs["hidden_states"],
+            encoder_hidden_states=training_batch_temp.input_kwargs[
+                "encoder_hidden_states"],
+            timestep=training_batch_temp.input_kwargs["timestep"],
+            encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
+                "encoder_hidden_states_image"),
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start=current_start_frame * self.frame_seq_length,
+            start_frame=start_frame,
+        )
+
+    def _simulation_predict_flow(
+        self,
+        *,
+        model,
+        training_batch_temp: TrainingBatch,
+        kv_cache: list[dict[str, Any]],
+        crossattn_cache: list[dict[str, Any]],
+        current_start_frame: int,
+        start_frame: int,
+        current_num_frames: int,
+    ) -> torch.Tensor:
+        """Return flow prediction in BFCHW for denoising loop."""
+        pred = self._simulation_model_forward_raw(
+            model=model,
+            training_batch_temp=training_batch_temp,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_frame=current_start_frame,
+            start_frame=start_frame,
+            current_num_frames=current_num_frames,
+        )
+        return pred.permute(0, 2, 1, 3, 4)
 
     def _initialize_simulation_caches(
         self,
