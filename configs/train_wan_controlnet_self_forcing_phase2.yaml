@@ -1,0 +1,73 @@
+# FastVideo training config for:
+#   Wan TI2V + ControlNet + Self-Forcing (Phase-2)
+#
+# Usage (IMPORTANT): `--config` cannot be the first CLI arg due to FastVideo parser behavior.
+# Example:
+#   torchrun --nnodes 1 --nproc_per_node 8 \
+#     fastvideo/training/wan_controlnet_self_forcing_distillation_pipeline.py \
+#     --inference_mode False \
+#     --config configs/train_wan_controlnet_self_forcing_phase2.yaml
+
+# ---- Paths ----
+pretrained_model_name_or_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+real_score_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+fake_score_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+
+controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
+real_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
+fake_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
+
+# Optional: initialize STUDENT transformer weights from a custom safetensors file.
+# You can create this from your Diff-Factory fp32 state_dict via the helper script:
+#   python tools/convert_pt_state_dict_to_safetensors.py --in_pt ..._fp32_state_dict.pt --out_safetensors student_init.safetensors --select_prefix transformer. --strip_prefix transformer.
+# Then set:
+# init_weights_from_safetensors: /path/to/student_init.safetensors
+
+# ---- Dataset ----
+data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_120
+dataloader_num_workers: 2
+train_batch_size: 1
+train_sp_batch_size: 1
+
+# ---- Shapes ----
+num_height: 384
+num_width: 512
+num_frames: 81
+num_latent_t: 21
+
+# ---- Self-forcing ----
+simulate_generator_forward: true
+num_frame_per_block: 3
+context_noise: 0
+dfake_gen_update_ratio: 5
+
+# ---- DMD / CFG ----
+real_score_guidance_scale: 3.5
+training_cfg_rate: 0.0
+
+# ---- Training ----
+max_train_steps: 2000
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-6
+weight_decay: 0.01
+betas: "0.9,0.999"
+mixed_precision: bf16
+max_grad_norm: 1.0
+seed: 1024
+
+# ---- Parallelism (8 GPUs typical) ----
+tp_size: 1
+sp_size: 1
+hsdp_replicate_dim: 8
+hsdp_shard_dim: 1
+num_gpus: 8
+
+# ---- Scheduler ----
+flow_shift: 8
+
+# ---- Checkpointing / logs ----
+output_dir: outputs/wan_controlnet_self_forcing_phase2
+checkpoints_total_limit: 2
+training_state_checkpointing_steps: 200
+log_validation: false
