@@ -30,6 +30,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
 from tqdm import tqdm
 
@@ -38,7 +39,8 @@ from fastvideo.configs.models.vaes import WanVAEConfig
 from fastvideo.dataset.dataloader.parquet_io import (ParquetDatasetWriter,
                                                      records_to_table)
 from fastvideo.dataset.dataloader.schema import pyarrow_schema_ti2v_controlnet
-from fastvideo.distributed import (get_local_torch_device, get_world_size,
+from fastvideo.distributed import (get_local_torch_device, get_world_rank,
+                                   get_world_size,
                                    maybe_init_distributed_environment_and_model_parallel)
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
@@ -262,8 +264,8 @@ def main(args: argparse.Namespace) -> None:
     model_path = maybe_download_model(args.model_path)
 
     maybe_init_distributed_environment_and_model_parallel(1, 1)
-    if int(get_world_size()) != 1:
-        raise RuntimeError("This preprocess script only supports 1 GPU/process.")
+    world_size = int(get_world_size())
+    rank = int(get_world_rank())
 
     pipeline_config = PipelineConfig.from_pretrained(model_path)
     pipeline_config.update_config_from_dict({
@@ -280,8 +282,12 @@ def main(args: argparse.Namespace) -> None:
         pipeline_config=pipeline_config,
     )
 
-    device = torch.device(
-        "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and torch.cuda.is_available():
+        # Each torchrun process uses its local CUDA device.
+        device = get_local_torch_device()
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
 
     # Load modules from the diffusers model folder.
     text_encoder = PipelineComponentLoader.load_module(
@@ -316,11 +322,18 @@ def main(args: argparse.Namespace) -> None:
     end = len(samples) if int(args.end) < 0 else min(int(args.end), len(samples))
     warp_root = Path(_maybe_expand(args.warp_out_root))
 
-    writer = ParquetDatasetWriter(args.output_dir,
+    # Multi-GPU preprocessing: each rank writes to its own subdir to avoid file name collisions.
+    out_dir_rank = os.path.join(args.output_dir, f"rank_{rank:02d}")
+    writer = ParquetDatasetWriter(out_dir_rank,
                                  samples_per_file=int(args.samples_per_file))
     buffer: list[dict[str, Any]] = []
 
-    for idx in tqdm(range(start, end), desc="preprocess"):
+    indices = list(range(start, end))
+    if world_size > 1:
+        indices = indices[rank::world_size]
+    pbar = tqdm(indices, desc=f"preprocess[r{rank}/{world_size}]")
+
+    for idx in pbar:
         s = samples[idx]
         if not isinstance(s, dict):
             continue
@@ -447,7 +460,10 @@ def main(args: argparse.Namespace) -> None:
         writer.append_table(table)
         writer.flush(num_workers=1, write_remainder=True)
 
-    logger.info("Done. Wrote parquet dataset to: %s", args.output_dir)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if rank == 0:
+        logger.info("Done. Wrote parquet dataset to: %s (per-rank shards under rank_XX/)", args.output_dir)
 
 
 if __name__ == "__main__":
