@@ -66,7 +66,6 @@ betas: "0.9,0.999"
 mixed_precision: bf16
 max_grad_norm: 1.0
 seed: 1024
-is_causal: true
 
 # ---- Parallelism (8 GPUs typical) ----
 tp_size: 1

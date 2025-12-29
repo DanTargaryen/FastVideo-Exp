@@ -130,6 +130,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}is-causal",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}is_causal",
+            default=PipelineConfig.is_causal,
+            help="Whether to use causal (autoregressive) pipeline behavior",
+        )
 
         # DiT configuration
         parser.add_argument(

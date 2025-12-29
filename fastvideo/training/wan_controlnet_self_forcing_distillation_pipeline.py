@@ -53,8 +53,18 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
     def load_modules(self,
                      fastvideo_args: FastVideoArgs,
                      loaded_modules: dict[str, torch.nn.Module] | None = None):
-        modules = super().load_modules(fastvideo_args, loaded_modules)
         training_args = cast(TrainingArgs, fastvideo_args)
+
+        # Student/generator must run with chunk-wise causal transformer to match
+        # inference rollout (KV cache). Teacher/critic transformers are loaded
+        # later and explicitly forced to bidirectional in `DistillationPipeline`.
+        prev_override = getattr(training_args, "override_transformer_cls_name",
+                                None)
+        training_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
+        try:
+            modules = super().load_modules(fastvideo_args, loaded_modules)
+        finally:
+            training_args.override_transformer_cls_name = prev_override
 
         # Load student ControlNet (component dir, diffusers format)
         if training_args.controlnet_model_path:
