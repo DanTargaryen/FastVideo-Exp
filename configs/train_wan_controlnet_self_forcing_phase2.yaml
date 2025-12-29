@@ -8,6 +8,13 @@
 #     --inference_mode=False \
 #     --config configs/train_wan_controlnet_self_forcing_phase2.yaml
 
+# IMPORTANT:
+# - Set `mode: distillation` so FastVideo keeps `inference_mode=False` for training.
+# - Set `dit_precision: fp32` because training requires fp32 master weights (compute can still be bf16 via `mixed_precision`).
+mode: distillation
+workload_type: i2v
+dit_precision: fp32
+
 # ---- Paths ----
 pretrained_model_name_or_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
