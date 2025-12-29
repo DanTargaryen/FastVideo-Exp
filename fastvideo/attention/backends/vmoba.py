@@ -6,8 +6,13 @@ from dataclasses import dataclass
 import torch
 from einops import rearrange
 
-from fastvideo_kernel import (moba_attn_varlen, process_moba_input,
-                              process_moba_output)
+try:
+    from fastvideo_kernel import (moba_attn_varlen, process_moba_input,
+                                  process_moba_output)
+except ImportError:
+    moba_attn_varlen = None
+    process_moba_input = None
+    process_moba_output = None
 from fastvideo.attention.backends.abstract import (AttentionBackend,
                                                    AttentionImpl,
                                                    AttentionMetadata,
@@ -149,6 +154,13 @@ class VMOBAAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if (moba_attn_varlen is None or process_moba_input is None
+                or process_moba_output is None):
+            raise ImportError(
+                "fastvideo_kernel is not installed (required for VMOBA_ATTN). "
+                "Either build/install FastVideo CUDA extensions or set "
+                "`FASTVIDEO_ATTENTION_BACKEND=TORCH_SDPA` (or FLASH_ATTN) to "
+                "avoid selecting VMOBA.")
         """
         query: [B, L, H, D]
         key:   [B, L, H, D]
