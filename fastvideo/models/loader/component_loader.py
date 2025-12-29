@@ -545,6 +545,22 @@ class ControlNetLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {model_path}")
 
+        # Optional: initialize student ControlNet from a custom safetensors file (e.g., phase-1 checkpoint conversion).
+        custom_weights_path = getattr(fastvideo_args,
+                                      "init_controlnet_weights_from_safetensors",
+                                      None)
+        use_custom_weights = (custom_weights_path and os.path.exists(custom_weights_path)
+                              and not hasattr(fastvideo_args, "_loading_teacher_critic_model"))
+        if use_custom_weights:
+            if os.path.isdir(custom_weights_path):
+                safetensors_list = glob.glob(
+                    os.path.join(str(custom_weights_path), "*.safetensors"))
+            else:
+                assert str(custom_weights_path).endswith(
+                    ".safetensors"
+                ), "init_controlnet_weights_from_safetensors must be a .safetensors file or a directory"
+                safetensors_list = [str(custom_weights_path)]
+
         default_dtype = PRECISION_TO_TYPE[
             fastvideo_args.pipeline_config.dit_precision] if fastvideo_args.pipeline_config.dit_precision else torch.bfloat16
 

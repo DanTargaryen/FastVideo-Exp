@@ -173,6 +173,7 @@ class FastVideoArgs:
     override_transformer_cls_name: str | None = None
     init_weights_from_safetensors: str = ""  # path to safetensors file for initial weight loading
     init_weights_from_safetensors_2: str = ""  # path to safetensors file for initial weight loading for transformer_2
+    init_controlnet_weights_from_safetensors: str = ""  # path to safetensors file for initial ControlNet weight loading
 
     override_pipeline_cls_name: str | None = None
 
@@ -496,6 +497,10 @@ class FastVideoArgs:
             "--init-weights-from-safetensors-2",
             type=str,
             help="Path to safetensors file for initial weight loading")
+        parser.add_argument(
+            "--init-controlnet-weights-from-safetensors",
+            type=str,
+            help="Path to safetensors file for initial ControlNet weight loading")
 
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

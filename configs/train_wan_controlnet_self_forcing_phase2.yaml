@@ -18,11 +18,15 @@ controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/wo
 real_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
 fake_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
 
+init_weights_from_safetensors: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_fastvideo_inits/transformer_init.safetensors
+init_controlnet_weights_from_safetensors: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_fastvideo_inits/controlnet_init.safetensors
+
 # Optional: initialize STUDENT transformer weights from a custom safetensors file.
 # You can create this from your Diff-Factory fp32 state_dict via the helper script:
-#   python tools/convert_pt_state_dict_to_safetensors.py --in_pt ..._fp32_state_dict.pt --out_safetensors student_init.safetensors --select_prefix transformer. --strip_prefix transformer.
-# Then set:
+#   python tools/export_phase1_ckpt_to_fastvideo_inits.py --in_pt ..._fp32_state_dict.pt --out_dir /path/to/out_dir
+# Then set (paths below are examples):
 # init_weights_from_safetensors: /path/to/student_init.safetensors
+# init_controlnet_weights_from_safetensors: /path/to/student_controlnet_init.safetensors
 
 # ---- Dataset ----
 data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_120

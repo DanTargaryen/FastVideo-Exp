@@ -74,12 +74,18 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         if training_args.real_score_controlnet_model_path:
             logger.info("Loading teacher controlnet from: %s",
                         training_args.real_score_controlnet_model_path)
-            self.real_score_controlnet = PipelineComponentLoader.load_module(
-                module_name="controlnet",
-                component_model_path=training_args.real_score_controlnet_model_path,
-                transformers_or_diffusers="diffusers",
-                fastvideo_args=training_args,
-            )
+            # Prevent student custom init weights from being applied to teacher.
+            setattr(training_args, "_loading_teacher_critic_model", True)
+            try:
+                self.real_score_controlnet = PipelineComponentLoader.load_module(
+                    module_name="controlnet",
+                    component_model_path=training_args.real_score_controlnet_model_path,
+                    transformers_or_diffusers="diffusers",
+                    fastvideo_args=training_args,
+                )
+            finally:
+                if hasattr(training_args, "_loading_teacher_critic_model"):
+                    delattr(training_args, "_loading_teacher_critic_model")
             modules["real_score_controlnet"] = self.real_score_controlnet
         else:
             self.real_score_controlnet = None
@@ -88,12 +94,18 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         if training_args.fake_score_controlnet_model_path:
             logger.info("Loading critic controlnet from: %s",
                         training_args.fake_score_controlnet_model_path)
-            self.fake_score_controlnet = PipelineComponentLoader.load_module(
-                module_name="controlnet",
-                component_model_path=training_args.fake_score_controlnet_model_path,
-                transformers_or_diffusers="diffusers",
-                fastvideo_args=training_args,
-            )
+            # Prevent student custom init weights from being applied to critic.
+            setattr(training_args, "_loading_teacher_critic_model", True)
+            try:
+                self.fake_score_controlnet = PipelineComponentLoader.load_module(
+                    module_name="controlnet",
+                    component_model_path=training_args.fake_score_controlnet_model_path,
+                    transformers_or_diffusers="diffusers",
+                    fastvideo_args=training_args,
+                )
+            finally:
+                if hasattr(training_args, "_loading_teacher_critic_model"):
+                    delattr(training_args, "_loading_teacher_critic_model")
             modules["fake_score_controlnet"] = self.fake_score_controlnet
         else:
             self.fake_score_controlnet = None
