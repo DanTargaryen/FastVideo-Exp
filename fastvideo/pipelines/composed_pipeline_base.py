@@ -182,6 +182,18 @@ class ComposedPipelineBase(ABC):
         loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
+        # Treat training modes as training even if `--inference-mode` was not
+        # explicitly set (common when users only set `--mode distillation`).
+        if args is not None:
+            mode = getattr(args, "mode", None)
+            mode_str = mode.value if hasattr(mode, "value") else str(mode)
+            if mode_str in ("distillation", "finetuning") and getattr(
+                    args, "inference_mode", True):
+                logger.warning(
+                    "Mode is '%s' but inference_mode is True. Forcing inference_mode=False.",
+                    mode_str)
+                setattr(args, "inference_mode", False)
+
         if args is None or args.inference_mode:
 
             kwargs['model_path'] = model_path
