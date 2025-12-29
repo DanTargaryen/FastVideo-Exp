@@ -298,22 +298,26 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
         config_args = self._load_config_file(file_path)
 
-        # 0th index is for {serve,chat,complete}
-        # followed by model_tag (only for serve)
-        # followed by config args
-        # followed by rest of cli args.
-        # maintaining this order will enforce the precedence
-        # of cli > config > defaults
-        if args[0] == "serve":
-            if index == 1:
-                raise ValueError(
-                    "No model_tag specified! Please check your command-line"
-                    " arguments.")
-            args = [args[0]] + [
-                args[1]
-            ] + config_args + args[2:index] + args[index + 2:]
-        else:
-            args = [args[0]] + config_args + args[1:index] + args[index + 2:]
+        # Remove the config flag/path from the CLI args.
+        args_wo_config = args[:index] + args[index + 2:]
+
+        # Insert config args early so that any explicitly provided CLI args
+        # (before or after --config) take precedence.
+        #
+        # For vLLM-style CLIs, keep the positional subcommand (and model tag for
+        # `serve`) at the front. For generic scripts with no positional command
+        # (i.e., args_wo_config starts with '--...'), insert config args at the
+        # very beginning.
+        insert_at = 0
+        if args_wo_config and not args_wo_config[0].startswith('-'):
+            if (args_wo_config[0] == "serve" and len(args_wo_config) > 1
+                    and not args_wo_config[1].startswith('-')):
+                insert_at = 2
+            else:
+                insert_at = 1
+
+        args = (args_wo_config[:insert_at] + config_args +
+                args_wo_config[insert_at:])
 
         return args
 

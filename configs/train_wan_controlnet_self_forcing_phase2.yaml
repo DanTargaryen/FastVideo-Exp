@@ -5,7 +5,7 @@
 # Example:
 #   torchrun --nnodes 1 --nproc_per_node 8 \
 #     fastvideo/training/wan_controlnet_self_forcing_distillation_pipeline.py \
-#     --inference_mode False \
+#     --inference_mode=False \
 #     --config configs/train_wan_controlnet_self_forcing_phase2.yaml
 
 # ---- Paths ----
