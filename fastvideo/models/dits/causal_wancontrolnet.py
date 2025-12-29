@@ -43,12 +43,12 @@ class CausalWanControlnet3DModel(BaseDiT):
     Causal Wan ControlNet for video latents.
 
     Expected inputs:
-    - `hidden_states`: (B, 16, F, H, W)
-    - `controlnet_states`: (B, 48, F, H, W) where 48 = 16(depth) + 16(masked_rgb) + 16(mask)
+    - `hidden_states`: (B, C_lat, F, H, W) where `C_lat` is the Wan VAE latent channel size
+    - `controlnet_states`: (B, 3*C_lat, F, H, W) corresponding to (depth, masked_rgb, mask), each VAE-encoded
 
     Fusion follows Diff-Factory / diffusers-style WanControlnet:
       repeat video latents along channel (x3) then add control latents:
-        (B,16,F,H,W) -> repeat -> (B,48,F,H,W); fused = repeat + control
+        (B,C_lat,F,H,W) -> repeat -> (B,3*C_lat,F,H,W); fused = repeat + control
     """
 
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions

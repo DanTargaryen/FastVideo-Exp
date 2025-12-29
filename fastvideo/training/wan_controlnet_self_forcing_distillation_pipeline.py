@@ -32,6 +32,11 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     ControlNet residuals are injected into both causal and bidirectional Wan transformers
     via `block_controlnet_hidden_states`.
+
+    Control latent convention:
+      If Wan VAE latent channel size is `C_lat` (z_dim), then:
+        - video latents: (B, C_lat, T_lat, H_lat, W_lat)
+        - control latents: (B, 3*C_lat, T_lat, H_lat, W_lat) = cat(depth, masked_rgb, mask)
     """
 
     _required_config_modules = ["scheduler", "transformer", "vae"]

@@ -2,7 +2,7 @@
 """
 Preprocess OmniWorld-Game (pickle manifest) into FastVideo parquet for:
   - TI2V (first-frame latent)
-  - ControlNet (48ch latent = depth + warped_masked_rgb + warped_mask)
+  - ControlNet (control latent = cat(depth, warped_masked_rgb, warped_mask) in VAE latent space)
 
 Inputs:
   - `--in_pickle`: a list[dict] manifest (same structure as Diff-Factory phase1 recorder)
@@ -13,6 +13,10 @@ Inputs:
 
 Output:
   - Parquet dataset directory compatible with `pyarrow_schema_ti2v_controlnet`.
+
+Notes:
+  - If Wan VAE latent channel size is `C_lat` (aka z_dim), then each of (depth/masked_rgb/mask)
+    encodes to `C_lat` channels, and the concatenated control latent has `3*C_lat` channels.
 """
 
 from __future__ import annotations
@@ -448,4 +452,3 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     main(parse_args())
-

@@ -81,12 +81,13 @@ pyarrow_schema_t2v = pa.schema([
 ])
 
 
-# TI2V + ControlNet (48ch control latent) schema.
+# TI2V + ControlNet schema.
 # Intended for self-forcing distillation where we may not store ground-truth video latents
 # (use `--simulate_generator_forward`), but we still need:
 # - prompt text embeddings
 # - first frame latent (TI2V conditioning)
 # - control latent (depth + masked_rgb + mask), already VAE-encoded and concatenated on channel dim
+#   Channel size is `3 * C_lat`, where `C_lat` is the Wan VAE latent channel size (z_dim).
 pyarrow_schema_ti2v_controlnet = pa.schema([
     pa.field("id", pa.string()),
     # --- Text encoder output ---
@@ -101,7 +102,7 @@ pyarrow_schema_ti2v_controlnet = pa.schema([
     pa.field("first_frame_latent_bytes", pa.binary()),
     pa.field("first_frame_latent_shape", pa.list_(pa.int64())),
     pa.field("first_frame_latent_dtype", pa.string()),
-    # --- ControlNet conditioning latent (48 channels) ---
+    # --- ControlNet conditioning latent (3*C_lat channels) ---
     pa.field("control_latent_bytes", pa.binary()),
     pa.field("control_latent_shape", pa.list_(pa.int64())),
     pa.field("control_latent_dtype", pa.string()),
