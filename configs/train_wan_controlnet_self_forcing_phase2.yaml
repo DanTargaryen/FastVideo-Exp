@@ -58,7 +58,7 @@ dfake_gen_update_ratio: 5
 real_score_guidance_scale: 3.5
 training_cfg_rate: 0.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
-dmd_denoising_steps: [1000, 750, 500, 250]
+dmd_denoising_steps: "1000,750,500,250"
 warp_denoising_step: true
 
 # ---- Training ----
