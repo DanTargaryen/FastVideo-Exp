@@ -74,8 +74,9 @@ seed: 1024
 # ---- Parallelism (8 GPUs typical) ----
 tp_size: 1
 sp_size: 1
-hsdp_replicate_dim: 8
-hsdp_shard_dim: 1
+# HSDP/FSDP2 sharding: shard params across 8 GPUs to reduce per-GPU memory.
+hsdp_replicate_dim: 1
+hsdp_shard_dim: 8
 num_gpus: 8
 
 # ---- Scheduler ----
