@@ -12,6 +12,7 @@ from fastvideo.fastvideo_args import FastVideoArgs, TrainingArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
+from fastvideo.forward_context import set_forward_context
 from fastvideo.training.self_forcing_distillation_pipeline import (
     SelfForcingDistillationPipeline,
 )
@@ -375,7 +376,11 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     def faker_score_forward(self, training_batch):
         control_latent = getattr(training_batch, "control_latent", None)
-        with torch.no_grad():
+        # The Wan attention stack requires ForwardContext to be set for every
+        # forward pass (including ControlNet during simulation).
+        with torch.no_grad(), set_forward_context(
+                current_timestep=training_batch.timesteps,
+                attn_metadata=training_batch.attn_metadata):
             if self.training_args.simulate_generator_forward:
                 generator_pred_video = self._generator_multi_step_simulation_forward(
                     training_batch)
@@ -405,14 +410,16 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             noisy_generator_pred_video, fake_score_timestep,
             training_batch.conditional_dict, training_batch)
 
-        current_fake_score_transformer = self._get_fake_score_transformer(
-            fake_score_timestep)
-        fake_score_pred_noise = self._predict_noise_with_controlnet(
-            transformer=current_fake_score_transformer,
-            controlnet=getattr(self, "fake_score_controlnet", None),
-            input_kwargs=training_batch.input_kwargs,
-            control_latent=control_latent,
-        ).permute(0, 2, 1, 3, 4)
+        with set_forward_context(current_timestep=training_batch.timesteps,
+                                 attn_metadata=training_batch.attn_metadata):
+            current_fake_score_transformer = self._get_fake_score_transformer(
+                fake_score_timestep)
+            fake_score_pred_noise = self._predict_noise_with_controlnet(
+                transformer=current_fake_score_transformer,
+                controlnet=getattr(self, "fake_score_controlnet", None),
+                input_kwargs=training_batch.input_kwargs,
+                control_latent=control_latent,
+            ).permute(0, 2, 1, 3, 4)
 
         target = fake_score_noise - generator_pred_video
         flow_matching_loss = torch.mean((fake_score_pred_noise - target)**2)
