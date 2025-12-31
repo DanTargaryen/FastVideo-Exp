@@ -866,6 +866,16 @@ class TrainingArgs(FastVideoArgs):
                 # Check if the attribute is provided in args
                 if hasattr(args, attr):
                     value = getattr(args, attr)
+                    # Argparse sets `None` for many optional CLI args when not
+                    # provided. In that case, fall back to the dataclass
+                    # default (if it's not None) so downstream code can safely
+                    # assume the documented default behavior.
+                    if value is None:
+                        if field.default_factory is not dataclasses.MISSING:  # type: ignore
+                            value = field.default_factory()  # type: ignore
+                        elif (field.default is not dataclasses.MISSING
+                              and field.default is not None):
+                            value = field.default
                 else:
                     # Use the field's default value
                     if field.default_factory is not dataclasses.MISSING:

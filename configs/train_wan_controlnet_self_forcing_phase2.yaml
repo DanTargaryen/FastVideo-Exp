@@ -86,4 +86,5 @@ flow_shift: 8
 output_dir: outputs/wan_controlnet_self_forcing_phase2
 checkpoints_total_limit: 2
 training_state_checkpointing_steps: 200
+weight_only_checkpointing_steps: 0
 log_validation: false
