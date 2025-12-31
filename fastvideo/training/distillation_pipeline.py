@@ -566,8 +566,17 @@ class DistillationPipeline(TrainingPipeline):
             text_dict: dict[str, torch.Tensor] | None,
             training_batch: TrainingBatch) -> TrainingBatch:
         if text_dict is None:
-            raise ValueError(
-                "text_dict cannot be None for distillation pipeline")
+            # Be tolerant here: some callers pass `training_batch.conditional_dict`
+            # but older batches may not have it populated (e.g., custom pipelines).
+            # Falling back to the per-batch fields keeps behavior consistent.
+            if training_batch.encoder_hidden_states is None or training_batch.encoder_attention_mask is None:
+                raise ValueError(
+                    "text_dict cannot be None for distillation pipeline (missing encoder_hidden_states/encoder_attention_mask)"
+                )
+            text_dict = {
+                "encoder_hidden_states": training_batch.encoder_hidden_states,
+                "encoder_attention_mask": training_batch.encoder_attention_mask,
+            }
 
         training_batch.input_kwargs = {
             "hidden_states": noise_input.permute(0, 2, 1, 3, 4),
@@ -882,12 +891,26 @@ class DistillationPipeline(TrainingPipeline):
             "encoder_hidden_states": training_batch.encoder_hidden_states,
             "encoder_attention_mask": training_batch.encoder_attention_mask,
         }
+        # Unconditional text embeddings are required for teacher CFG in DMD/SiD.
+        # Prefer a precomputed negative prompt embedding if available; otherwise
+        # fall back to a zero embedding (same shape as conditional) which is the
+        # same convention used by the parquet loader when `cfg_rate > 0`.
         if getattr(self, "negative_prompt_embeds", None) is not None:
-            unconditional_dict = {
+            training_batch.unconditional_dict = {
                 "encoder_hidden_states": self.negative_prompt_embeds,
                 "encoder_attention_mask": self.negative_prompt_attention_mask,
             }
-            training_batch.unconditional_dict = unconditional_dict
+        else:
+            if training_batch.encoder_hidden_states is None or training_batch.encoder_attention_mask is None:
+                raise ValueError(
+                    "encoder_hidden_states/encoder_attention_mask must be set before building unconditional_dict"
+                )
+            training_batch.unconditional_dict = {
+                "encoder_hidden_states": torch.zeros_like(
+                    training_batch.encoder_hidden_states
+                ),
+                "encoder_attention_mask": training_batch.encoder_attention_mask,
+            }
 
         training_batch.dmd_latent_vis_dict = {}
         training_batch.fake_score_latent_vis_dict = {}
