@@ -161,8 +161,14 @@ class CausalWanSelfAttention(nn.Module):
             k_for_attn = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             v_for_attn = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             if torch.is_grad_enabled():
-                k_for_attn = k_for_attn.contiguous()
-                v_for_attn = v_for_attn.contiguous()
+                # NOTE:
+                # `kv_cache["k"][:, start:end]` can be a *view* into the mutable cache.
+                # Even if it reports `is_contiguous()==True` (e.g. when some dims are 1),
+                # `.contiguous()` may return the same storage, and later cache updates
+                # would corrupt tensors saved for backward.
+                # Use `.clone()` to force new storage.
+                k_for_attn = k_for_attn.clone()
+                v_for_attn = v_for_attn.clone()
             x = self.attn(roped_query, k_for_attn, v_for_attn)
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)

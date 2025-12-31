@@ -257,8 +257,11 @@ class CausalMatrixGameSelfAttention(nn.Module):
             # is updated in-place across blocks/steps. Make K/V contiguous copies
             # to avoid "modified by an inplace operation" autograd errors.
             if torch.is_grad_enabled():
-                k_for_attn = k_for_attn.contiguous()
-                v_for_attn = v_for_attn.contiguous()
+                # See fastvideo/models/dits/causal_wanvideo.py for rationale:
+                # slices from a mutable KV cache may still share storage even when
+                # they appear contiguous; force new storage for backward safety.
+                k_for_attn = k_for_attn.clone()
+                v_for_attn = v_for_attn.clone()
 
             x = torch.nn.functional.scaled_dot_product_attention(
                 roped_query.transpose(1, 2),
