@@ -252,6 +252,14 @@ class CausalMatrixGameSelfAttention(nn.Module):
             k_for_attn = kv_cache["k"][:, kv_start:local_end_index]
             v_for_attn = kv_cache["v"][:, kv_start:local_end_index]
 
+            # When gradients are enabled, SDPA backward needs K/V to compute dQ.
+            # `k_for_attn`/`v_for_attn` are views into the mutable kv_cache, which
+            # is updated in-place across blocks/steps. Make K/V contiguous copies
+            # to avoid "modified by an inplace operation" autograd errors.
+            if torch.is_grad_enabled():
+                k_for_attn = k_for_attn.contiguous()
+                v_for_attn = v_for_attn.contiguous()
+
             x = torch.nn.functional.scaled_dot_product_attention(
                 roped_query.transpose(1, 2),
                 k_for_attn.transpose(1, 2),

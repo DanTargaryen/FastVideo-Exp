@@ -289,7 +289,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         exit_flags = self.generate_and_sync_list(len(all_num_frames),
                                                  num_denoising_steps,
                                                  device=noise.device)
-        start_gradient_frame_index = max(0, num_output_frames - 21)
+        grad_last_n_frames = int(
+            getattr(self.training_args, "gradient_mask_last_n_frames", 21) or 21
+        )
+        start_gradient_frame_index = max(0, num_output_frames - grad_last_n_frames)
 
         for block_index, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[:, current_start_frame -
@@ -422,17 +425,21 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
 
-        # Handle last 21 frames logic
+        # Handle "last N frames" logic (N = gradient_mask_last_n_frames).
         pred_image_or_video = output
         if num_input_frames > 0:
             pred_image_or_video = output[:, num_input_frames:]
 
-        # Slice last 21 frames if we generated more
+        # Slice last N frames if we generated more
         gradient_mask = None
-        if pred_image_or_video.shape[1] > 21:
+        if pred_image_or_video.shape[1] > grad_last_n_frames:
             with torch.no_grad():
                 # Re-encode to get image latent
-                latent_to_decode = pred_image_or_video[:, :-20, ...]
+                # Keep the last (N-1) latent frames, and convert the preceding
+                # part into a single "image latent" by decoding its last frame
+                # then re-encoding.
+                keep_last = max(0, grad_last_n_frames - 1)
+                latent_to_decode = pred_image_or_video[:, :-keep_last, ...] if keep_last > 0 else pred_image_or_video
                 # Decode to video
                 latent_to_decode = latent_to_decode.permute(
                     0, 2, 1, 3, 4)  # [B, C, F, H, W]
@@ -463,15 +470,15 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 image_latent = image_latent.permute(0, 2, 1, 3,
                                                     4)  # [B, F, C, H, W]
 
-            pred_image_or_video_last_21 = torch.cat(
-                [image_latent, pred_image_or_video[:, -20:, ...]], dim=1)
+            suffix = pred_image_or_video[:, -keep_last:, ...] if keep_last > 0 else pred_image_or_video[:, :0, ...]
+            pred_image_or_video_last_n = torch.cat([image_latent, suffix], dim=1)
         else:
-            pred_image_or_video_last_21 = pred_image_or_video
+            pred_image_or_video_last_n = pred_image_or_video
 
         # Set up gradient mask if we generated more than minimum frames
         if num_generated_frames != min_num_frames:
             # Currently, we do not use gradient for the first chunk, since it contains image latents
-            gradient_mask = torch.ones_like(pred_image_or_video_last_21,
+            gradient_mask = torch.ones_like(pred_image_or_video_last_n,
                                             dtype=torch.bool)
             if self.independent_first_frame:
                 gradient_mask[:, :1] = False
@@ -479,13 +486,13 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 gradient_mask[:, :self.num_frame_per_block] = False
 
         # Apply gradient masking if needed
-        final_output = pred_image_or_video_last_21.to(dtype)
+        final_output = pred_image_or_video_last_n.to(dtype)
         if gradient_mask is not None:
             # Apply gradient masking: detach frames that shouldn't contribute gradients
             final_output = torch.where(
                 gradient_mask,
-                pred_image_or_video_last_21,  # Keep original values where gradient_mask is True
-                pred_image_or_video_last_21.detach(
+                pred_image_or_video_last_n,  # Keep original values where gradient_mask is True
+                pred_image_or_video_last_n.detach(
                 )  # Detach where gradient_mask is False
             )
 
@@ -506,11 +513,18 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             training_batch.dmd_latent_vis_dict["min_num_frames"] = torch.tensor(
                 min_num_frames, dtype=torch.float32, device=self.device)
 
-        # Clean up caches
-        assert self.kv_cache1 is not None
-        assert self.crossattn_cache is not None
-        self._reset_simulation_caches(self.kv_cache1, self.crossattn_cache)
-        self._reset_additional_simulation_caches()
+        # Clean up caches.
+        # IMPORTANT: when gradients are enabled, the attention backward can save
+        # K/V tensors (including from caches) to compute dQ. Resetting caches
+        # in-place before backward would trigger "modified by an inplace operation"
+        # autograd errors. In the grad-enabled path we simply keep the cache
+        # tensors alive until backward completes; the next rollout will
+        # re-initialize fresh caches anyway.
+        if not torch.is_grad_enabled():
+            assert self.kv_cache1 is not None
+            assert self.crossattn_cache is not None
+            self._reset_simulation_caches(self.kv_cache1, self.crossattn_cache)
+            self._reset_additional_simulation_caches()
 
         return final_output if gradient_mask is not None else pred_image_or_video
 

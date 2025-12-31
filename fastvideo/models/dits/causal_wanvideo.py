@@ -152,11 +152,18 @@ class CausalWanSelfAttention(nn.Module):
                 # logger.info("kv_cache['k'] is in comp graph: %s", kv_cache["k"].requires_grad or kv_cache["k"].grad_fn is not None)
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = self.attn(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+            # IMPORTANT: `kv_cache["k"]/["v"]` are mutated in-place across blocks/steps
+            # during self-forcing rollout. When gradients are enabled, the attention
+            # backward needs K/V to compute dQ, and PyTorch will save these tensors.
+            # Passing a view into the mutable cache would trigger "modified by an inplace operation"
+            # errors once the cache updates later in the rollout. Make K/V contiguous copies
+            # (i.e. new storage) when grad is enabled.
+            k_for_attn = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            v_for_attn = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            if torch.is_grad_enabled():
+                k_for_attn = k_for_attn.contiguous()
+                v_for_attn = v_for_attn.contiguous()
+            x = self.attn(roped_query, k_for_attn, v_for_attn)
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
