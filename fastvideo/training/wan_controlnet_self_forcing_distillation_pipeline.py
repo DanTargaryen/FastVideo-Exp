@@ -16,6 +16,7 @@ from fastvideo.forward_context import set_forward_context
 from fastvideo.training.self_forcing_distillation_pipeline import (
     SelfForcingDistillationPipeline,
 )
+from fastvideo.training.activation_checkpoint import apply_activation_checkpointing
 from fastvideo.training.training_utils import get_scheduler
 from fastvideo.utils import is_vsa_available
 
@@ -432,6 +433,23 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     def initialize_training_pipeline(self, training_args: TrainingArgs):
         super().initialize_training_pipeline(training_args)
+
+        # Activation checkpointing for ControlNet modules (important for memory in
+        # self-forcing rollout, where the KV-cache path would otherwise retain a
+        # large autograd graph).
+        if training_args.enable_gradient_checkpointing_type is not None:
+            for name in ("controlnet", "fake_score_controlnet",
+                         "real_score_controlnet"):
+                m = getattr(self, name, None)
+                if m is not None:
+                    setattr(
+                        self,
+                        name,
+                        apply_activation_checkpointing(
+                            m,
+                            checkpointing_type=training_args.
+                            enable_gradient_checkpointing_type),
+                    )
 
         # Freeze teacher controlnet
         if getattr(self, "real_score_controlnet", None) is not None:

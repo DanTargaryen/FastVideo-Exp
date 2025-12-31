@@ -497,10 +497,9 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             )
 
         # Store visualization data
-        training_batch.dmd_latent_vis_dict["generator_timestep"] = torch.tensor(
-            self.denoising_step_list[exit_flags[0]],
-            dtype=torch.float32,
-            device=self.device)
+        training_batch.dmd_latent_vis_dict["generator_timestep"] = (
+            self.denoising_step_list[exit_flags[0]].detach().clone().to(
+                device=self.device, dtype=torch.float32))
 
         # Store gradient mask information for debugging
         if gradient_mask is not None:
