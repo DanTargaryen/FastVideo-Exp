@@ -465,6 +465,37 @@ class CausalWanTransformer3DModel(BaseDiT):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        # Normalize timestep shape to (B, num_frames) so that downstream
+        # modulation tensors can be reshaped consistently.
+        timestep_2d = timestep
+        if timestep_2d.dim() == 0:
+            timestep_2d = timestep_2d.view(1, 1).expand(batch_size, num_frames)
+        elif timestep_2d.dim() == 1:
+            if timestep_2d.numel() == 1:
+                timestep_2d = timestep_2d.view(1,
+                                               1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size:
+                timestep_2d = timestep_2d.view(batch_size,
+                                               1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size * num_frames:
+                timestep_2d = timestep_2d.view(batch_size, num_frames)
+            elif batch_size == 1 and timestep_2d.numel() == num_frames:
+                timestep_2d = timestep_2d.view(1, num_frames)
+            else:
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        elif timestep_2d.dim() == 2:
+            if timestep_2d.shape == (batch_size, 1):
+                timestep_2d = timestep_2d.expand(batch_size, num_frames)
+            elif timestep_2d.shape != (batch_size, num_frames):
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
+            )
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
@@ -496,8 +527,11 @@ class CausalWanTransformer3DModel(BaseDiT):
         encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(1, self.text_len - encoder_hidden_states.size(1), encoder_hidden_states.size(2))], dim=1)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-                        timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image)
-        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(dim=0, sizes=timestep.shape)
+                        timestep_2d.flatten(), encoder_hidden_states, encoder_hidden_states_image)
+        timestep_proj = timestep_proj.unflatten(1,
+                                                (6, self.hidden_size)).unflatten(
+                                                    dim=0,
+                                                    sizes=timestep_2d.shape)
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
@@ -546,7 +580,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                     control_index].to(hidden_states.dtype)
 
         # 5. Output norm, projection & unpatchify
-        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
+        temb = temb.unflatten(dim=0, sizes=timestep_2d.shape).unsqueeze(2)
         shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2,
                                                                     dim=2)
         hidden_states = self.norm_out(hidden_states, shift, scale)
@@ -576,6 +610,37 @@ class CausalWanTransformer3DModel(BaseDiT):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        # Normalize timestep shape to (B, num_frames) so that downstream
+        # modulation tensors can be reshaped consistently.
+        timestep_2d = timestep
+        if timestep_2d.dim() == 0:
+            timestep_2d = timestep_2d.view(1, 1).expand(batch_size, num_frames)
+        elif timestep_2d.dim() == 1:
+            if timestep_2d.numel() == 1:
+                timestep_2d = timestep_2d.view(1,
+                                               1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size:
+                timestep_2d = timestep_2d.view(batch_size,
+                                               1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size * num_frames:
+                timestep_2d = timestep_2d.view(batch_size, num_frames)
+            elif batch_size == 1 and timestep_2d.numel() == num_frames:
+                timestep_2d = timestep_2d.view(1, num_frames)
+            else:
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        elif timestep_2d.dim() == 2:
+            if timestep_2d.shape == (batch_size, 1):
+                timestep_2d = timestep_2d.expand(batch_size, num_frames)
+            elif timestep_2d.shape != (batch_size, num_frames):
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
+            )
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
@@ -617,8 +682,11 @@ class CausalWanTransformer3DModel(BaseDiT):
         encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(1, self.text_len - encoder_hidden_states.size(1), encoder_hidden_states.size(2))], dim=1)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-                        timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image)
-        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(dim=0, sizes=timestep.shape)
+                        timestep_2d.flatten(), encoder_hidden_states, encoder_hidden_states_image)
+        timestep_proj = timestep_proj.unflatten(1,
+                                                (6, self.hidden_size)).unflatten(
+                                                    dim=0,
+                                                    sizes=timestep_2d.shape)
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
@@ -663,7 +731,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                         control_index].to(hidden_states.dtype)
 
         # 5. Output norm, projection & unpatchify
-        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
+        temb = temb.unflatten(dim=0, sizes=timestep_2d.shape).unsqueeze(2)
         shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2,
                                                                     dim=2)
         hidden_states = self.norm_out(hidden_states, shift, scale)

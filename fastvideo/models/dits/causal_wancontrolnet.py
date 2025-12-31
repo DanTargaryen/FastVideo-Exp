@@ -206,6 +206,39 @@ class CausalWanControlnet3DModel(BaseDiT):
         hidden_states = hidden_states.repeat(1, 3, 1, 1, 1) + controlnet_states
 
         batch_size, _c, num_frames, height, width = hidden_states.shape
+        # Normalize timestep shape to (B, num_frames) so that downstream
+        # modulation tensors can be reshaped consistently.
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.as_tensor(timestep, device=hidden_states.device)
+        else:
+            timestep = timestep.to(device=hidden_states.device)
+        timestep_2d = timestep
+        if timestep_2d.dim() == 0:
+            timestep_2d = timestep_2d.view(1, 1).expand(batch_size, num_frames)
+        elif timestep_2d.dim() == 1:
+            if timestep_2d.numel() == 1:
+                timestep_2d = timestep_2d.view(1, 1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size:
+                timestep_2d = timestep_2d.view(batch_size, 1).expand(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size * num_frames:
+                timestep_2d = timestep_2d.view(batch_size, num_frames)
+            elif batch_size == 1 and timestep_2d.numel() == num_frames:
+                timestep_2d = timestep_2d.view(1, num_frames)
+            else:
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        elif timestep_2d.dim() == 2:
+            if timestep_2d.shape == (batch_size, 1):
+                timestep_2d = timestep_2d.expand(batch_size, num_frames)
+            elif timestep_2d.shape != (batch_size, num_frames):
+                raise ValueError(
+                    f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
+            )
         _, p_h, p_w = self.patch_size
         post_patch_height = height // p_h
         post_patch_width = width // p_w
@@ -246,9 +279,11 @@ class CausalWanControlnet3DModel(BaseDiT):
         ], dim=1)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+            timestep_2d.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
-        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(dim=0, sizes=timestep.shape)
+        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
+            dim=0, sizes=timestep_2d.shape
+        )
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)

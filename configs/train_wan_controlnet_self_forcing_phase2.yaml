@@ -17,17 +17,17 @@ dit_precision: fp32
 inference_mode: false
 
 # ---- Paths ----
-pretrained_model_name_or_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-real_score_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-fake_score_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/yinli/Diff-Factory/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+pretrained_model_name_or_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+real_score_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+fake_score_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 
-controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
-real_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
-fake_score_controlnet_model_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/pretrained_weights/world-renderer-controlnet-warp-mask
+controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
+real_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
+fake_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
 
-init_weights_from_safetensors: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_fastvideo_inits/transformer_init.safetensors
-init_controlnet_weights_from_safetensors: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_fastvideo_inits/controlnet_init.safetensors
+init_weights_from_safetensors: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/stu_phase1/phase1_fastvideo_inits/transformer_init.safetensors
+init_controlnet_weights_from_safetensors: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/stu_phase1/phase1_fastvideo_inits/controlnet_init.safetensors
 
 # Optional: initialize STUDENT transformer weights from a custom safetensors file.
 # You can create this from your Diff-Factory fp32 state_dict via the helper script:
