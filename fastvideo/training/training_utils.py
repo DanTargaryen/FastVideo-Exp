@@ -206,6 +206,8 @@ def save_distillation_checkpoint(
         noise_generator=None,
         generator_ema=None,
         only_save_generator_weight=False,
+        generator_controlnet=None,
+        fake_score_controlnet=None,
         # MoE support
         generator_transformer_2=None,
         real_score_transformer_2=None,
@@ -244,13 +246,34 @@ def save_distillation_checkpoint(
 
     # Only save distributed checkpoint if not only saving generator weight
     if not only_save_generator_weight:
+        # If the optimizer includes parameters not present in `generator_transformer`
+        # (e.g. when training an external ControlNet), torch.distributed.checkpoint's
+        # optimizer state dict utilities will fail to map param ids -> FQNs.
+        # Wrap the involved modules under a single container module for DCP save/load.
+        class _CheckpointContainer(torch.nn.Module):
+            def __init__(self, **modules):
+                super().__init__()
+                for name, module in modules.items():
+                    if module is not None:
+                        setattr(self, name, module)
+
+        generator_ckpt_model = generator_transformer
+        if generator_controlnet is not None:
+            generator_ckpt_model = _CheckpointContainer(
+                transformer=generator_transformer, controlnet=generator_controlnet)
+
+        critic_ckpt_model = fake_score_transformer
+        if fake_score_controlnet is not None:
+            critic_ckpt_model = _CheckpointContainer(
+                transformer=fake_score_transformer, controlnet=fake_score_controlnet)
+
         # Save generator distributed checkpoint
         generator_states = {
-            "model": ModelWrapper(generator_transformer),
+            "model": ModelWrapper(generator_ckpt_model),
         }
         if generator_optimizer is not None:
             generator_states["optimizer"] = OptimizerWrapper(
-                generator_transformer, generator_optimizer)
+                generator_ckpt_model, generator_optimizer)
         if dataloader is not None:
             generator_states["dataloader"] = dataloader
         if generator_scheduler is not None:
@@ -313,11 +336,11 @@ def save_distillation_checkpoint(
 
         # Save critic distributed checkpoint
         critic_states = {
-            "model": ModelWrapper(fake_score_transformer),
+            "model": ModelWrapper(critic_ckpt_model),
         }
         if fake_score_optimizer is not None:
             critic_states["optimizer"] = OptimizerWrapper(
-                fake_score_transformer, fake_score_optimizer)
+                critic_ckpt_model, fake_score_optimizer)
         if dataloader is not None:
             critic_states["dataloader"] = dataloader
         if fake_score_scheduler is not None:
@@ -568,6 +591,8 @@ def load_distillation_checkpoint(
         fake_score_scheduler=None,
         noise_generator=None,
         generator_ema=None,
+        generator_controlnet=None,
+        fake_score_controlnet=None,
         # MoE support
         generator_transformer_2=None,
         real_score_transformer_2=None,
@@ -614,13 +639,30 @@ def load_distillation_checkpoint(
             generator_dcp_dir)
         return 0
 
+    class _CheckpointContainer(torch.nn.Module):
+        def __init__(self, **modules):
+            super().__init__()
+            for name, module in modules.items():
+                if module is not None:
+                    setattr(self, name, module)
+
+    generator_ckpt_model = generator_transformer
+    if generator_controlnet is not None:
+        generator_ckpt_model = _CheckpointContainer(
+            transformer=generator_transformer, controlnet=generator_controlnet)
+
+    critic_ckpt_model = fake_score_transformer
+    if fake_score_controlnet is not None:
+        critic_ckpt_model = _CheckpointContainer(
+            transformer=fake_score_transformer, controlnet=fake_score_controlnet)
+
     generator_states = {
-        "model": ModelWrapper(generator_transformer),
+        "model": ModelWrapper(generator_ckpt_model),
     }
 
     if generator_optimizer is not None:
         generator_states["optimizer"] = OptimizerWrapper(
-            generator_transformer, generator_optimizer)
+            generator_ckpt_model, generator_optimizer)
 
     if dataloader is not None:
         generator_states["dataloader"] = dataloader
@@ -724,11 +766,11 @@ def load_distillation_checkpoint(
         return 0
 
     critic_states = {
-        "model": ModelWrapper(fake_score_transformer),
+        "model": ModelWrapper(critic_ckpt_model),
     }
 
     if fake_score_optimizer is not None:
-        critic_states["optimizer"] = OptimizerWrapper(fake_score_transformer,
+        critic_states["optimizer"] = OptimizerWrapper(critic_ckpt_model,
                                                       fake_score_optimizer)
 
     if dataloader is not None:

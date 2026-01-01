@@ -1295,6 +1295,9 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     self.fake_score_lr_scheduler,
                     self.noise_random_generator,
                     self.generator_ema,
+                    generator_controlnet=getattr(self, "controlnet", None),
+                    fake_score_controlnet=getattr(self, "fake_score_controlnet",
+                                                  None),
                     # MoE support
                     generator_transformer_2=getattr(self, 'transformer_2',
                                                     None),
@@ -1333,6 +1336,9 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     f"{step}_weight_only",
                     only_save_generator_weight=True,
                     generator_ema=self.generator_ema,
+                    generator_controlnet=getattr(self, "controlnet", None),
+                    fake_score_controlnet=getattr(self, "fake_score_controlnet",
+                                                  None),
                     # MoE support
                     generator_transformer_2=getattr(self, 'transformer_2',
                                                     None),
@@ -1378,6 +1384,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             self.fake_score_lr_scheduler,
             self.noise_random_generator,
             self.generator_ema,
+            generator_controlnet=getattr(self, "controlnet", None),
+            fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
             # MoE support
             generator_transformer_2=getattr(self, 'transformer_2', None),
             real_score_transformer_2=getattr(self, 'real_score_transformer_2',
