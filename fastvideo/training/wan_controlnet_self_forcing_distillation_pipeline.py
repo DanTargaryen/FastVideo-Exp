@@ -283,6 +283,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                      training_batch) -> torch.Tensor:
         original_latent = generator_pred_video
         control_latent = getattr(training_batch, "control_latent", None)
+        if not hasattr(training_batch, "dmd_latent_vis_dict") or training_batch.dmd_latent_vis_dict is None:
+            training_batch.dmd_latent_vis_dict = {}
         with torch.no_grad():
             timestep = torch.randint(0,
                                      self.num_train_timestep, [1],
@@ -373,6 +375,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         dmd_loss = 0.5 * F.mse_loss(original_latent.float(),
                                     (original_latent.float() -
                                      grad.float()).detach())
+
+        training_batch.dmd_latent_vis_dict.update({
+            "training_batch_dmd_fwd_clean_latent": training_batch.latents,
+            "generator_pred_video": original_latent.detach(),
+            "real_score_pred_video": real_score_pred_video.detach(),
+            "faker_score_pred_video": faker_score_pred_video.detach(),
+            "dmd_timestep": timestep.detach(),
+        })
         return dmd_loss
 
     def faker_score_forward(self, training_batch):

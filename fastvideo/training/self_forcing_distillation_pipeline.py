@@ -5,6 +5,7 @@ import time
 from collections import deque
 from typing import Any
 
+import imageio
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -1015,6 +1016,99 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         if self.global_rank == 0 and tracker_loss_dict:
             self.tracker.log_artifacts(tracker_loss_dict, step)
 
+    @torch.no_grad()
+    def _decode_latents_to_video_uint8(
+        self,
+        latents_bfchw: torch.Tensor,
+        *,
+        max_frames: int = 0,
+    ) -> np.ndarray:
+        vae_device = next(self.vae.parameters()).device
+        # latents: (B, F_lat, C, H, W) -> VAE expects (B, C, F_lat, H, W)
+        latents = latents_bfchw.detach().permute(0, 2, 1, 3, 4).to(vae_device)
+
+        if isinstance(self.vae.scaling_factor, torch.Tensor):
+            latents = latents / self.vae.scaling_factor.to(
+                latents.device, latents.dtype)
+        else:
+            latents = latents / self.vae.scaling_factor
+
+        if hasattr(self.vae,
+                   "shift_factor") and self.vae.shift_factor is not None:
+            if isinstance(self.vae.shift_factor, torch.Tensor):
+                latents = latents + self.vae.shift_factor.to(
+                    latents.device, latents.dtype)
+            else:
+                latents = latents + self.vae.shift_factor
+
+        if vae_device.type == "cuda":
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                video = self.vae.decode(latents)
+        else:
+            video = self.vae.decode(latents)
+
+        video = (video / 2 + 0.5).clamp(0, 1).cpu().float()
+        video = video.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
+        if max_frames and max_frames > 0:
+            video = video[:, :max_frames]
+        video = (video * 255).numpy().astype(np.uint8)
+        return video
+
+    @torch.no_grad()
+    def _maybe_log_checkpoint_preview(self, training_batch: TrainingBatch,
+                                      step: int, *, tag: str) -> None:
+        if self.global_rank != 0:
+            return
+        if not getattr(self.training_args, "checkpoint_preview", False):
+            return
+
+        latents = None
+        source = None
+        if getattr(training_batch, "dmd_latent_vis_dict", None):
+            latents = training_batch.dmd_latent_vis_dict.get(
+                "generator_pred_video")
+            source = "dmd/generator_pred_video"
+        if latents is None and getattr(training_batch, "fake_score_latent_vis_dict",
+                                       None):
+            latents = training_batch.fake_score_latent_vis_dict.get(
+                "generator_pred_video")
+            source = "critic/generator_pred_video"
+
+        if not isinstance(latents, torch.Tensor):
+            logger.info(
+                "Skipping checkpoint preview at step %s (no generator latents in vis dicts)",
+                step)
+            return
+
+        max_frames = int(getattr(self.training_args, "checkpoint_preview_max_frames",
+                                 0) or 0)
+        fps = int(getattr(self.training_args, "checkpoint_preview_fps", 24) or 24)
+
+        video_uint8 = self._decode_latents_to_video_uint8(latents,
+                                                          max_frames=max_frames)
+
+        # 1) Log to tracker (wandb if enabled)
+        caption = f"{tag} step={step} source={source}"
+        video_artifact = self.tracker.video(video_uint8,
+                                            fps=fps,
+                                            format="mp4",
+                                            caption=caption)
+        if video_artifact is not None:
+            self.tracker.log_artifacts({f"checkpoint_preview/{tag}": video_artifact},
+                                       step)
+
+        # 2) Save mp4 to disk under output_dir for quick local inspection
+        try:
+            out_dir = os.path.join(self.training_args.output_dir,
+                                   "checkpoint_previews")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{tag}_step_{step:07d}.mp4")
+            frames = video_uint8[0].transpose(0, 2, 3, 1)  # (T,H,W,C)
+            imageio.mimwrite(out_path, frames, fps=fps)
+            logger.info("Saved checkpoint preview video: %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to save checkpoint preview mp4: %s", e)
+
     @profile_region("profiler_region_training_train")
     def train(self) -> None:
         """Main training loop with self-forcing specific logging."""
@@ -1162,15 +1256,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 log_data.update(ema_stats)
 
                 if training_batch.dmd_latent_vis_dict:
-                    dmd_additional_logs = {
-                        "generator_timestep":
-                        training_batch.
-                        dmd_latent_vis_dict["generator_timestep"].item(),
-                        "dmd_timestep":
-                        training_batch.dmd_latent_vis_dict["dmd_timestep"].item(
-                        ),
-                    }
-                    log_data.update(dmd_additional_logs)
+                    if "generator_timestep" in training_batch.dmd_latent_vis_dict:
+                        log_data["generator_timestep"] = training_batch.dmd_latent_vis_dict[
+                            "generator_timestep"].item()
+                    if "dmd_timestep" in training_batch.dmd_latent_vis_dict:
+                        log_data["dmd_timestep"] = training_batch.dmd_latent_vis_dict[
+                            "dmd_timestep"].item()
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":
@@ -1221,6 +1312,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                                    None),
                     generator_ema_2=getattr(self, 'generator_ema_2', None))
 
+                self._maybe_log_checkpoint_preview(training_batch,
+                                                   step,
+                                                   tag="train_state")
+
                 if self.transformer:
                     self.transformer.train()
                 self.sp_group.barrier()
@@ -1254,6 +1349,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                                    'fake_score_lr_scheduler_2',
                                                    None),
                     generator_ema_2=getattr(self, 'generator_ema_2', None))
+
+                self._maybe_log_checkpoint_preview(training_batch,
+                                                   step,
+                                                   tag="weight_only")
 
                 if self.training_args.use_ema and self.is_ema_ready():
                     self.save_ema_weights(self.training_args.output_dir, step)

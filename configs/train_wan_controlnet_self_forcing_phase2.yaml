@@ -92,3 +92,13 @@ checkpoints_total_limit: 2
 training_state_checkpointing_steps: 200
 weight_only_checkpointing_steps: 0
 log_validation: false
+
+# ---- Tracking / Preview ----
+# Enable wandb by setting `tracker_project_name` (FastVideo will auto-enable WANDB on rank0).
+tracker_project_name: worldrender_phase2
+wandb_run_name: wan_controlnet_self_forcing_phase2
+
+# At each checkpoint save, decode the current student "clean" latent prediction and log/save an mp4.
+checkpoint_preview: true
+checkpoint_preview_fps: 24
+checkpoint_preview_max_frames: 0

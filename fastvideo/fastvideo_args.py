@@ -819,6 +819,9 @@ class TrainingArgs(FastVideoArgs):
     training_state_checkpointing_steps: int = 0  # for resuming training
     weight_only_checkpointing_steps: int = 0  # for inference
     log_visualization: bool = False
+    checkpoint_preview: bool = False
+    checkpoint_preview_fps: int = 24
+    checkpoint_preview_max_frames: int = 0  # 0 means keep all frames
     # simulate generator forward to match inference
     simulate_generator_forward: bool = False
     warp_denoising_step: bool = False
@@ -1038,6 +1041,21 @@ class TrainingArgs(FastVideoArgs):
         parser.add_argument("--logging-dir",
                             type=str,
                             help="Directory for logging")
+        parser.add_argument(
+            "--checkpoint-preview",
+            action=StoreBoolean,
+            help=
+            "Whether to decode and log a preview video at every checkpoint save"
+        )
+        parser.add_argument("--checkpoint-preview-fps",
+                            type=int,
+                            default=24,
+                            help="FPS for checkpoint preview videos")
+        parser.add_argument(
+            "--checkpoint-preview-max-frames",
+            type=int,
+            default=0,
+            help="Max frames to log/save for checkpoint preview (0 = all)")
 
         # Training configuration
         parser.add_argument("--num-train-epochs",
