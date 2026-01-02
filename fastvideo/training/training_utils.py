@@ -758,8 +758,21 @@ def load_distillation_checkpoint(
                        checkpoint_path)
         return 0
 
-    # Extract step number from checkpoint path
-    step = int(os.path.basename(checkpoint_path).split('-')[-1])
+    # Extract step number from checkpoint path (handle trailing slash and
+    # accidental `.../distributed_checkpoint` inputs).
+    checkpoint_path = os.path.normpath(checkpoint_path)
+    base = os.path.basename(checkpoint_path)
+    if base == "distributed_checkpoint":
+        checkpoint_path = os.path.dirname(checkpoint_path)
+        base = os.path.basename(checkpoint_path)
+    try:
+        step = int(base.split('-')[-1])
+    except ValueError:
+        logger.warning(
+            "Invalid distillation checkpoint path %s (expected basename like 'checkpoint-<step>').",
+            checkpoint_path,
+        )
+        return 0
 
     if rank == 0:
         logger.info("Loading distillation checkpoint from step %s", step)
