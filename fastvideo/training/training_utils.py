@@ -94,13 +94,30 @@ def _dtensor_full_tensor_fallback(param: torch.Tensor) -> torch.Tensor:
     world_size = dist.get_world_size()
 
     local_cpu = local.detach().cpu()
+    # `dist.gather` requires matching tensor shapes across ranks. DTensor shards
+    # may have uneven sizes (e.g. when global dim is not divisible). Pad to the
+    # per-dim max size across ranks before gathering, then slice back using the
+    # DTensor's global shape.
+    shape_t = torch.tensor(list(local_cpu.shape), dtype=torch.int64)
+    shape_list = [torch.empty_like(shape_t) for _ in range(world_size)]
+    dist.all_gather(shape_list, shape_t, group=group)
+    max_shape = torch.stack(shape_list, dim=0).max(dim=0).values.tolist()
+    if list(local_cpu.shape) != max_shape:
+        import torch.nn.functional as F
+
+        pad = []
+        for cur, mx in zip(reversed(local_cpu.shape), reversed(max_shape)):
+            pad.extend([0, int(mx - cur)])
+        local_cpu = F.pad(local_cpu, pad)
+
     if rank == 0:
         gather_list = [torch.empty_like(local_cpu) for _ in range(world_size)]
         dist.gather(local_cpu, gather_list=gather_list, dst=0, group=group)
         full = torch.cat(gather_list, dim=shard_dim)
-        global_size = int(param.shape[shard_dim])
-        if full.shape[shard_dim] != global_size:
-            full = full.narrow(shard_dim, 0, global_size)
+        global_shape = tuple(int(x) for x in param.shape)
+        for dim, gsz in enumerate(global_shape):
+            if full.shape[dim] != gsz:
+                full = full.narrow(dim, 0, gsz)
         return full
 
     dist.gather(local_cpu, gather_list=None, dst=0, group=group)
@@ -122,32 +139,22 @@ def gather_state_dict_on_cpu_rank0(
     for param_name, param in sharded_sd.items():
         if param_name not in param_requires_grad:
             continue
-        if hasattr(param, "_local_tensor"):
-            # DTensor case
+        if hasattr(param, "_local_tensor") or hasattr(param, "to_local"):
+            # DTensor case:
+            # Avoid `DTensor.full_tensor()` entirely because it may call NCCL
+            # collectives (e.g. allgather_into_tensor_coalesced) that are not
+            # available in some environments. Always use our CPU-gather path.
             try:
-                if param.is_cpu:
-                    # Gather directly on CPU
-                    param = param.full_tensor()
-                else:
-                    if device is not None:
-                        param = param.to(device)
-                    param = param.full_tensor()
-            except RuntimeError as e:
-                # Fallback for environments where DTensor uses NCCL ops that are
-                # not available (e.g. allgather_into_tensor_coalesced).
-                msg = str(e)
-                if "allgather_into_tensor_coalesced" in msg or "does not support" in msg:
-                    # NOTE: fastvideo's process-aware kwargs exist on logger.info(..),
-                    # but not on logger.warning(..). Use info here to avoid crashing.
-                    logger.info(
-                        "DTensor full_tensor() failed for %s (%s). Falling back to CPU gather via gloo.",
-                        param_name,
-                        msg.splitlines()[0],
-                        local_main_process_only=False,
-                    )
-                    param = _dtensor_full_tensor_fallback(param)
-                else:
-                    raise
+                param = _dtensor_full_tensor_fallback(param)
+            except Exception as e:
+                # Keep the error message actionable; don't risk logging kwargs
+                # that might not be supported by the active logger backend.
+                logger.info(
+                    "DTensor CPU-gather fallback failed for %s: %s",
+                    param_name,
+                    str(e).splitlines()[0] if str(e) else repr(e),
+                )
+                raise
         else:
             # Regular tensor case
             if param.is_cpu:

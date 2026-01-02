@@ -95,7 +95,7 @@ training_state_checkpointing_steps: 200
 # - `generator_inference_controlnet/` (student controlnet)
 # This is slower than distributed checkpointing and may use significant CPU RAM, but it's
 # convenient for inference/export.
-weight_only_checkpointing_steps: 800
+weight_only_checkpointing_steps: 8000
 log_validation: false
 
 # ---- Tracking / Preview ----
