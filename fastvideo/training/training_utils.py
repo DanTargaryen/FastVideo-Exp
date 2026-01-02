@@ -63,15 +63,15 @@ def _dtensor_full_tensor_fallback(param: torch.Tensor) -> torch.Tensor:
     This avoids DTensor's internal functional collectives which may require NCCL
     ops unavailable in some environments.
     """
-    if not hasattr(param, "_local_tensor"):
+    if not hasattr(param, "_local_tensor") and not hasattr(param, "to_local"):
         return param
 
-    local = getattr(param, "_local_tensor")
+    local = param.to_local() if hasattr(param, "to_local") else getattr(param, "_local_tensor")
     if not isinstance(local, torch.Tensor):
         raise TypeError(f"DTensor local shard is not a Tensor: {type(local)}")
 
     # Determine sharded tensor dim (default to 0 for FSDP2 sharding).
-    shard_dim = 0
+    # If there is no Shard placement, this DTensor is effectively replicated.
     placements = getattr(param, "placements", None)
     if placements is not None:
         shard_dims = [getattr(p, "dim") for p in placements if hasattr(p, "dim")]
@@ -79,8 +79,12 @@ def _dtensor_full_tensor_fallback(param: torch.Tensor) -> torch.Tensor:
             raise NotImplementedError(
                 f"DTensor fallback only supports a single Shard placement, got: {placements}"
             )
-        if len(shard_dims) == 1:
-            shard_dim = int(shard_dims[0])
+        if len(shard_dims) == 0:
+            # Replicated DTensor: local tensor is already the full tensor.
+            return local.detach().cpu()
+        shard_dim = int(shard_dims[0])
+    else:
+        shard_dim = 0
 
     group = _get_cpu_gloo_group()
     if group is None:
@@ -133,7 +137,9 @@ def gather_state_dict_on_cpu_rank0(
                 # not available (e.g. allgather_into_tensor_coalesced).
                 msg = str(e)
                 if "allgather_into_tensor_coalesced" in msg or "does not support" in msg:
-                    logger.warning(
+                    # NOTE: fastvideo's process-aware kwargs exist on logger.info(..),
+                    # but not on logger.warning(..). Use info here to avoid crashing.
+                    logger.info(
                         "DTensor full_tensor() failed for %s (%s). Falling back to CPU gather via gloo.",
                         param_name,
                         msg.splitlines()[0],
