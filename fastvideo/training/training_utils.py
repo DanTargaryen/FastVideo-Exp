@@ -336,6 +336,8 @@ def save_distillation_checkpoint(
     # Create directories for models
     inference_save_dir = os.path.join(save_dir,
                                       "generator_inference_transformer")
+    inference_save_controlnet_dir = os.path.join(save_dir,
+                                                 "generator_inference_controlnet")
 
     # Only save distributed checkpoint if not only saving generator weight
     if not only_save_generator_weight:
@@ -572,6 +574,39 @@ def save_distillation_checkpoint(
                 step,
                 weight_path,
             )
+
+            # Save generator ControlNet weights (consolidated) for inference
+            if generator_controlnet is not None:
+                cpu_controlnet_state = gather_state_dict_on_cpu_rank0(
+                    generator_controlnet, device=None)
+                os.makedirs(inference_save_controlnet_dir, exist_ok=True)
+                controlnet_weight_path = os.path.join(
+                    inference_save_controlnet_dir,
+                    "diffusion_pytorch_model.safetensors")
+                logger.info(
+                    "rank: %s, saving consolidated generator controlnet inference checkpoint to %s",
+                    rank,
+                    controlnet_weight_path,
+                    local_main_process_only=False)
+
+                controlnet_diffusers_state = custom_to_hf_state_dict(
+                    cpu_controlnet_state,
+                    generator_controlnet.reverse_param_names_mapping)
+                save_file(controlnet_diffusers_state, controlnet_weight_path)
+
+                controlnet_config = generator_controlnet.hf_config
+                if "dtype" in controlnet_config:
+                    del controlnet_config["dtype"]  # TODO
+                controlnet_config_path = os.path.join(
+                    inference_save_controlnet_dir, "config.json")
+                with open(controlnet_config_path, "w") as f:
+                    json.dump(controlnet_config, f, indent=4)
+
+                logger.info(
+                    "rank: %s, consolidated generator controlnet inference checkpoint saved to %s",
+                    rank,
+                    controlnet_weight_path,
+                    local_main_process_only=False)
 
             # Save generator_2 model weights (consolidated) for inference (MoE support)
             if generator_transformer_2 is not None:
