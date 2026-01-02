@@ -27,6 +27,81 @@ from fastvideo.distributed.parallel_state import (get_sp_parallel_rank,
 logger = init_logger(__name__)
 
 _HAS_ERRORED_CLIP_GRAD_NORM_WHILE_HANDLING_FAILING_DTENSOR_CASES = False
+_CPU_GLOO_GROUP = None
+
+
+def _get_cpu_gloo_group():
+    """
+    A dedicated CPU (gloo) process group for checkpoint gathering.
+
+    Some PyTorch builds/backends do not support certain DTensor collectives on NCCL
+    (e.g. `allgather_into_tensor_coalesced`). For checkpointing we can fall back
+    to CPU gather using a gloo group.
+    """
+    global _CPU_GLOO_GROUP
+    if _CPU_GLOO_GROUP is not None:
+        return _CPU_GLOO_GROUP
+    if not dist.is_initialized():
+        return None
+
+    world_size = dist.get_world_size()
+    ranks = list(range(world_size))
+    _CPU_GLOO_GROUP = dist.new_group(ranks=ranks, backend="gloo")
+    return _CPU_GLOO_GROUP
+
+
+def _dtensor_full_tensor_fallback(param: torch.Tensor) -> torch.Tensor:
+    """
+    Fallback implementation for DTensor -> full tensor gathering.
+
+    Assumptions (matches our training setup):
+    - parameters are sharded with a single Shard(dim=0) placement (HSDP/FSDP2),
+      possibly alongside Replicate placements.
+    - hsdp_replicate_dim is 1 (single replicate group), so global ranks form the
+      sharding group.
+
+    This avoids DTensor's internal functional collectives which may require NCCL
+    ops unavailable in some environments.
+    """
+    if not hasattr(param, "_local_tensor"):
+        return param
+
+    local = getattr(param, "_local_tensor")
+    if not isinstance(local, torch.Tensor):
+        raise TypeError(f"DTensor local shard is not a Tensor: {type(local)}")
+
+    # Determine sharded tensor dim (default to 0 for FSDP2 sharding).
+    shard_dim = 0
+    placements = getattr(param, "placements", None)
+    if placements is not None:
+        shard_dims = [getattr(p, "dim") for p in placements if hasattr(p, "dim")]
+        if len(shard_dims) > 1:
+            raise NotImplementedError(
+                f"DTensor fallback only supports a single Shard placement, got: {placements}"
+            )
+        if len(shard_dims) == 1:
+            shard_dim = int(shard_dims[0])
+
+    group = _get_cpu_gloo_group()
+    if group is None:
+        raise RuntimeError("Distributed not initialized; cannot gather DTensor")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    local_cpu = local.detach().cpu()
+    if rank == 0:
+        gather_list = [torch.empty_like(local_cpu) for _ in range(world_size)]
+        dist.gather(local_cpu, gather_list=gather_list, dst=0, group=group)
+        full = torch.cat(gather_list, dim=shard_dim)
+        global_size = int(param.shape[shard_dim])
+        if full.shape[shard_dim] != global_size:
+            full = full.narrow(shard_dim, 0, global_size)
+        return full
+
+    dist.gather(local_cpu, gather_list=None, dst=0, group=group)
+    # Non-rank0 will never use the returned value.
+    return local_cpu
 
 
 def gather_state_dict_on_cpu_rank0(
@@ -45,13 +120,28 @@ def gather_state_dict_on_cpu_rank0(
             continue
         if hasattr(param, "_local_tensor"):
             # DTensor case
-            if param.is_cpu:
-                # Gather directly on CPU
-                param = param.full_tensor()
-            else:
-                if device is not None:
-                    param = param.to(device)
-                param = param.full_tensor()
+            try:
+                if param.is_cpu:
+                    # Gather directly on CPU
+                    param = param.full_tensor()
+                else:
+                    if device is not None:
+                        param = param.to(device)
+                    param = param.full_tensor()
+            except RuntimeError as e:
+                # Fallback for environments where DTensor uses NCCL ops that are
+                # not available (e.g. allgather_into_tensor_coalesced).
+                msg = str(e)
+                if "allgather_into_tensor_coalesced" in msg or "does not support" in msg:
+                    logger.warning(
+                        "DTensor full_tensor() failed for %s (%s). Falling back to CPU gather via gloo.",
+                        param_name,
+                        msg.splitlines()[0],
+                        local_main_process_only=False,
+                    )
+                    param = _dtensor_full_tensor_fallback(param)
+                else:
+                    raise
         else:
             # Regular tensor case
             if param.is_cpu:
@@ -206,6 +296,7 @@ def save_distillation_checkpoint(
         noise_generator=None,
         generator_ema=None,
         only_save_generator_weight=False,
+        save_consolidated_inference_checkpoint: bool = True,
         generator_controlnet=None,
         fake_score_controlnet=None,
         # MoE support
@@ -220,14 +311,16 @@ def save_distillation_checkpoint(
     """
     Save distillation checkpoint with both generator and fake_score models.
     Supports MoE (Mixture of Experts) models with transformer_2 variants.
-    Saves both distributed checkpoint and consolidated model weights.
-    Only saves the generator model for inference (consolidated weights).
+    Saves distributed checkpoint for training resume, and can optionally save a
+    consolidated (single-file) inference checkpoint for the generator.
     
     Args:
         generator_transformer: Main generator transformer model
         fake_score_transformer: Main fake score transformer model
         only_save_generator_weight: If True, only save the generator model weights for inference
                                    without saving distributed checkpoint for training resume.
+        save_consolidated_inference_checkpoint: If True, save a consolidated (single-file) inference
+                                    checkpoint under `generator_inference_transformer/`.
         generator_transformer_2: Secondary generator transformer for MoE (optional)
         real_score_transformer_2: Secondary real score transformer for MoE (optional) 
         fake_score_transformer_2: Secondary fake score transformer for MoE (optional)
@@ -439,54 +532,58 @@ def save_distillation_checkpoint(
             rank,
             local_main_process_only=False)
 
-    # Save generator model weights (consolidated) for inference
-    cpu_state = gather_state_dict_on_cpu_rank0(generator_transformer,
-                                               device=None)
-
-    if rank == 0:
+    if save_consolidated_inference_checkpoint:
         # Save generator model weights (consolidated) for inference
-        os.makedirs(inference_save_dir, exist_ok=True)
-        weight_path = os.path.join(inference_save_dir,
-                                   "diffusion_pytorch_model.safetensors")
-        logger.info(
-            "rank: %s, saving consolidated generator inference checkpoint to %s",
-            rank,
-            weight_path,
-            local_main_process_only=False)
+        cpu_state = gather_state_dict_on_cpu_rank0(generator_transformer,
+                                                   device=None)
 
-        # Convert training format to diffusers format and save
-        diffusers_state_dict = custom_to_hf_state_dict(
-            cpu_state, generator_transformer.reverse_param_names_mapping)
-        save_file(diffusers_state_dict, weight_path)
+        if rank == 0:
+            # Save generator model weights (consolidated) for inference
+            os.makedirs(inference_save_dir, exist_ok=True)
+            weight_path = os.path.join(inference_save_dir,
+                                       "diffusion_pytorch_model.safetensors")
+            logger.info(
+                "rank: %s, saving consolidated generator inference checkpoint to %s",
+                rank,
+                weight_path,
+                local_main_process_only=False)
 
-        logger.info(
-            "rank: %s, consolidated generator inference checkpoint saved to %s",
-            rank,
-            weight_path,
-            local_main_process_only=False)
+            # Convert training format to diffusers format and save
+            diffusers_state_dict = custom_to_hf_state_dict(
+                cpu_state, generator_transformer.reverse_param_names_mapping)
+            save_file(diffusers_state_dict, weight_path)
 
-        # Save model config
-        config_dict = generator_transformer.hf_config
-        if "dtype" in config_dict:
-            del config_dict["dtype"]  # TODO
-        config_path = os.path.join(inference_save_dir, "config.json")
-        # save dict as json
-        with open(config_path, "w") as f:
-            json.dump(config_dict, f, indent=4)
-        logger.info("--> distillation checkpoint saved at step %s to %s", step,
-                    weight_path)
+            logger.info(
+                "rank: %s, consolidated generator inference checkpoint saved to %s",
+                rank,
+                weight_path,
+                local_main_process_only=False)
 
-        # Save generator_2 model weights (consolidated) for inference (MoE support)
-        if generator_transformer_2 is not None:
-            inference_save_dir_2 = os.path.join(
-                save_dir, "generator_2_inference_transformer")
-            cpu_state_2 = gather_state_dict_on_cpu_rank0(
-                generator_transformer_2, device=None)
+            # Save model config
+            config_dict = generator_transformer.hf_config
+            if "dtype" in config_dict:
+                del config_dict["dtype"]  # TODO
+            config_path = os.path.join(inference_save_dir, "config.json")
+            # save dict as json
+            with open(config_path, "w") as f:
+                json.dump(config_dict, f, indent=4)
+            logger.info(
+                "--> distillation checkpoint saved at step %s to %s",
+                step,
+                weight_path,
+            )
 
-            if rank == 0:
+            # Save generator_2 model weights (consolidated) for inference (MoE support)
+            if generator_transformer_2 is not None:
+                inference_save_dir_2 = os.path.join(
+                    save_dir, "generator_2_inference_transformer")
+                cpu_state_2 = gather_state_dict_on_cpu_rank0(
+                    generator_transformer_2, device=None)
+
                 os.makedirs(inference_save_dir_2, exist_ok=True)
                 weight_path_2 = os.path.join(
-                    inference_save_dir_2, "diffusion_pytorch_model.safetensors")
+                    inference_save_dir_2,
+                    "diffusion_pytorch_model.safetensors")
                 logger.info(
                     "rank: %s, saving consolidated generator_2 inference checkpoint to %s",
                     rank,
@@ -515,7 +612,9 @@ def save_distillation_checkpoint(
                     json.dump(config_dict_2, f, indent=4)
                 logger.info(
                     "--> generator_2 distillation checkpoint saved at step %s to %s",
-                    step, weight_path_2)
+                    step,
+                    weight_path_2,
+                )
 
 
 def load_checkpoint(transformer,

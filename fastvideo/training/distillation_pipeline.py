@@ -1649,6 +1649,7 @@ class DistillationPipeline(TrainingPipeline):
                     self.fake_score_lr_scheduler,
                     self.noise_random_generator,
                     self.generator_ema,
+                    save_consolidated_inference_checkpoint=False,
                     generator_controlnet=getattr(self, "controlnet", None),
                     fake_score_controlnet=getattr(self, "fake_score_controlnet",
                                                   None),
