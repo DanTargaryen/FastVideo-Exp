@@ -62,7 +62,7 @@ dmd_denoising_steps: "1000,750,500,250"
 warp_denoising_step: true
 
 # ---- Training ----
-max_train_steps: 2000
+max_train_steps: 4000
 gradient_accumulation_steps: 4
 learning_rate: 2.0e-6
 weight_decay: 0.01
@@ -90,7 +90,10 @@ flow_shift: 8
 output_dir: outputs/wan_controlnet_self_forcing_phase2
 checkpoints_total_limit: 2
 training_state_checkpointing_steps: 200
-weight_only_checkpointing_steps: 0
+# Additionally save a consolidated (single-file) generator inference checkpoint every N steps.
+# This is slower than distributed checkpointing and may use significant CPU RAM, but it's
+# convenient for inference/export.
+weight_only_checkpointing_steps: 800
 log_validation: false
 
 # ---- Tracking / Preview ----
