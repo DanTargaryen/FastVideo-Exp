@@ -405,12 +405,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
         full_ts = scheduler.timesteps.to(device=device)
         idx_list = list(timestep_indices)
         if update_rule == "euler_dt":
-            # For Euler integration between sparse anchors, we also need a terminal point (t=0).
-            # Some scheduler variants expose an extra terminal sigma=0 in `sigmas` but not in `timesteps`.
-            # Only append a terminal index if it's actually in-range for `scheduler.timesteps`.
-            terminal_idx = int(schedule_num_inference_steps)
-            if terminal_idx < full_ts.numel() and (len(idx_list) == 0 or idx_list[-1] != terminal_idx):
-                idx_list = idx_list + [terminal_idx]
+            # For deterministic Euler stepping, we need a "next" timestep after the last anchor.
+            # In Diff-Factory phase-1 setups this is often the last schedule index (e.g. 49 for a 50-step grid),
+            # even if it is not considered an "anchor" for training (it only serves as nxt[i]).
+            last_idx = int(schedule_num_inference_steps) - 1
+            if last_idx >= 0 and (len(idx_list) == 0 or idx_list[-1] != last_idx):
+                idx_list = idx_list + [last_idx]
 
         idx_t = torch.tensor(idx_list, device=device, dtype=torch.long)
         if torch.any(idx_t < 0) or torch.any(idx_t >= full_ts.numel()):
@@ -419,8 +419,9 @@ def _causal_dmd_rollout_ti2v_controlnet(
             )
         t_list_full = full_ts.index_select(0, idx_t).to(device=device)
         logger.info(
-            "rollout schedule: timestep_indices=%s (schedule_num_inference_steps=%s) -> timesteps=%s",
+            "rollout schedule: timestep_indices=%s (effective_indices=%s, schedule_num_inference_steps=%s) -> timesteps=%s",
             list(timestep_indices),
+            idx_list,
             int(schedule_num_inference_steps),
             [int(x) for x in t_list_full.detach().cpu().tolist()],
         )
@@ -546,22 +547,15 @@ def _causal_dmd_rollout_ti2v_controlnet(
         # Timesteps for this chunk.
         t_list = t_list_full
 
-        # DMD steps: predict flow -> reconstruct clean x0 -> re-noise to next anchor
-        for step_i, t_cur in enumerate(t_list):
-            # Work in BFCHW like training does.
-            noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+        def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             latent_model_input = current_latents
-
             if first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
-                latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
-                    device=device, dtype=dtype)
+                latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
 
-            # Match training: per-frame timestep tensor (B, F). Keep as float for embedding stability.
             timestep = torch.ones((1, current_num_frames),
                                   device=device,
-                                  dtype=torch.float32) * t_cur
-            # TI2V: mimic Diff-Factory's "expand_timesteps" first-frame masking by setting frame0 timestep to 0.
+                                  dtype=torch.float32) * t_scalar
             if first_frame_latent_bcfhw is not None and start_index == 0:
                 timestep = timestep.clone()
                 timestep[:, 0] = 0
@@ -569,9 +563,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
                                 enabled=(dtype != torch.float32)):
-                # ForwardContext.current_timestep is used by some attention backends as an *index*.
-                # Use the denoising step index for maximum compatibility.
-                with set_forward_context(current_timestep=int(step_i),
+                with set_forward_context(current_timestep=int(step_index),
                                          attn_metadata=None,
                                          forward_batch=batch):
                     control_res_cond = controlnet(
@@ -597,10 +589,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
                 if guidance_scale != 1.0:
                     if negative_prompt_embeds_list is None:
-                        raise ValueError(
-                            "guidance_scale != 1.0 requires negative_prompt_embeds_list."
-                        )
-                    with set_forward_context(current_timestep=int(step_i),
+                        raise ValueError("guidance_scale != 1.0 requires negative_prompt_embeds_list.")
+                    with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
                         control_res_uncond = controlnet(
@@ -623,21 +613,30 @@ def _causal_dmd_rollout_ti2v_controlnet(
                             current_start=start_index * frame_seq_length,
                             start_frame=start_index,
                         ).permute(0, 2, 1, 3, 4)
+                    return pred_flow_uncond_btchw + float(guidance_scale) * (pred_flow_cond_btchw - pred_flow_uncond_btchw)
 
-                    pred_flow_btchw = pred_flow_uncond_btchw + float(
-                        guidance_scale) * (pred_flow_cond_btchw -
-                                           pred_flow_uncond_btchw)
-                else:
-                    pred_flow_btchw = pred_flow_cond_btchw
+            return pred_flow_cond_btchw
 
-            denoised_pred = pred_noise_to_pred_video(
-                pred_noise=pred_flow_btchw.flatten(0, 1),
-                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
-                timestep=timestep,
-                scheduler=scheduler,
-            ).unflatten(0, pred_flow_btchw.shape[:2])
+        if update_rule == "renoise_x0":
+            # Stochastic renoise chain (Self-Forcing simulation style): predict x0 then add noise at the next anchor.
+            for step_i, t_cur in enumerate(t_list):
+                noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+                pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
 
-            if update_rule == "renoise_x0":
+                timestep = torch.ones((1, current_num_frames),
+                                      device=device,
+                                      dtype=torch.float32) * t_cur
+                if first_frame_latent_bcfhw is not None and start_index == 0:
+                    timestep = timestep.clone()
+                    timestep[:, 0] = 0
+
+                denoised_pred = pred_noise_to_pred_video(
+                    pred_noise=pred_flow_btchw.flatten(0, 1),
+                    noise_input_latent=noisy_input_bfchw.flatten(0, 1),
+                    timestep=timestep,
+                    scheduler=scheduler,
+                ).unflatten(0, pred_flow_btchw.shape[:2])
+
                 if step_i < len(t_list) - 1:
                     next_timestep = t_list[step_i + 1]
                     noise = torch.randn_like(denoised_pred.flatten(0, 1))
@@ -653,30 +652,59 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
                 else:
                     current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
-            elif update_rule == "euler_dt":
-                # Deterministic Euler update in sigma space:
-                #   x_{t_next} = x_{t} + (sigma(t_next) - sigma(t)) * v_theta(x_t, t)
-                # We still return x0 at the final step (like DMD) via `denoised_pred`.
-                if step_i < len(t_list) - 1:
-                    t_next = t_list[step_i + 1]
-                    timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
-                    sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
-                    # Map t -> nearest sigma index (same logic as `pred_noise_to_pred_video`).
-                    idx_cur = torch.argmin((timesteps_1d - t_cur).abs())
-                    idx_next = torch.argmin((timesteps_1d - t_next).abs())
-                    sigma_cur = sigmas_1d[idx_cur]
-                    sigma_next = sigmas_1d[idx_next]
-                    dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
-                    current_latents = current_latents + dt * pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
-                else:
-                    current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
-            else:
-                raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
+                if first_frame_latent_bcfhw is not None and start_index == 0:
+                    current_latents = current_latents.clone()
+                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+
+        elif update_rule == "euler_dt":
+            # Deterministic Euler stepping in sigma space (Diff-Factory-style):
+            #   x_{t_next} = x_{t} + (sigma(t_next) - sigma(t)) * v_theta(x_t, t)
+            # then at the final (low-noise) timestep, predict x0 once.
+            if t_list.numel() < 2:
+                raise ValueError("euler_dt requires at least 2 timesteps (need a next timestep).")
+            timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
+            sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
+
+            # Step through (t_cur -> t_next) pairs without re-noising.
+            for step_i in range(int(t_list.numel()) - 1):
+                t_cur = t_list[step_i]
+                t_next = t_list[step_i + 1]
+                pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+
+                idx_cur = torch.argmin((timesteps_1d - t_cur.float()).abs())
+                idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
+                sigma_cur = sigmas_1d[idx_cur]
+                sigma_next = sigmas_1d[idx_next]
+                dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
+
+                current_latents = current_latents + dt * pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+                if first_frame_latent_bcfhw is not None and start_index == 0:
+                    current_latents = current_latents.clone()
+                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+
+            # Final x0 prediction at t_final (last element in t_list).
+            t_final = t_list[-1]
+            pred_flow_btchw = _predict_flow_at_t(t_final, step_index=int(t_list.numel()) - 1)
+            timestep_final = torch.ones((1, current_num_frames),
+                                        device=device,
+                                        dtype=torch.float32) * t_final
+            if first_frame_latent_bcfhw is not None and start_index == 0:
+                timestep_final = timestep_final.clone()
+                timestep_final[:, 0] = 0
+            noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+            denoised_pred = pred_noise_to_pred_video(
+                pred_noise=pred_flow_btchw.flatten(0, 1),
+                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
+                timestep=timestep_final,
+                scheduler=scheduler,
+            ).unflatten(0, pred_flow_btchw.shape[:2])
+            current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
             if first_frame_latent_bcfhw is not None and start_index == 0:
                 current_latents = current_latents.clone()
-                current_latents[:, :, :1] = first_frame_latent_bcfhw.to(
-                    device=device, dtype=dtype)
+                current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
         # Write back x0 chunk
         latents[:, :, start_index:start_index + current_num_frames] = current_latents
@@ -708,7 +736,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         with torch.autocast(device_type="cuda", dtype=dtype,
                             enabled=(dtype != torch.float32)), \
-                set_forward_context(current_timestep=context_timestep,
+                set_forward_context(current_timestep=0,
                                     attn_metadata=None,
                                     forward_batch=batch):
             control_res_ctx = controlnet(
