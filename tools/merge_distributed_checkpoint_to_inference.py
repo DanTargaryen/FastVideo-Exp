@@ -59,6 +59,12 @@ def _load_yaml_as_namespace(config_path: str) -> argparse.Namespace:
     cfg = dict(cfg)
     cfg["inference_mode"] = True
     cfg["mode"] = "inference"
+    # Avoid loading teacher/critic modules to reduce memory usage: we only need
+    # the generator transformer + generator controlnet.
+    cfg["real_score_model_path"] = ""
+    cfg["fake_score_model_path"] = ""
+    cfg["real_score_controlnet_model_path"] = ""
+    cfg["fake_score_controlnet_model_path"] = ""
     ns = argparse.Namespace(**cfg)
     # Make TrainingArgs.from_cli_args treat these as "explicitly provided".
     ns._provided = set(cfg.keys())  # type: ignore[attr-defined]
@@ -109,9 +115,15 @@ def main() -> None:
                          None) or getattr(training_args, "model_path", None)
     if not model_path:
         raise ValueError("Config must define pretrained_model_name_or_path or model_path.")
-    pipe = WanControlnetSelfForcingDistillationPipeline(model_path,
-                                                        training_args)
-    pipe.post_init()
+    # IMPORTANT: do NOT call `pipe.post_init()` here.
+    # `post_init()` would initialize the *training* pipeline when `training_mode=True`
+    # and may require training-only config fields (e.g. dmd_denoising_steps).
+    # For checkpoint merging we only need the modules created in `__init__()`.
+    #
+    # Also, even if `training_args.inference_mode=True`, some user configs may
+    # still cause `training_mode=True` via CLI overrides; skipping post_init
+    # makes the tool robust.
+    pipe = WanControlnetSelfForcingDistillationPipeline(model_path, training_args)
 
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed is not initialized; run with torchrun.")
