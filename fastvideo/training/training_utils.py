@@ -551,12 +551,25 @@ def save_distillation_checkpoint(
             local_main_process_only=False)
 
     if save_consolidated_inference_checkpoint:
+        def _strip_checkpoint_wrappers(sd: dict[str, Any]) -> dict[str, Any]:
+            # Activation checkpointing (and some wrapping utilities) may insert
+            # `._checkpoint_wrapped_module.` into FQNs. Inference loaders expect
+            # the unwrapped names, so strip it when exporting consolidated
+            # safetensors.
+            out: dict[str, Any] = {}
+            for k, v in sd.items():
+                if isinstance(k, str):
+                    k = k.replace("._checkpoint_wrapped_module.", ".")
+                out[k] = v
+            return out
+
         # Save generator model weights (consolidated) for inference
         # For inference checkpoints we need a *full* state_dict, even if the
         # training loop froze some parameters (e.g., partial finetuning/LoRA).
         cpu_state = gather_state_dict_on_cpu_rank0(generator_transformer,
                                                    device=None,
                                                    trainable_only=False)
+        cpu_state = _strip_checkpoint_wrappers(cpu_state)
 
         if rank == 0:
             # Save generator model weights (consolidated) for inference
@@ -598,6 +611,8 @@ def save_distillation_checkpoint(
             if generator_controlnet is not None:
                 cpu_controlnet_state = gather_state_dict_on_cpu_rank0(
                     generator_controlnet, device=None, trainable_only=False)
+                cpu_controlnet_state = _strip_checkpoint_wrappers(
+                    cpu_controlnet_state)
                 os.makedirs(inference_save_controlnet_dir, exist_ok=True)
                 controlnet_weight_path = os.path.join(
                     inference_save_controlnet_dir,
