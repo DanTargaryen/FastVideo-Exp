@@ -353,7 +353,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
     Returns: latents [B, C, T_lat, H_lat, W_lat] (BCFHW) where T_lat is latent frames (e.g. 21).
     """
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
-    generator = torch.Generator(device=device).manual_seed(seed)
+    # Use global RNG seeding for broad torch compatibility (older builds may not
+    # support `generator=` for randn_like / randn).
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
 
     def _scheduler_set_timesteps(num_steps: int) -> None:
         # Be permissive across scheduler versions.
@@ -371,7 +374,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
     batch.height = height
     batch.width = width
     batch.num_frames = num_frames
-    batch.generator = generator
 
     # Latent shape: derive from ControlNet latent (already VAE-encoded) to avoid
     # guessing VAE compression ratios.
@@ -404,8 +406,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
         idx_list = list(timestep_indices)
         if update_rule == "euler_dt":
             # For Euler integration between sparse anchors, we also need a terminal point (t=0).
-            # In FlowMatchEulerDiscreteScheduler, timesteps has length (num_inference_steps + 1)
-            # and the last index corresponds to sigma=0.
+            # Some scheduler variants expose an extra terminal sigma=0 in `sigmas` but not in `timesteps`.
+            # Only append a terminal index if it's actually in-range for `scheduler.timesteps`.
             terminal_idx = int(schedule_num_inference_steps)
             if terminal_idx < full_ts.numel() and (len(idx_list) == 0 or idx_list[-1] != terminal_idx):
                 idx_list = idx_list + [terminal_idx]
@@ -417,15 +419,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
             )
         t_list_full = full_ts.index_select(0, idx_t).to(device=device)
     else:
-        # DMD steps are specified in the 0..1000 coordinate system.
-        # Warp them to the shifted FlowMatch scheduler's 1000-step grid by nearest index (Self-Forcing training).
-        _scheduler_set_timesteps(1000)
-        t_list = torch.tensor(dmd_steps, dtype=torch.long).cpu()
-        t_list_full = t_list.to(device=device)
-        if warp_denoising_step:
-            scheduler_timesteps = torch.cat(
-                (scheduler.timesteps.detach().cpu(), torch.tensor([0.0], dtype=torch.float32)))
-            t_list_full = scheduler_timesteps[1000 - t_list].to(device=device)
+        # DMD steps are specified in the 0..1000 coordinate system (Self-Forcing training).
+        # Match training: feed these integer timesteps directly and rely on argmin mapping
+        # against the scheduler's internal 1000-grid.
+        t_list_full = torch.tensor(dmd_steps, dtype=torch.long, device=device)
 
     # Allocate output latents buffer; each chunk will be generated independently then written back.
     latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -495,8 +492,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
         current_num_frames = num_frames_per_block
         # Each chunk starts from fresh noise, then is denoised with the same DMD anchor schedule.
         current_latents = torch.randn(
-            (1, transformer.num_channels_latents, current_num_frames, latent_h, latent_w),
-            generator=generator,
+            (1, transformer.num_channels_latents, current_num_frames, latent_h,
+             latent_w),
             device=device,
             dtype=dtype,
         )
@@ -526,7 +523,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
                                 enabled=(dtype != torch.float32)):
-                with set_forward_context(current_timestep=int(step_i),
+                with set_forward_context(current_timestep=timestep,
                                          attn_metadata=None,
                                          forward_batch=batch):
                     control_res_cond = controlnet(
@@ -555,7 +552,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         raise ValueError(
                             "guidance_scale != 1.0 requires negative_prompt_embeds_list."
                         )
-                    with set_forward_context(current_timestep=int(step_i),
+                    with set_forward_context(current_timestep=timestep,
                                              attn_metadata=None,
                                              forward_batch=batch):
                         control_res_uncond = controlnet(
@@ -595,19 +592,14 @@ def _causal_dmd_rollout_ti2v_controlnet(
             if update_rule == "renoise_x0":
                 if step_i < len(t_list) - 1:
                     next_timestep = t_list[step_i + 1]
-                    noise = torch.randn(
-                        denoised_pred.flatten(0, 1).shape,
-                        generator=generator,
-                        device=device,
-                        dtype=denoised_pred.dtype,
-                    )
+                    noise = torch.randn_like(denoised_pred.flatten(0, 1))
                     noisy_input_bfchw = scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
                         noise,
                         next_timestep * torch.ones(
                             (1 * current_num_frames),
                             device=device,
-                            dtype=torch.float32,
+                            dtype=torch.long,
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
                     current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
@@ -649,12 +641,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                       device=device,
                                       dtype=torch.float32) * float(context_noise)
         # Match Self-Forcing training: always add (small) context noise then commit cache.
-        ctx_noise = torch.randn(
-            context_btchw.flatten(0, 1).shape,
-            generator=generator,
-            device=device,
-            dtype=context_btchw.dtype,
-        )
+        ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
         context_btchw = scheduler.add_noise(
             context_btchw.flatten(0, 1),
             ctx_noise,
@@ -670,7 +657,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         with torch.autocast(device_type="cuda", dtype=dtype,
                             enabled=(dtype != torch.float32)), \
-                set_forward_context(current_timestep=0,
+                set_forward_context(current_timestep=context_timestep,
                                     attn_metadata=None,
                                     forward_batch=batch):
             control_res_ctx = controlnet(
@@ -819,7 +806,7 @@ def main() -> None:
     parser.add_argument(
         "--update_rule",
         type=str,
-        default="euler_dt",
+        default="renoise_x0",
         choices=["renoise_x0", "euler_dt"],
         help=
         "How to propagate between anchors. `renoise_x0` matches the Self-Forcing simulation "
@@ -828,8 +815,8 @@ def main() -> None:
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=5.0,
-        help="Classifier-free guidance scale. Use 1.0 to disable CFG.",
+        default=1.0,
+        help="Classifier-free guidance scale. For student inference, 1.0 (no CFG) matches training by default.",
     )
     parser.add_argument("--context_noise",
                         type=int,
