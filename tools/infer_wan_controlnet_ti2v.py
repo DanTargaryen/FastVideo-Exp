@@ -333,6 +333,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
     controlnet,
     scheduler,
     prompt_embeds_list: list[torch.Tensor],
+    negative_prompt_embeds_list: list[torch.Tensor] | None,
+    guidance_scale: float,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -399,10 +401,19 @@ def _causal_dmd_rollout_ti2v_controlnet(
             raise ValueError("--schedule_num_inference_steps must be > 0 when using --timestep_indices")
         _scheduler_set_timesteps(int(schedule_num_inference_steps))
         full_ts = scheduler.timesteps.to(device=device)
-        idx_t = torch.tensor(timestep_indices, device=device, dtype=torch.long)
+        idx_list = list(timestep_indices)
+        if update_rule == "euler_dt":
+            # For Euler integration between sparse anchors, we also need a terminal point (t=0).
+            # In FlowMatchEulerDiscreteScheduler, timesteps has length (num_inference_steps + 1)
+            # and the last index corresponds to sigma=0.
+            terminal_idx = int(schedule_num_inference_steps)
+            if terminal_idx < full_ts.numel() and (len(idx_list) == 0 or idx_list[-1] != terminal_idx):
+                idx_list = idx_list + [terminal_idx]
+
+        idx_t = torch.tensor(idx_list, device=device, dtype=torch.long)
         if torch.any(idx_t < 0) or torch.any(idx_t >= full_ts.numel()):
             raise ValueError(
-                f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {timestep_indices}"
+                f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {idx_list}"
             )
         t_list_full = full_ts.index_select(0, idx_t).to(device=device)
     else:
@@ -444,12 +455,33 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                                   max_text_len=transformer.text_len,
                                                   dtype=dtype,
                                                   device=device)
+    kv_cache_uncond = _initialize_kv_cache(model=transformer,
+                                           batch_size=1,
+                                           dtype=dtype,
+                                           device=device,
+                                           frame_seq_length=frame_seq_length)
+    crossattn_cache_uncond = _initialize_crossattn_cache(model=transformer,
+                                                         batch_size=1,
+                                                         max_text_len=transformer.text_len,
+                                                         dtype=dtype,
+                                                         device=device)
     control_kv_cache = _initialize_kv_cache(model=controlnet,
                                             batch_size=1,
                                             dtype=dtype,
                                             device=device,
                                             frame_seq_length=frame_seq_length)
     control_crossattn_cache = _initialize_crossattn_cache(
+        model=controlnet,
+        batch_size=1,
+        max_text_len=controlnet.text_len,
+        dtype=dtype,
+        device=device)
+    control_kv_cache_uncond = _initialize_kv_cache(model=controlnet,
+                                                   batch_size=1,
+                                                   dtype=dtype,
+                                                   device=device,
+                                                   frame_seq_length=frame_seq_length)
+    control_crossattn_cache_uncond = _initialize_crossattn_cache(
         model=controlnet,
         batch_size=1,
         max_text_len=controlnet.text_len,
@@ -491,32 +523,67 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                   device=device,
                                   dtype=torch.float32) * t_cur
 
-            with torch.autocast(device_type="cuda", dtype=dtype,
-                                enabled=(dtype != torch.float32)), \
-                    set_forward_context(current_timestep=int(step_i),
-                                        attn_metadata=None,
-                                        forward_batch=batch):
-                control_res = controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds_list,
-                    timestep=timestep,
-                    controlnet_states=control_chunk,
-                    kv_cache=control_kv_cache,
-                    crossattn_cache=control_crossattn_cache,
-                    current_start=start_index * frame_seq_length,
-                    start_frame=start_index,
-                )
+            with torch.autocast(device_type="cuda",
+                                dtype=dtype,
+                                enabled=(dtype != torch.float32)):
+                with set_forward_context(current_timestep=int(step_i),
+                                         attn_metadata=None,
+                                         forward_batch=batch):
+                    control_res_cond = controlnet(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds_list,
+                        timestep=timestep,
+                        controlnet_states=control_chunk,
+                        kv_cache=control_kv_cache,
+                        crossattn_cache=control_crossattn_cache,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    )
+                    pred_flow_cond_btchw = transformer(
+                        latent_model_input,
+                        prompt_embeds_list,
+                        timestep,
+                        block_controlnet_hidden_states=control_res_cond,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    ).permute(0, 2, 1, 3, 4)
 
-                pred_flow_btchw = transformer(
-                    latent_model_input,
-                    prompt_embeds_list,
-                    timestep,
-                    block_controlnet_hidden_states=control_res,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=start_index * frame_seq_length,
-                    start_frame=start_index,
-                ).permute(0, 2, 1, 3, 4)
+                if guidance_scale != 1.0:
+                    if negative_prompt_embeds_list is None:
+                        raise ValueError(
+                            "guidance_scale != 1.0 requires negative_prompt_embeds_list."
+                        )
+                    with set_forward_context(current_timestep=int(step_i),
+                                             attn_metadata=None,
+                                             forward_batch=batch):
+                        control_res_uncond = controlnet(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=negative_prompt_embeds_list,
+                            timestep=timestep,
+                            controlnet_states=control_chunk,
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=start_index * frame_seq_length,
+                            start_frame=start_index,
+                        )
+                        pred_flow_uncond_btchw = transformer(
+                            latent_model_input,
+                            negative_prompt_embeds_list,
+                            timestep,
+                            block_controlnet_hidden_states=control_res_uncond,
+                            kv_cache=kv_cache_uncond,
+                            crossattn_cache=crossattn_cache_uncond,
+                            current_start=start_index * frame_seq_length,
+                            start_frame=start_index,
+                        ).permute(0, 2, 1, 3, 4)
+
+                    pred_flow_btchw = pred_flow_uncond_btchw + float(
+                        guidance_scale) * (pred_flow_cond_btchw -
+                                           pred_flow_uncond_btchw)
+                else:
+                    pred_flow_btchw = pred_flow_cond_btchw
 
             denoised_pred = pred_noise_to_pred_video(
                 pred_noise=pred_flow_btchw.flatten(0, 1),
@@ -626,6 +693,31 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 current_start=start_index * frame_seq_length,
                 start_frame=start_index,
             )
+            if guidance_scale != 1.0:
+                if negative_prompt_embeds_list is None:
+                    raise ValueError(
+                        "guidance_scale != 1.0 requires negative_prompt_embeds_list."
+                    )
+                control_res_ctx_uncond = controlnet(
+                    hidden_states=context_bcfhw,
+                    encoder_hidden_states=negative_prompt_embeds_list,
+                    timestep=context_timestep,
+                    controlnet_states=control_chunk,
+                    kv_cache=control_kv_cache_uncond,
+                    crossattn_cache=control_crossattn_cache_uncond,
+                    current_start=start_index * frame_seq_length,
+                    start_frame=start_index,
+                )
+                _ = transformer(
+                    context_bcfhw,
+                    negative_prompt_embeds_list,
+                    context_timestep,
+                    block_controlnet_hidden_states=control_res_ctx_uncond,
+                    kv_cache=kv_cache_uncond,
+                    crossattn_cache=crossattn_cache_uncond,
+                    current_start=start_index * frame_seq_length,
+                    start_frame=start_index,
+                )
 
         start_index += current_num_frames
 
@@ -639,6 +731,24 @@ def _save_mp4(frames_bcthw: torch.Tensor, out_path: str, fps: int) -> None:
     frames_u8 = (frames * 255.0).round().astype(np.uint8)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(out_path, list(frames_u8), fps=fps, format="mp4")
+
+
+def _tensor_stats(name: str, x: torch.Tensor) -> str:
+    x_f = x.detach().float()
+    return (
+        f"{name}: shape={tuple(x.shape)} dtype={x.dtype} "
+        f"min={x_f.min().item():.4g} max={x_f.max().item():.4g} "
+        f"mean={x_f.mean().item():.4g} std={x_f.std(unbiased=False).item():.4g}"
+    )
+
+
+def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
+    import imageio
+
+    img = frame_chw.detach().float().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+    img_u8 = (img * 255.0).round().astype(np.uint8)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(out_path, img_u8)
 
 
 def main() -> None:
@@ -697,7 +807,7 @@ def main() -> None:
     parser.add_argument(
         "--timestep_indices",
         type=str,
-        default="0,12,24,36,49",
+        default="0,12,24,36",
         help="Comma-separated indices into scheduler.timesteps for few-step rollout (Diff-Factory-style).",
     )
     parser.add_argument(
@@ -709,11 +819,17 @@ def main() -> None:
     parser.add_argument(
         "--update_rule",
         type=str,
-        default="renoise_x0",
+        default="euler_dt",
         choices=["renoise_x0", "euler_dt"],
         help=
         "How to propagate between anchors. `renoise_x0` matches the Self-Forcing simulation "
         "(x0 reconstruction then add_noise). `euler_dt` is a deterministic Euler update in sigma space.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=5.0,
+        help="Classifier-free guidance scale. Use 1.0 to disable CFG.",
     )
     parser.add_argument("--context_noise",
                         type=int,
@@ -727,6 +843,11 @@ def main() -> None:
                         type=str,
                         default="bf16",
                         choices=["fp32", "bf16", "fp16"])
+    parser.add_argument(
+        "--debug_dump",
+        action="store_true",
+        help="Dump latent stats and save a decoded first-frame PNG for debugging.",
+    )
     args = parser.parse_args()
 
     _ensure_single_process_dist_env()
@@ -804,16 +925,34 @@ def main() -> None:
 
         prompt_embeds = sample.text_embedding_bld.to(device="cuda",
                                                      dtype=dtype)
+        negative_prompt_embeds = None
+        if float(args.guidance_scale) != 1.0:
+            # Match FastVideo training convention: unconditional prompt embedding is all-zeros.
+            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
         first_frame_latent = sample.first_frame_latent_bcfhw.to(device="cuda",
                                                                 dtype=dtype)
         control_latent = sample.control_latent_bcfhw.to(device="cuda",
                                                         dtype=dtype)
+
+        if args.debug_dump:
+            logger.info(_tensor_stats("text_embedding", prompt_embeds))
+            logger.info(_tensor_stats("first_frame_latent", first_frame_latent))
+            logger.info(_tensor_stats("control_latent", control_latent))
+            # Sanity-check decode: if this PNG already looks like noise, then the latent space / decode
+            # path is mismatched (preprocess vs decode), independent of diffusion sampling quality.
+            decoded_first = decoding.decode(first_frame_latent, fastvideo_args)[0]
+            _save_png(
+                decoded_first[:, 0],
+                str(Path(args.out_dir) / f"{sample.sample_id}__first_frame.png"),
+            )
 
         latents = _causal_dmd_rollout_ti2v_controlnet(
             transformer=transformer,
             controlnet=controlnet,
             scheduler=scheduler,
             prompt_embeds_list=[prompt_embeds],
+            negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
+            guidance_scale=float(args.guidance_scale),
             first_frame_latent_bcfhw=first_frame_latent,
             control_latent_bcfhw=control_latent,
             height=args.height,
@@ -828,6 +967,9 @@ def main() -> None:
             seed=args.seed + i,
             dtype=dtype,
         )
+
+        if args.debug_dump:
+            logger.info(_tensor_stats("generated_latents", latents))
 
         # Decode to pixels [B, C, T, H, W] in [0,1], then save mp4
         decoded = decoding.decode(latents, fastvideo_args).cpu().float()
