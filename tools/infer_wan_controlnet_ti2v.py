@@ -460,8 +460,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 next_t = t_list[step_i + 1] * torch.ones([1],
                                                          device=device,
                                                          dtype=torch.float32)
-                noise = torch.randn_like(pred_video_btchw,
-                                         generator=generator)
+                # `torch.randn_like` does not accept `generator` in many PyTorch versions.
+                noise = torch.randn(pred_video_btchw.shape,
+                                    generator=generator,
+                                    device=pred_video_btchw.device,
+                                    dtype=pred_video_btchw.dtype)
                 noise_latents_btchw = scheduler.add_noise(
                     pred_video_btchw.flatten(0, 1), noise.flatten(0, 1),
                     next_t).unflatten(0, pred_video_btchw.shape[:2])
@@ -484,11 +487,15 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                dtype=torch.float32) * float(context_noise)
         context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
         if context_noise != 0:
-            context_btchw = scheduler.add_noise(
-                context_btchw.flatten(0, 1),
-                torch.randn_like(context_btchw.flatten(0, 1),
-                                 generator=generator), context_t).unflatten(
-                                     0, context_btchw.shape[:2])
+                ctx_flat = context_btchw.flatten(0, 1)
+                ctx_noise = torch.randn(ctx_flat.shape,
+                                        generator=generator,
+                                        device=ctx_flat.device,
+                                        dtype=ctx_flat.dtype)
+                context_btchw = scheduler.add_noise(ctx_flat, ctx_noise,
+                                                    context_t).unflatten(
+                                                        0,
+                                                        context_btchw.shape[:2])
         context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
         if first_frame_latent_bcfhw is not None and start_index == 0:
