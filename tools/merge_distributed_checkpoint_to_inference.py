@@ -35,6 +35,7 @@ import yaml
 from fastvideo.logger import init_logger
 from fastvideo.training.checkpointing_utils import ModelWrapper
 from fastvideo.training.training_utils import save_distillation_checkpoint
+from fastvideo.fastvideo_args import TrainingArgs
 from fastvideo.training.wan_controlnet_self_forcing_distillation_pipeline import (
     WanControlnetSelfForcingDistillationPipeline,
 )
@@ -52,6 +53,12 @@ def _load_yaml_as_namespace(config_path: str) -> argparse.Namespace:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ValueError(f"Config must be a YAML dict, got: {type(cfg)}")
+    # This script is for *loading modules and checkpoint weights only*.
+    # Force inference_mode=True so the pipeline won't run training init (which
+    # may require fields irrelevant for checkpoint merging, e.g. denoising steps).
+    cfg = dict(cfg)
+    cfg["inference_mode"] = True
+    cfg["mode"] = "inference"
     ns = argparse.Namespace(**cfg)
     # Make TrainingArgs.from_cli_args treat these as "explicitly provided".
     ns._provided = set(cfg.keys())  # type: ignore[attr-defined]
@@ -95,17 +102,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg_ns = _load_yaml_as_namespace(args.config)
+    training_args = TrainingArgs.from_cli_args(cfg_ns)
 
     # Build the pipeline (initializes distributed environment and creates modules).
-    model_path = getattr(cfg_ns, "pretrained_model_name_or_path", None) or getattr(
-        cfg_ns, "model_path", None
-    )
+    model_path = getattr(training_args, "pretrained_model_name_or_path",
+                         None) or getattr(training_args, "model_path", None)
     if not model_path:
         raise ValueError("Config must define pretrained_model_name_or_path or model_path.")
-
-    pipe = WanControlnetSelfForcingDistillationPipeline.from_pretrained(
-        model_path, args=cfg_ns
-    )
+    pipe = WanControlnetSelfForcingDistillationPipeline(model_path,
+                                                        training_args)
+    pipe.post_init()
 
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed is not initialized; run with torchrun.")
@@ -165,4 +171,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
