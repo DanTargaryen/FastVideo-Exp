@@ -284,7 +284,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
     # Make sure scheduler has the 1000-step grid used by warp_denoising_step mapping.
     if hasattr(scheduler, "set_timesteps"):
-        scheduler.set_timesteps(1000, training=False)
+        # diffusers schedulers have slightly different `set_timesteps` signatures
+        # across versions; be permissive here.
+        try:
+            scheduler.set_timesteps(1000, device=device)  # type: ignore[arg-type]
+        except TypeError:
+            try:
+                scheduler.set_timesteps(1000)
+            except TypeError:
+                # Some schedulers expect `num_inference_steps` as a named arg.
+                scheduler.set_timesteps(num_inference_steps=1000)  # type: ignore[call-arg]
 
     # Build a minimal ForwardBatch for forward_context bookkeeping.
     batch = ForwardBatch(data_type="ti2v_controlnet")
