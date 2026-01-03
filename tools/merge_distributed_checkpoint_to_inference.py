@@ -179,7 +179,9 @@ def main() -> None:
         generator_controlnet=generator_controlnet,
         fake_score_controlnet=None,
     )
-    dist.barrier()
+    # Do not barrier here: rank0 may spend a long time writing large safetensors
+    # files to disk, and other ranks can safely exit after participating in the
+    # DTensor gathers.
 
     if rank == 0:
         logger.info(

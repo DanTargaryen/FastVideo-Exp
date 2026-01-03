@@ -607,12 +607,15 @@ def save_distillation_checkpoint(
                 weight_path,
             )
 
-            # Save generator ControlNet weights (consolidated) for inference
-            if generator_controlnet is not None:
-                cpu_controlnet_state = gather_state_dict_on_cpu_rank0(
-                    generator_controlnet, device=None, trainable_only=False)
-                cpu_controlnet_state = _strip_checkpoint_wrappers(
-                    cpu_controlnet_state)
+        # Save generator ControlNet weights (consolidated) for inference.
+        # IMPORTANT: the state_dict gather must run on *all ranks* (DTensor collectives),
+        # not only on rank0; only the file write should be rank0-only.
+        if generator_controlnet is not None:
+            cpu_controlnet_state = gather_state_dict_on_cpu_rank0(
+                generator_controlnet, device=None, trainable_only=False)
+            cpu_controlnet_state = _strip_checkpoint_wrappers(cpu_controlnet_state)
+
+            if rank == 0:
                 os.makedirs(inference_save_controlnet_dir, exist_ok=True)
                 controlnet_weight_path = os.path.join(
                     inference_save_controlnet_dir,
