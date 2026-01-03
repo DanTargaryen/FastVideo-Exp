@@ -128,16 +128,19 @@ def _dtensor_full_tensor_fallback(param: torch.Tensor) -> torch.Tensor:
 def gather_state_dict_on_cpu_rank0(
     model,
     device: torch.device | None = None,
+    trainable_only: bool = True,
 ) -> dict[str, Any]:
     rank = dist.get_rank()
     cpu_state_dict = {}
     sharded_sd = model.state_dict()
-    param_requires_grad = set([
-        k.replace("._checkpoint_wrapped_module.", ".")
-        for k, v in dict(model.named_parameters()).items() if v.requires_grad
-    ])
+    param_requires_grad: set[str] | None = None
+    if trainable_only:
+        param_requires_grad = set([
+            k.replace("._checkpoint_wrapped_module.", ".")
+            for k, v in dict(model.named_parameters()).items() if v.requires_grad
+        ])
     for param_name, param in sharded_sd.items():
-        if param_name not in param_requires_grad:
+        if param_requires_grad is not None and param_name not in param_requires_grad:
             continue
         if hasattr(param, "_local_tensor") or hasattr(param, "to_local"):
             # DTensor case:
@@ -549,8 +552,11 @@ def save_distillation_checkpoint(
 
     if save_consolidated_inference_checkpoint:
         # Save generator model weights (consolidated) for inference
+        # For inference checkpoints we need a *full* state_dict, even if the
+        # training loop froze some parameters (e.g., partial finetuning/LoRA).
         cpu_state = gather_state_dict_on_cpu_rank0(generator_transformer,
-                                                   device=None)
+                                                   device=None,
+                                                   trainable_only=False)
 
         if rank == 0:
             # Save generator model weights (consolidated) for inference
@@ -591,7 +597,7 @@ def save_distillation_checkpoint(
             # Save generator ControlNet weights (consolidated) for inference
             if generator_controlnet is not None:
                 cpu_controlnet_state = gather_state_dict_on_cpu_rank0(
-                    generator_controlnet, device=None)
+                    generator_controlnet, device=None, trainable_only=False)
                 os.makedirs(inference_save_controlnet_dir, exist_ok=True)
                 controlnet_weight_path = os.path.join(
                     inference_save_controlnet_dir,
