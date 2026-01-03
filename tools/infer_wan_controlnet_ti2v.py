@@ -418,11 +418,52 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {idx_list}"
             )
         t_list_full = full_ts.index_select(0, idx_t).to(device=device)
+        logger.info(
+            "rollout schedule: timestep_indices=%s (schedule_num_inference_steps=%s) -> timesteps=%s",
+            list(timestep_indices),
+            int(schedule_num_inference_steps),
+            [int(x) for x in t_list_full.detach().cpu().tolist()],
+        )
     else:
-        # DMD steps are specified in the 0..1000 coordinate system (Self-Forcing training).
-        # Match training: feed these integer timesteps directly and rely on argmin mapping
-        # against the scheduler's internal 1000-grid.
-        t_list_full = torch.tensor(dmd_steps, dtype=torch.long, device=device)
+        # DMD denoising steps (Self-Forcing style).
+        #
+        # IMPORTANT: FastVideo training treats `dmd_denoising_steps` as *indices* in the 0..1000 grid
+        # (largest = highest noise), then optionally "warps" them to the scheduler's actual
+        # timesteps via:
+        #   timesteps = cat([scheduler.timesteps, 0])
+        #   denoise_ts = timesteps[1000 - dmd_steps]
+        #
+        # See: `fastvideo/training/distillation_pipeline.py` where `Warping denoising_step_list` is logged.
+        #
+        # For inference, mirror that behavior so the solver matches training.
+        dmd_steps_t = torch.tensor(dmd_steps, dtype=torch.long, device=device)
+        if warp_denoising_step:
+            # Ensure the scheduler has a 1000-step grid available.
+            # FlowMatchEulerDiscreteScheduler usually exposes this by default, but be robust.
+            try:
+                if not hasattr(scheduler, "timesteps") or scheduler.timesteps is None or int(scheduler.timesteps.numel()) < 1000:
+                    _scheduler_set_timesteps(1000)
+            except Exception:
+                _scheduler_set_timesteps(1000)
+
+            schedule_ts = scheduler.timesteps.to(device=device)
+            # Training uses an extra terminal "0" entry.
+            schedule_ts = torch.cat(
+                (schedule_ts, torch.tensor([0], device=device, dtype=schedule_ts.dtype)),
+                dim=0,
+            )
+            # Clamp to avoid OOB if scheduler grid differs slightly.
+            idx = (1000 - dmd_steps_t).clamp_(0, schedule_ts.numel() - 1)
+            t_list_full = schedule_ts.index_select(0, idx)
+        else:
+            # Treat provided steps as raw timestep values.
+            t_list_full = dmd_steps_t
+        logger.info(
+            "rollout schedule: dmd_steps=%s warp=%s -> timesteps=%s",
+            list(dmd_steps),
+            bool(warp_denoising_step),
+            [float(x) for x in t_list_full.detach().cpu().tolist()],
+        )
 
     # Allocate output latents buffer; each chunk will be generated independently then written back.
     latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -516,14 +557,21 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
                     device=device, dtype=dtype)
 
+            # Match training: per-frame timestep tensor (B, F). Keep as float for embedding stability.
             timestep = torch.ones((1, current_num_frames),
                                   device=device,
                                   dtype=torch.float32) * t_cur
+            # TI2V: mimic Diff-Factory's "expand_timesteps" first-frame masking by setting frame0 timestep to 0.
+            if first_frame_latent_bcfhw is not None and start_index == 0:
+                timestep = timestep.clone()
+                timestep[:, 0] = 0
 
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
                                 enabled=(dtype != torch.float32)):
-                with set_forward_context(current_timestep=timestep,
+                # ForwardContext.current_timestep is used by some attention backends as an *index*.
+                # Use the denoising step index for maximum compatibility.
+                with set_forward_context(current_timestep=int(step_i),
                                          attn_metadata=None,
                                          forward_batch=batch):
                     control_res_cond = controlnet(
@@ -552,7 +600,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         raise ValueError(
                             "guidance_scale != 1.0 requires negative_prompt_embeds_list."
                         )
-                    with set_forward_context(current_timestep=timestep,
+                    with set_forward_context(current_timestep=int(step_i),
                                              attn_metadata=None,
                                              forward_batch=batch):
                         control_res_uncond = controlnet(
@@ -640,6 +688,9 @@ def _causal_dmd_rollout_ti2v_controlnet(
         context_timestep = torch.ones((1, current_num_frames),
                                       device=device,
                                       dtype=torch.float32) * float(context_noise)
+        if first_frame_latent_bcfhw is not None and start_index == 0:
+            context_timestep = context_timestep.clone()
+            context_timestep[:, 0] = 0
         # Match Self-Forcing training: always add (small) context noise then commit cache.
         ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
         context_btchw = scheduler.add_noise(
@@ -792,6 +843,15 @@ def main() -> None:
         help="Teacher grid size used to define the student timestep anchors (usually 50).",
     )
     parser.add_argument(
+        "--flow_shift",
+        type=float,
+        default=8.0,
+        help=(
+            "FlowMatch Euler scheduler shift used during training/inference. "
+            "IMPORTANT: this must match the value used for training (your phase2 config uses flow_shift=8)."
+        ),
+    )
+    parser.add_argument(
         "--timestep_indices",
         type=str,
         default="0,12,24,36",
@@ -801,7 +861,11 @@ def main() -> None:
         "--dmd_steps",
         type=str,
         default="",
-        help="Optional: comma-separated anchors in 0..1000 grid (Self-Forcing-style). If set, overrides --timestep_indices.",
+        help=(
+            "Optional: comma-separated DMD denoising steps in the 0..1000 grid (Self-Forcing/FastVideo training style). "
+            "If set, overrides --timestep_indices. When --warp_denoising_step is enabled (default), "
+            "these steps are mapped to `scheduler.timesteps[1000 - step]` to match training."
+        ),
     )
     parser.add_argument(
         "--update_rule",
@@ -893,11 +957,15 @@ def main() -> None:
         "transformer", args.transformer_dir, "diffusers", fastvideo_args)
     controlnet = PipelineComponentLoader.load_module(
         "controlnet", args.controlnet_dir, "diffusers", fastvideo_args)
+    if args.init_transformer_safetensors and not args.init_controlnet_safetensors:
+        logger.warning(
+            "You set --init_transformer_safetensors but did not set --init_controlnet_safetensors. "
+            "If you are testing phase-1 student init, you usually want to initialize BOTH transformer and controlnet "
+            "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
+        )
     # Self-Forcing / DMD training uses Euler ODE (FlowMatchEulerDiscreteScheduler).
-    # Do NOT use the base model's UniPC scheduler here, otherwise the timestep grid
-    # and update rule mismatch and results can collapse to noise.
-    flow_shift = float(getattr(fastvideo_args.pipeline_config, "flow_shift", 8.0) or 8.0)
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
+    # Do NOT use the base model's UniPC scheduler here. Also, the `shift` MUST match training.
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=float(args.flow_shift))
     vae = PipelineComponentLoader.load_module("vae",
                                               str(Path(args.base_model) / "vae"),
                                               "diffusers", fastvideo_args)
