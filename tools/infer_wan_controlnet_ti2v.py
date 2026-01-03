@@ -4,7 +4,8 @@
 TI2V inference for *student* Wan (causal) + ControlNet using exported weight-only checkpoints.
 
 This script:
-1) loads student transformer + controlnet from FastVideo weight-only exports
+1) loads student transformer + controlnet (either from FastVideo weight-only exports, or by
+   loading the base diffusers configs and overriding weights with `*_init.safetensors`)
 2) reads one (or more) samples from the TI2V+ControlNet parquet dataset
 3) runs chunk-wise causal rollout with FlowMatchEulerDiscreteScheduler (Euler ODE) on a few-step anchor grid
 4) decodes latents with VAE and saves mp4(s)
@@ -26,6 +27,22 @@ Typical usage (single node):
     --controlnet_dir "$CKPT/generator_inference_controlnet" \
     --index 0 \
     --out_dir outputs/infer_ckpt800
+
+Phase-1 init weights (no diffusers-format model folder; use base model for config + override weights):
+
+  BASE_MODEL=/path/to/Wan2.2-TI2V-5B-Diffusers
+  TEACHER_CONTROLNET=/path/to/world-renderer-controlnet-warp-mask
+  INIT_DIR=/path/to/phase1_fastvideo_inits
+
+  python tools/infer_wan_controlnet_ti2v.py \
+    --base_model "$BASE_MODEL" \
+    --data_path "$DATA" \
+    --transformer_dir "$BASE_MODEL/transformer" \
+    --controlnet_dir "$TEACHER_CONTROLNET" \
+    --init_transformer_safetensors "$INIT_DIR/transformer_init.safetensors" \
+    --init_controlnet_safetensors "$INIT_DIR/controlnet_init.safetensors" \
+    --index 0 \
+    --out_dir outputs/infer_phase1_init
 """
 
 from __future__ import annotations
@@ -47,6 +64,7 @@ from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.decoding import DecodingStage
 
@@ -324,6 +342,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     dmd_steps: list[int],
     context_noise: int,
     warp_denoising_step: bool,
+    update_rule: str,
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -363,6 +382,22 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 "first_frame_latent and control_latent spatial sizes mismatch: "
                 f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
             )
+
+    # For self-forcing / DMD rollout we use the training-time (1000-step) scheduler grid.
+    # The `dmd_steps` are specified in that 0..1000 coordinate system.
+    # If a caller passes a different schedule size, we still default to the 1000-grid
+    # to match training behavior unless explicitly requested.
+    if int(schedule_num_inference_steps) <= 0:
+        schedule_num_inference_steps = 1000
+    if int(schedule_num_inference_steps) != 1000:
+        logger.warning(
+            "schedule_num_inference_steps=%s but self-forcing rollout expects 1000-grid anchors; "
+            "using 1000-step FlowMatchEulerDiscreteScheduler grid for mapping.",
+            schedule_num_inference_steps,
+        )
+
+    # Make sure scheduler has a 1000-step grid available (some schedulers require calling set_timesteps).
+    _scheduler_set_timesteps(1000)
 
     # Allocate output latents buffer; each chunk will be generated independently then written back.
     latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -409,34 +444,31 @@ def _causal_dmd_rollout_ti2v_controlnet(
     start_index = 0
     for _block_idx in range(num_blocks):
         current_num_frames = num_frames_per_block
-        # Each chunk starts from fresh noise, then is denoised with the same schedule.
-        current_latents = torch.randn((1, transformer.num_channels_latents, current_num_frames, latent_h, latent_w),
-                                      generator=generator,
-                                      device=device,
-                                      dtype=dtype)
+        # Each chunk starts from fresh noise, then is denoised with the same DMD anchor schedule.
+        current_latents = torch.randn(
+            (1, transformer.num_channels_latents, current_num_frames, latent_h, latent_w),
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
 
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
                                                                     dtype=dtype)
 
-        # Reset scheduler internal step index for each chunk (each chunk starts from the same noise level).
-        _scheduler_set_timesteps(int(schedule_num_inference_steps))
-        schedule_timesteps = scheduler.timesteps.to(device=device, dtype=torch.float32)
-        anchors = torch.tensor(dmd_steps, device=device, dtype=schedule_timesteps.dtype)
-        idx = torch.argmin((schedule_timesteps[None, :] - anchors[:, None]).abs(), dim=1)
-        t_list = schedule_timesteps.index_select(0, idx)
+        # Build the DMD timestep list in scheduler coordinate (float) if warp enabled.
+        # This matches `FastVideo/fastvideo/training/distillation_pipeline.py` warping.
+        t_list = torch.tensor(dmd_steps, dtype=torch.long).cpu()
+        if warp_denoising_step:
+            scheduler_timesteps = torch.cat(
+                (scheduler.timesteps.cpu(), torch.tensor([0.0], dtype=torch.float32)))
+            t_list = scheduler_timesteps[1000 - t_list]
+        t_list = t_list.to(device=device)
 
-        # Self-Forcing convention: `context_noise` is an *index/step* on the current schedule,
-        # but some codepaths treat it as a 0..1000 coordinate. Support both.
-        if 0 <= int(context_noise) < int(schedule_num_inference_steps):
-            t_context = schedule_timesteps[int(context_noise)]
-        else:
-            ctx_v = torch.as_tensor(float(context_noise), device=device, dtype=schedule_timesteps.dtype)
-            ctx_idx = torch.argmin((schedule_timesteps - ctx_v).abs()).item()
-            t_context = schedule_timesteps[int(ctx_idx)]
-
-        # Euler ODE steps: x_{t_next} = x_t + dt * v_theta(x_t, t)
+    # DMD steps: predict flow -> reconstruct clean x0 -> re-noise to next anchor
         for step_i, t_cur in enumerate(t_list):
+            # Work in BFCHW like training does.
+            noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
             latent_model_input = current_latents
 
             if first_frame_latent_bcfhw is not None and start_index == 0:
@@ -444,7 +476,9 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
                     device=device, dtype=dtype)
 
-            t_expanded = t_cur.reshape(1, 1).to(device=device, dtype=torch.float32)
+            timestep = torch.ones((1, current_num_frames),
+                                  device=device,
+                                  dtype=torch.float32) * t_cur
 
             with torch.autocast(device_type="cuda", dtype=dtype,
                                 enabled=(dtype != torch.float32)), \
@@ -454,7 +488,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 control_res = controlnet(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds_list,
-                    timestep=t_expanded,
+                    timestep=timestep,
                     controlnet_states=control_chunk,
                     kv_cache=control_kv_cache,
                     crossattn_cache=control_crossattn_cache,
@@ -462,18 +496,64 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     start_frame=start_index,
                 )
 
-                flow_bcfhw = transformer(
+                pred_flow_btchw = transformer(
                     latent_model_input,
                     prompt_embeds_list,
-                    t_expanded,
+                    timestep,
                     block_controlnet_hidden_states=control_res,
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_cache,
                     current_start=start_index * frame_seq_length,
                     start_frame=start_index,
-                )
+                ).permute(0, 2, 1, 3, 4)
 
-            current_latents = scheduler.step(flow_bcfhw, t_cur, current_latents, return_dict=False)[0]
+            denoised_pred = pred_noise_to_pred_video(
+                pred_noise=pred_flow_btchw.flatten(0, 1),
+                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
+                timestep=timestep,
+                scheduler=scheduler,
+            ).unflatten(0, pred_flow_btchw.shape[:2])
+
+            if update_rule == "renoise_x0":
+                if step_i < len(t_list) - 1:
+                    next_timestep = t_list[step_i + 1]
+                    noise = torch.randn(
+                        denoised_pred.flatten(0, 1).shape,
+                        generator=generator,
+                        device=device,
+                        dtype=denoised_pred.dtype,
+                    )
+                    noisy_input_bfchw = scheduler.add_noise(
+                        denoised_pred.flatten(0, 1),
+                        noise,
+                        next_timestep * torch.ones(
+                            (1 * current_num_frames),
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                    ).unflatten(0, denoised_pred.shape[:2])
+                    current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
+                else:
+                    current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
+            elif update_rule == "euler_dt":
+                # Deterministic Euler update in sigma space:
+                #   x_{t_next} = x_{t} + (sigma(t_next) - sigma(t)) * v_theta(x_t, t)
+                # We still return x0 at the final step (like DMD) via `denoised_pred`.
+                if step_i < len(t_list) - 1:
+                    t_next = t_list[step_i + 1]
+                    timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
+                    sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
+                    # Map t -> nearest sigma index (same logic as `pred_noise_to_pred_video`).
+                    idx_cur = torch.argmin((timesteps_1d - t_cur).abs())
+                    idx_next = torch.argmin((timesteps_1d - t_next).abs())
+                    sigma_cur = sigmas_1d[idx_cur]
+                    sigma_next = sigmas_1d[idx_next]
+                    dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
+                    current_latents = current_latents + dt * pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+                else:
+                    current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
+            else:
+                raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
             if first_frame_latent_bcfhw is not None and start_index == 0:
                 current_latents = current_latents.clone()
@@ -484,19 +564,25 @@ def _causal_dmd_rollout_ti2v_controlnet(
         latents[:, :, start_index:start_index + current_num_frames] = current_latents
 
         # Cache update with optional context noise (Self-Forcing style)
-        # `add_noise` in FlowMatchEulerDiscreteScheduler expects a 1D timestep tensor; if len==1 it broadcasts.
-        context_t_val = t_context.reshape(1).to(device=device, dtype=torch.float32)
-        context_t_model = context_t_val.view(1, 1)
+        # Cache update with optional context noise (Self-Forcing style): add context noise then forward once to
+        # commit KV cache for the next chunk.
         context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-        if float(t_context.item()) != 0.0:
-            ctx_flat = context_btchw.flatten(0, 1)
-            ctx_noise = torch.randn(ctx_flat.shape,
-                                    generator=generator,
-                                    device=ctx_flat.device,
-                                    dtype=ctx_flat.dtype)
-            context_btchw = scheduler.add_noise(ctx_flat, ctx_noise,
-                                                context_t_val).unflatten(
-                                                    0, context_btchw.shape[:2])
+        context_timestep = torch.ones((1, current_num_frames),
+                                      device=device,
+                                      dtype=torch.float32) * float(context_noise)
+        if float(context_noise) != 0.0:
+            ctx_noise = torch.randn(
+                context_btchw.flatten(0, 1).shape,
+                generator=generator,
+                device=device,
+                dtype=context_btchw.dtype,
+            )
+            context_btchw = scheduler.add_noise(
+                context_btchw.flatten(0, 1),
+                ctx_noise,
+                context_timestep.flatten(),
+            ).unflatten(0, context_btchw.shape[:2])
+
         context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
         if first_frame_latent_bcfhw is not None and start_index == 0:
@@ -512,7 +598,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             control_res_ctx = controlnet(
                 hidden_states=context_bcfhw,
                 encoder_hidden_states=prompt_embeds_list,
-                timestep=context_t_model,
+                timestep=context_timestep,
                 controlnet_states=control_chunk,
                 kv_cache=control_kv_cache,
                 crossattn_cache=control_crossattn_cache,
@@ -522,7 +608,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             _ = transformer(
                 context_bcfhw,
                 prompt_embeds_list,
-                context_t_model,
+                context_timestep,
                 block_controlnet_hidden_states=control_res_ctx,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
@@ -548,8 +634,38 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--transformer_dir", type=str, required=True)
-    parser.add_argument("--controlnet_dir", type=str, required=True)
+    parser.add_argument(
+        "--transformer_dir",
+        type=str,
+        required=True,
+        help=
+        "Diffusers-format folder used for transformer config (contains config.json + *.safetensors). "
+        "Can be either (a) consolidated inference export dir, or (b) base model's transformer/ dir.",
+    )
+    parser.add_argument(
+        "--controlnet_dir",
+        type=str,
+        required=True,
+        help=
+        "Diffusers-format folder used for ControlNet config (contains config.json + *.safetensors). "
+        "Can be either (a) consolidated inference export dir, or (b) teacher ControlNet dir.",
+    )
+    parser.add_argument(
+        "--init_transformer_safetensors",
+        type=str,
+        default="",
+        help=
+        "Optional: path to a FastVideo init .safetensors for the STUDENT transformer (e.g. phase-1 export). "
+        "When set, weights are loaded from this file but config is still read from --transformer_dir.",
+    )
+    parser.add_argument(
+        "--init_controlnet_safetensors",
+        type=str,
+        default="",
+        help=
+        "Optional: path to a FastVideo init .safetensors for the STUDENT controlnet (e.g. phase-1 export). "
+        "When set, weights are loaded from this file but config is still read from --controlnet_dir.",
+    )
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--num_samples", type=int, default=1)
@@ -571,6 +687,15 @@ def main() -> None:
                         type=str,
                         default="1000,750,500,250",
                         help="Comma-separated DMD anchors in 0..1000 grid.")
+    parser.add_argument(
+        "--update_rule",
+        type=str,
+        default="renoise_x0",
+        choices=["renoise_x0", "euler_dt"],
+        help=
+        "How to propagate between anchors. `renoise_x0` matches the Self-Forcing simulation "
+        "(x0 reconstruction then add_noise). `euler_dt` is a deterministic Euler update in sigma space.",
+    )
     parser.add_argument("--context_noise",
                         type=int,
                         default=0,
@@ -629,6 +754,11 @@ def main() -> None:
     fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps
     fastvideo_args.pipeline_config.context_noise = int(args.context_noise)
 
+    if args.init_transformer_safetensors:
+        fastvideo_args.init_weights_from_safetensors = args.init_transformer_safetensors
+    if args.init_controlnet_safetensors:
+        fastvideo_args.init_controlnet_weights_from_safetensors = args.init_controlnet_safetensors
+
     transformer = PipelineComponentLoader.load_module(
         "transformer", args.transformer_dir, "diffusers", fastvideo_args)
     controlnet = PipelineComponentLoader.load_module(
@@ -671,6 +801,7 @@ def main() -> None:
             dmd_steps=dmd_steps,
             context_noise=args.context_noise,
             warp_denoising_step=True,
+            update_rule=args.update_rule,
             seed=args.seed + i,
             dtype=dtype,
         )
