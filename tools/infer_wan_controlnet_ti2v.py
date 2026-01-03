@@ -6,7 +6,7 @@ TI2V inference for *student* Wan (causal) + ControlNet using exported weight-onl
 This script:
 1) loads student transformer + controlnet from FastVideo weight-only exports
 2) reads one (or more) samples from the TI2V+ControlNet parquet dataset
-3) runs chunk-wise causal DMD rollout (same re-noising scheme as training's simulation)
+3) runs chunk-wise causal rollout with FlowMatchEulerDiscreteScheduler (Euler ODE) on a few-step anchor grid
 4) decodes latents with VAE and saves mp4(s)
 
 Typical usage (single node):
@@ -44,7 +44,9 @@ from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
-from fastvideo.models.utils import pred_noise_to_pred_video
+from fastvideo.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.decoding import DecodingStage
 
@@ -265,8 +267,30 @@ def _initialize_crossattn_cache(*, model, batch_size: int, max_text_len: int,
                                 dtype: torch.dtype,
                                 device: torch.device) -> list[dict]:
     num_blocks = len(model.blocks)
-    num_heads = model.num_attention_heads
-    head_dim = model.attention_head_dim
+    num_heads = getattr(model, "num_attention_heads", None)
+    if num_heads is None:
+        num_heads = getattr(getattr(model, "config", None), "num_attention_heads", None)
+    if num_heads is None:
+        num_heads = getattr(getattr(getattr(model, "config", None), "arch_config", None),
+                            "num_attention_heads", None)
+    if num_heads is None:
+        raise AttributeError(f"Cannot determine num_attention_heads for {type(model).__name__}")
+    num_heads = int(num_heads)
+
+    head_dim = getattr(model, "attention_head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(getattr(model, "config", None), "attention_head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(getattr(getattr(model, "config", None), "arch_config", None),
+                           "attention_head_dim", None)
+    if head_dim is None:
+        inner_dim = getattr(model, "inner_dim", None)
+        if inner_dim is None:
+            inner_dim = getattr(model, "hidden_size", None)
+        if inner_dim is None:
+            raise AttributeError(f"Cannot determine attention_head_dim for {type(model).__name__}")
+        head_dim = int(inner_dim) // int(num_heads)
+    head_dim = int(head_dim)
     cache: list[dict] = []
     for _ in range(num_blocks):
         cache.append({
@@ -296,6 +320,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     height: int,
     width: int,
     num_frames: int,
+    schedule_num_inference_steps: int,
     dmd_steps: list[int],
     context_noise: int,
     warp_denoising_step: bool,
@@ -308,18 +333,15 @@ def _causal_dmd_rollout_ti2v_controlnet(
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    # Make sure scheduler has the 1000-step grid used by warp_denoising_step mapping.
-    if hasattr(scheduler, "set_timesteps"):
-        # diffusers schedulers have slightly different `set_timesteps` signatures
-        # across versions; be permissive here.
+    def _scheduler_set_timesteps(num_steps: int) -> None:
+        # Be permissive across scheduler versions.
         try:
-            scheduler.set_timesteps(1000, device=device)  # type: ignore[arg-type]
+            scheduler.set_timesteps(int(num_steps), device=device)  # type: ignore[arg-type]
         except TypeError:
             try:
-                scheduler.set_timesteps(1000)
+                scheduler.set_timesteps(int(num_steps))
             except TypeError:
-                # Some schedulers expect `num_inference_steps` as a named arg.
-                scheduler.set_timesteps(num_inference_steps=1000)  # type: ignore[call-arg]
+                scheduler.set_timesteps(num_inference_steps=int(num_steps))  # type: ignore[call-arg]
 
     # Build a minimal ForwardBatch for forward_context bookkeeping.
     batch = ForwardBatch(data_type="ti2v_controlnet")
@@ -342,21 +364,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
             )
 
-    latents = torch.randn((1, transformer.num_channels_latents, latent_t,
-                           latent_h, latent_w),
-                          generator=generator,
+    # Allocate output latents buffer; each chunk will be generated independently then written back.
+    latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
                           device=device,
                           dtype=dtype)
-    if hasattr(scheduler, "init_noise_sigma"):
-        latents = latents * scheduler.init_noise_sigma
-
-    # DMD timestep list in scheduler coordinate (float) if warp enabled.
-    t_list = torch.tensor(dmd_steps, dtype=torch.long).cpu()
-    if warp_denoising_step:
-        scheduler_timesteps = torch.cat(
-            (scheduler.timesteps.cpu(), torch.tensor([0.0])))
-        t_list = scheduler_timesteps[1000 - t_list]
-    t_list = t_list.to(device=device)
 
     num_frames_per_block = transformer.config.arch_config.num_frames_per_block
     if latents.shape[2] % num_frames_per_block != 0:
@@ -398,18 +409,34 @@ def _causal_dmd_rollout_ti2v_controlnet(
     start_index = 0
     for _block_idx in range(num_blocks):
         current_num_frames = num_frames_per_block
-        current_latents = latents[:, :, start_index:start_index +
-                                  current_num_frames].contiguous()
+        # Each chunk starts from fresh noise, then is denoised with the same schedule.
+        current_latents = torch.randn((1, transformer.num_channels_latents, current_num_frames, latent_h, latent_w),
+                                      generator=generator,
+                                      device=device,
+                                      dtype=dtype)
 
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
                                                                     dtype=dtype)
 
-        # DMD steps: pred -> x0 -> re-noise to next anchor
+        # Reset scheduler internal step index for each chunk (each chunk starts from the same noise level).
+        _scheduler_set_timesteps(int(schedule_num_inference_steps))
+        schedule_timesteps = scheduler.timesteps.to(device=device, dtype=torch.float32)
+        anchors = torch.tensor(dmd_steps, device=device, dtype=schedule_timesteps.dtype)
+        idx = torch.argmin((schedule_timesteps[None, :] - anchors[:, None]).abs(), dim=1)
+        t_list = schedule_timesteps.index_select(0, idx)
+
+        # Self-Forcing convention: `context_noise` is an *index/step* on the current schedule,
+        # but some codepaths treat it as a 0..1000 coordinate. Support both.
+        if 0 <= int(context_noise) < int(schedule_num_inference_steps):
+            t_context = schedule_timesteps[int(context_noise)]
+        else:
+            ctx_v = torch.as_tensor(float(context_noise), device=device, dtype=schedule_timesteps.dtype)
+            ctx_idx = torch.argmin((schedule_timesteps - ctx_v).abs()).item()
+            t_context = schedule_timesteps[int(ctx_idx)]
+
+        # Euler ODE steps: x_{t_next} = x_t + dt * v_theta(x_t, t)
         for step_i, t_cur in enumerate(t_list):
-            # Conversion utilities expect BTCHW
-            noise_latents_btchw = current_latents.permute(0, 2, 1, 3,
-                                                          4).contiguous()
             latent_model_input = current_latents
 
             if first_frame_latent_bcfhw is not None and start_index == 0:
@@ -417,9 +444,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
                     device=device, dtype=dtype)
 
-            t_expanded = t_cur * torch.ones((1, 1),
-                                            device=device,
-                                            dtype=torch.float32)
+            t_expanded = t_cur.reshape(1, 1).to(device=device, dtype=torch.float32)
 
             with torch.autocast(device_type="cuda", dtype=dtype,
                                 enabled=(dtype != torch.float32)), \
@@ -437,7 +462,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     start_frame=start_index,
                 )
 
-                pred_noise_btchw = transformer(
+                flow_bcfhw = transformer(
                     latent_model_input,
                     prompt_embeds_list,
                     t_expanded,
@@ -446,35 +471,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     crossattn_cache=crossattn_cache,
                     current_start=start_index * frame_seq_length,
                     start_frame=start_index,
-                ).permute(0, 2, 1, 3, 4)
+                )
 
-            t_expand_1d = t_cur.repeat(pred_noise_btchw.shape[0])
-            pred_video_btchw = pred_noise_to_pred_video(
-                pred_noise=pred_noise_btchw.flatten(0, 1),
-                noise_input_latent=noise_latents_btchw.flatten(0, 1),
-                timestep=t_expand_1d,
-                scheduler=scheduler,
-            ).unflatten(0, pred_noise_btchw.shape[:2])
-
-            if step_i < len(t_list) - 1:
-                next_t = t_list[step_i + 1] * torch.ones([1],
-                                                         device=device,
-                                                         dtype=torch.float32)
-                # `torch.randn_like` does not accept `generator` in many PyTorch versions.
-                noise = torch.randn(pred_video_btchw.shape,
-                                    generator=generator,
-                                    device=pred_video_btchw.device,
-                                    dtype=pred_video_btchw.dtype)
-                noise_latents_btchw = scheduler.add_noise(
-                    pred_video_btchw.flatten(0, 1), noise.flatten(0, 1),
-                    next_t).unflatten(0, pred_video_btchw.shape[:2])
-                current_latents = noise_latents_btchw.permute(
-                    0, 2, 1, 3, 4).contiguous()
-            else:
-                current_latents = pred_video_btchw.permute(0, 2, 1, 3,
-                                                           4).contiguous()
+            current_latents = scheduler.step(flow_bcfhw, t_cur, current_latents, return_dict=False)[0]
 
             if first_frame_latent_bcfhw is not None and start_index == 0:
+                current_latents = current_latents.clone()
                 current_latents[:, :, :1] = first_frame_latent_bcfhw.to(
                     device=device, dtype=dtype)
 
@@ -482,20 +484,19 @@ def _causal_dmd_rollout_ti2v_controlnet(
         latents[:, :, start_index:start_index + current_num_frames] = current_latents
 
         # Cache update with optional context noise (Self-Forcing style)
-        context_t = torch.ones((1, 1),
-                               device=device,
-                               dtype=torch.float32) * float(context_noise)
+        # `add_noise` in FlowMatchEulerDiscreteScheduler expects a 1D timestep tensor; if len==1 it broadcasts.
+        context_t_val = t_context.reshape(1).to(device=device, dtype=torch.float32)
+        context_t_model = context_t_val.view(1, 1)
         context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-        if context_noise != 0:
-                ctx_flat = context_btchw.flatten(0, 1)
-                ctx_noise = torch.randn(ctx_flat.shape,
-                                        generator=generator,
-                                        device=ctx_flat.device,
-                                        dtype=ctx_flat.dtype)
-                context_btchw = scheduler.add_noise(ctx_flat, ctx_noise,
-                                                    context_t).unflatten(
-                                                        0,
-                                                        context_btchw.shape[:2])
+        if float(t_context.item()) != 0.0:
+            ctx_flat = context_btchw.flatten(0, 1)
+            ctx_noise = torch.randn(ctx_flat.shape,
+                                    generator=generator,
+                                    device=ctx_flat.device,
+                                    dtype=ctx_flat.dtype)
+            context_btchw = scheduler.add_noise(ctx_flat, ctx_noise,
+                                                context_t_val).unflatten(
+                                                    0, context_btchw.shape[:2])
         context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
         if first_frame_latent_bcfhw is not None and start_index == 0:
@@ -511,7 +512,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             control_res_ctx = controlnet(
                 hidden_states=context_bcfhw,
                 encoder_hidden_states=prompt_embeds_list,
-                timestep=context_t,
+                timestep=context_t_model,
                 controlnet_states=control_chunk,
                 kv_cache=control_kv_cache,
                 crossattn_cache=control_crossattn_cache,
@@ -521,7 +522,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             _ = transformer(
                 context_bcfhw,
                 prompt_embeds_list,
-                context_t,
+                context_t_model,
                 block_controlnet_hidden_states=control_res_ctx,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
@@ -560,6 +561,12 @@ def main() -> None:
     # Treat this as the *output* fps (not the dataset fps stored in parquet),
     # so users can match Diff-Factory behavior even if preprocess wrote fps=30.
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument(
+        "--schedule_num_inference_steps",
+        type=int,
+        default=50,
+        help="Teacher grid size used to define the student timestep anchors (usually 50).",
+    )
     parser.add_argument("--dmd_steps",
                         type=str,
                         default="1000,750,500,250",
@@ -571,7 +578,7 @@ def main() -> None:
     parser.add_argument("--warp_denoising_step",
                         action="store_true",
                         default=True,
-                        help="Match training: map 0..1000 DMD grid to scheduler.timesteps.")
+                        help="Snap DMD anchors (0..1000) to the nearest values in scheduler.timesteps.")
     parser.add_argument("--dtype",
                         type=str,
                         default="bf16",
@@ -626,9 +633,11 @@ def main() -> None:
         "transformer", args.transformer_dir, "diffusers", fastvideo_args)
     controlnet = PipelineComponentLoader.load_module(
         "controlnet", args.controlnet_dir, "diffusers", fastvideo_args)
-    scheduler = PipelineComponentLoader.load_module(
-        "scheduler", str(Path(args.base_model) / "scheduler"), "diffusers",
-        fastvideo_args)
+    # Self-Forcing / DMD training uses Euler ODE (FlowMatchEulerDiscreteScheduler).
+    # Do NOT use the base model's UniPC scheduler here, otherwise the timestep grid
+    # and update rule mismatch and results can collapse to noise.
+    flow_shift = float(getattr(fastvideo_args.pipeline_config, "flow_shift", 8.0) or 8.0)
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
     vae = PipelineComponentLoader.load_module("vae",
                                               str(Path(args.base_model) / "vae"),
                                               "diffusers", fastvideo_args)
@@ -658,6 +667,7 @@ def main() -> None:
             height=args.height,
             width=args.width,
             num_frames=args.num_frames,
+            schedule_num_inference_steps=int(args.schedule_num_inference_steps),
             dmd_steps=dmd_steps,
             context_noise=args.context_noise,
             warp_denoising_step=True,
