@@ -346,6 +346,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     context_noise: int,
     warp_denoising_step: bool,
     update_rule: str,
+    first_frame_timestep_zero: bool,
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -556,7 +557,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
             timestep = torch.ones((1, current_num_frames),
                                   device=device,
                                   dtype=torch.float32) * t_scalar
-            if first_frame_latent_bcfhw is not None and start_index == 0:
+            # IMPORTANT (training alignment):
+            # In FastVideo self-forcing training, TI2V enforces the first latent frame by
+            # overwriting `hidden_states[:, :, 0]`, but does NOT override its timestep.
+            # Keep the original timestep by default; allow forcing to 0 for Diff-Factory-style
+            # expand_timesteps debugging via `--first_frame_timestep_zero`.
+            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
                 timestep = timestep.clone()
                 timestep[:, 0] = 0
 
@@ -626,7 +632,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 timestep = torch.ones((1, current_num_frames),
                                       device=device,
                                       dtype=torch.float32) * t_cur
-                if first_frame_latent_bcfhw is not None and start_index == 0:
+                if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
                     timestep = timestep.clone()
                     timestep[:, 0] = 0
 
@@ -689,7 +695,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             timestep_final = torch.ones((1, current_num_frames),
                                         device=device,
                                         dtype=torch.float32) * t_final
-            if first_frame_latent_bcfhw is not None and start_index == 0:
+            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
                 timestep_final = timestep_final.clone()
                 timestep_final[:, 0] = 0
             noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
@@ -716,9 +722,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
         context_timestep = torch.ones((1, current_num_frames),
                                       device=device,
                                       dtype=torch.float32) * float(context_noise)
-        if first_frame_latent_bcfhw is not None and start_index == 0:
-            context_timestep = context_timestep.clone()
-            context_timestep[:, 0] = 0
         # Match Self-Forcing training: always add (small) context noise then commit cache.
         ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
         context_btchw = scheduler.add_noise(
@@ -910,6 +913,14 @@ def main() -> None:
         default=1.0,
         help="Classifier-free guidance scale. For student inference, 1.0 (no CFG) matches training by default.",
     )
+    parser.add_argument(
+        "--first_frame_timestep_zero",
+        action="store_true",
+        help=(
+            "Force the first latent frame's timestep to 0 (Diff-Factory expand_timesteps behavior). "
+            "Default OFF to match FastVideo self-forcing training."
+        ),
+    )
     parser.add_argument("--context_noise",
                         type=int,
                         default=0,
@@ -1047,6 +1058,7 @@ def main() -> None:
             context_noise=args.context_noise,
             warp_denoising_step=True,
             update_rule=args.update_rule,
+            first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
             seed=args.seed + i,
             dtype=dtype,
         )
