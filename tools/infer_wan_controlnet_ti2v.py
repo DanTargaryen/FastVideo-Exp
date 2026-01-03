@@ -339,7 +339,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
     width: int,
     num_frames: int,
     schedule_num_inference_steps: int,
-    dmd_steps: list[int],
+    dmd_steps: list[int] | None,
+    timestep_indices: list[int] | None,
     context_noise: int,
     warp_denoising_step: bool,
     update_rule: str,
@@ -383,21 +384,37 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
             )
 
-    # For self-forcing / DMD rollout we use the training-time (1000-step) scheduler grid.
-    # The `dmd_steps` are specified in that 0..1000 coordinate system.
-    # If a caller passes a different schedule size, we still default to the 1000-grid
-    # to match training behavior unless explicitly requested.
-    if int(schedule_num_inference_steps) <= 0:
-        schedule_num_inference_steps = 1000
-    if int(schedule_num_inference_steps) != 1000:
-        logger.warning(
-            "schedule_num_inference_steps=%s but self-forcing rollout expects 1000-grid anchors; "
-            "using 1000-step FlowMatchEulerDiscreteScheduler grid for mapping.",
-            schedule_num_inference_steps,
-        )
+    # Scheduler grid choice:
+    # - If `timestep_indices` is provided: we run on a K-step inference grid (e.g. 50) and select those indices.
+    # - If `dmd_steps` is provided: interpret as 0..1000 coordinates and (optionally) warp to the scheduler's
+    #   1000-step grid (Self-Forcing style).
+    if timestep_indices is not None and dmd_steps is not None:
+        raise ValueError("Pass only one of dmd_steps or timestep_indices (not both).")
 
-    # Make sure scheduler has a 1000-step grid available (some schedulers require calling set_timesteps).
-    _scheduler_set_timesteps(1000)
+    if timestep_indices is None and dmd_steps is None:
+        raise ValueError("Must provide either timestep_indices or dmd_steps.")
+
+    if timestep_indices is not None:
+        if int(schedule_num_inference_steps) <= 0:
+            raise ValueError("--schedule_num_inference_steps must be > 0 when using --timestep_indices")
+        _scheduler_set_timesteps(int(schedule_num_inference_steps))
+        full_ts = scheduler.timesteps.to(device=device)
+        idx_t = torch.tensor(timestep_indices, device=device, dtype=torch.long)
+        if torch.any(idx_t < 0) or torch.any(idx_t >= full_ts.numel()):
+            raise ValueError(
+                f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {timestep_indices}"
+            )
+        t_list_full = full_ts.index_select(0, idx_t).to(device=device)
+    else:
+        # DMD steps are specified in the 0..1000 coordinate system.
+        # Warp them to the shifted FlowMatch scheduler's 1000-step grid by nearest index (Self-Forcing training).
+        _scheduler_set_timesteps(1000)
+        t_list = torch.tensor(dmd_steps, dtype=torch.long).cpu()
+        t_list_full = t_list.to(device=device)
+        if warp_denoising_step:
+            scheduler_timesteps = torch.cat(
+                (scheduler.timesteps.detach().cpu(), torch.tensor([0.0], dtype=torch.float32)))
+            t_list_full = scheduler_timesteps[1000 - t_list].to(device=device)
 
     # Allocate output latents buffer; each chunk will be generated independently then written back.
     latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -456,16 +473,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                              current_num_frames].to(device=device,
                                                                     dtype=dtype)
 
-        # Build the DMD timestep list in scheduler coordinate (float) if warp enabled.
-        # This matches `FastVideo/fastvideo/training/distillation_pipeline.py` warping.
-        t_list = torch.tensor(dmd_steps, dtype=torch.long).cpu()
-        if warp_denoising_step:
-            scheduler_timesteps = torch.cat(
-                (scheduler.timesteps.cpu(), torch.tensor([0.0], dtype=torch.float32)))
-            t_list = scheduler_timesteps[1000 - t_list]
-        t_list = t_list.to(device=device)
+        # Timesteps for this chunk.
+        t_list = t_list_full
 
-    # DMD steps: predict flow -> reconstruct clean x0 -> re-noise to next anchor
+        # DMD steps: predict flow -> reconstruct clean x0 -> re-noise to next anchor
         for step_i, t_cur in enumerate(t_list):
             # Work in BFCHW like training does.
             noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
@@ -570,18 +581,18 @@ def _causal_dmd_rollout_ti2v_controlnet(
         context_timestep = torch.ones((1, current_num_frames),
                                       device=device,
                                       dtype=torch.float32) * float(context_noise)
-        if float(context_noise) != 0.0:
-            ctx_noise = torch.randn(
-                context_btchw.flatten(0, 1).shape,
-                generator=generator,
-                device=device,
-                dtype=context_btchw.dtype,
-            )
-            context_btchw = scheduler.add_noise(
-                context_btchw.flatten(0, 1),
-                ctx_noise,
-                context_timestep.flatten(),
-            ).unflatten(0, context_btchw.shape[:2])
+        # Match Self-Forcing training: always add (small) context noise then commit cache.
+        ctx_noise = torch.randn(
+            context_btchw.flatten(0, 1).shape,
+            generator=generator,
+            device=device,
+            dtype=context_btchw.dtype,
+        )
+        context_btchw = scheduler.add_noise(
+            context_btchw.flatten(0, 1),
+            ctx_noise,
+            context_timestep.flatten(),
+        ).unflatten(0, context_btchw.shape[:2])
 
         context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
@@ -683,10 +694,18 @@ def main() -> None:
         default=50,
         help="Teacher grid size used to define the student timestep anchors (usually 50).",
     )
-    parser.add_argument("--dmd_steps",
-                        type=str,
-                        default="1000,750,500,250",
-                        help="Comma-separated DMD anchors in 0..1000 grid.")
+    parser.add_argument(
+        "--timestep_indices",
+        type=str,
+        default="0,12,24,36,49",
+        help="Comma-separated indices into scheduler.timesteps for few-step rollout (Diff-Factory-style).",
+    )
+    parser.add_argument(
+        "--dmd_steps",
+        type=str,
+        default="",
+        help="Optional: comma-separated anchors in 0..1000 grid (Self-Forcing-style). If set, overrides --timestep_indices.",
+    )
     parser.add_argument(
         "--update_rule",
         type=str,
@@ -726,7 +745,10 @@ def main() -> None:
         "fp16": torch.float16,
     }[args.dtype]
 
+    timestep_indices = [int(x) for x in args.timestep_indices.split(",") if x.strip() != ""]
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
+    dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
+    timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
 
     fastvideo_args = FastVideoArgs.from_kwargs(
         model_path=args.base_model,
@@ -751,7 +773,7 @@ def main() -> None:
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     fastvideo_args.pipeline_config.warp_denoising_step = True
-    fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps
+    fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps if dmd_steps_list is not None else []
     fastvideo_args.pipeline_config.context_noise = int(args.context_noise)
 
     if args.init_transformer_safetensors:
@@ -798,7 +820,8 @@ def main() -> None:
             width=args.width,
             num_frames=args.num_frames,
             schedule_num_inference_steps=int(args.schedule_num_inference_steps),
-            dmd_steps=dmd_steps,
+            dmd_steps=dmd_steps_list,
+            timestep_indices=timestep_indices_list,
             context_noise=args.context_noise,
             warp_denoising_step=True,
             update_rule=args.update_rule,
