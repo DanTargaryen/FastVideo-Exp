@@ -206,8 +206,34 @@ def _initialize_kv_cache(*, model, batch_size: int, dtype: torch.dtype,
                          device: torch.device,
                          frame_seq_length: int) -> list[dict]:
     num_blocks = len(model.blocks)
-    num_heads = model.num_attention_heads
-    head_dim = model.attention_head_dim
+    # Different model variants expose these attributes differently.
+    # - CausalWanTransformer3DModel / CausalWanControlnet3DModel: has `num_attention_heads` + `attention_head_dim`
+    # - WanTransformer3DModel: has `num_attention_heads` but not `attention_head_dim`
+    num_heads = getattr(model, "num_attention_heads", None)
+    if num_heads is None:
+        num_heads = getattr(getattr(model, "config", None), "num_attention_heads", None)
+    if num_heads is None:
+        num_heads = getattr(getattr(getattr(model, "config", None), "arch_config", None),
+                            "num_attention_heads", None)
+    if num_heads is None:
+        raise AttributeError(f"Cannot determine num_attention_heads for {type(model).__name__}")
+    num_heads = int(num_heads)
+
+    head_dim = getattr(model, "attention_head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(getattr(model, "config", None), "attention_head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(getattr(getattr(model, "config", None), "arch_config", None),
+                           "attention_head_dim", None)
+    if head_dim is None:
+        # Fallback: infer from inner dim if possible.
+        inner_dim = getattr(model, "inner_dim", None)
+        if inner_dim is None:
+            inner_dim = getattr(model, "hidden_size", None)
+        if inner_dim is None:
+            raise AttributeError(f"Cannot determine attention_head_dim for {type(model).__name__}")
+        head_dim = int(inner_dim) // int(num_heads)
+    head_dim = int(head_dim)
 
     local_attn_size = getattr(model, "local_attn_size", -1)
     sliding_window_num_frames = model.config.arch_config.sliding_window_num_frames
@@ -577,6 +603,9 @@ def main() -> None:
         vae_cpu_offload=False,
         pin_cpu_memory=True,
     )
+    # Ensure student rollout uses the chunk-wise causal transformer (KV cache),
+    # even if the exported config.json says "WanTransformer3DModel".
+    fastvideo_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     fastvideo_args.pipeline_config.warp_denoising_step = True
