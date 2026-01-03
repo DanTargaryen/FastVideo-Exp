@@ -556,7 +556,10 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--seed", type=int, default=1024)
-    parser.add_argument("--fps", type=int, default=30)
+    # Diff-Factory's Wan video export examples use fps=16 for visualization.
+    # Treat this as the *output* fps (not the dataset fps stored in parquet),
+    # so users can match Diff-Factory behavior even if preprocess wrote fps=30.
+    parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--dmd_steps",
                         type=str,
                         default="1000,750,500,250",
@@ -664,7 +667,7 @@ def main() -> None:
 
         # Decode to pixels [B, C, T, H, W] in [0,1], then save mp4
         decoded = decoding.decode(latents, fastvideo_args).cpu().float()
-        fps = int(sample.fps or args.fps)
+        fps = int(args.fps)
         out_path = str(Path(args.out_dir) / f"{sample.sample_id}.mp4")
         _save_mp4(decoded, out_path, fps=fps)
         logger.info("saved: %s", out_path)
