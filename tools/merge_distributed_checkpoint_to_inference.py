@@ -32,13 +32,14 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import yaml
 
+from fastvideo.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+)
 from fastvideo.logger import init_logger
+from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.training.checkpointing_utils import ModelWrapper
 from fastvideo.training.training_utils import save_distillation_checkpoint
 from fastvideo.fastvideo_args import TrainingArgs
-from fastvideo.training.wan_controlnet_self_forcing_distillation_pipeline import (
-    WanControlnetSelfForcingDistillationPipeline,
-)
 
 logger = init_logger(__name__)
 
@@ -59,12 +60,6 @@ def _load_yaml_as_namespace(config_path: str) -> argparse.Namespace:
     cfg = dict(cfg)
     cfg["inference_mode"] = True
     cfg["mode"] = "inference"
-    # Avoid loading teacher/critic modules to reduce memory usage: we only need
-    # the generator transformer + generator controlnet.
-    cfg["real_score_model_path"] = ""
-    cfg["fake_score_model_path"] = ""
-    cfg["real_score_controlnet_model_path"] = ""
-    cfg["fake_score_controlnet_model_path"] = ""
     ns = argparse.Namespace(**cfg)
     # Make TrainingArgs.from_cli_args treat these as "explicitly provided".
     ns._provided = set(cfg.keys())  # type: ignore[attr-defined]
@@ -110,24 +105,39 @@ def main() -> None:
     cfg_ns = _load_yaml_as_namespace(args.config)
     training_args = TrainingArgs.from_cli_args(cfg_ns)
 
-    # Build the pipeline (initializes distributed environment and creates modules).
     model_path = getattr(training_args, "pretrained_model_name_or_path",
                          None) or getattr(training_args, "model_path", None)
     if not model_path:
         raise ValueError("Config must define pretrained_model_name_or_path or model_path.")
-    # IMPORTANT: do NOT call `pipe.post_init()` here.
-    # `post_init()` would initialize the *training* pipeline when `training_mode=True`
-    # and may require training-only config fields (e.g. dmd_denoising_steps).
-    # For checkpoint merging we only need the modules created in `__init__()`.
-    #
-    # Also, even if `training_args.inference_mode=True`, some user configs may
-    # still cause `training_mode=True` via CLI overrides; skipping post_init
-    # makes the tool robust.
-    pipe = WanControlnetSelfForcingDistillationPipeline(model_path, training_args)
 
+    # Initialize distributed env (needed for FSDP2/HSDP sharding and DCP load).
+    maybe_init_distributed_environment_and_model_parallel(training_args.tp_size,
+                                                          training_args.sp_size)
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed is not initialized; run with torchrun.")
     rank = dist.get_rank()
+
+    # Load ONLY the generator modules we need (transformer + controlnet), without
+    # constructing the distillation training pipeline (which would require teacher paths).
+    # Ensure we load the causal transformer class (student architecture).
+    training_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
+
+    transformer_dir = os.path.join(model_path, "transformer")
+    generator_transformer = PipelineComponentLoader.load_module(
+        module_name="transformer",
+        component_model_path=transformer_dir,
+        transformers_or_diffusers="diffusers",
+        fastvideo_args=training_args,
+    )
+
+    generator_controlnet = None
+    if getattr(training_args, "controlnet_model_path", ""):
+        generator_controlnet = PipelineComponentLoader.load_module(
+            module_name="controlnet",
+            component_model_path=training_args.controlnet_model_path,
+            transformers_or_diffusers="diffusers",
+            fastvideo_args=training_args,
+        )
 
     checkpoint_dir = os.path.normpath(args.checkpoint_dir)
     step = _extract_step_from_checkpoint_dir(checkpoint_dir)
@@ -136,9 +146,6 @@ def main() -> None:
     generator_dcp_dir = os.path.join(checkpoint_dir, "distributed_checkpoint", "generator")
     if not os.path.isdir(generator_dcp_dir):
         raise FileNotFoundError(f"Missing generator DCP dir: {generator_dcp_dir}")
-
-    generator_transformer: torch.nn.Module = pipe.get_module("transformer")
-    generator_controlnet: torch.nn.Module | None = getattr(pipe, "controlnet", None)
 
     # Load generator weights from distributed checkpoint.
     generator_ckpt_model: torch.nn.Module = generator_transformer
