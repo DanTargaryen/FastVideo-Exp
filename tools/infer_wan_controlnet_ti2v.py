@@ -379,15 +379,27 @@ def _causal_dmd_rollout_ti2v_controlnet(
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
 
-    def _scheduler_set_timesteps(num_steps: int) -> None:
-        # Be permissive across scheduler versions.
-        try:
-            scheduler.set_timesteps(int(num_steps), device=device)  # type: ignore[arg-type]
-        except TypeError:
-            try:
-                scheduler.set_timesteps(int(num_steps))
-            except TypeError:
-                scheduler.set_timesteps(num_inference_steps=int(num_steps))  # type: ignore[call-arg]
+    def _get_train_grid_timesteps() -> torch.Tensor:
+        """
+        FastVideo training uses `FlowMatchEulerDiscreteScheduler(shift=...)` on the *full* training grid
+        (1000 points) without calling `set_timesteps()`.
+
+        IMPORTANT: calling `set_timesteps()` on this scheduler applies `shift` again, which makes the final
+        (low-noise) timestep much larger (~60 instead of ~8 when shift=8). That mismatch typically produces
+        "all-noise" videos (frame 0 looks OK because it's clamped from the dataset).
+        """
+        ts = getattr(scheduler, "timesteps", None)
+        num_train = int(
+            getattr(getattr(scheduler, "config", None), "num_train_timesteps",
+                    1000))
+        if ts is None:
+            raise ValueError("scheduler.timesteps is None")
+        if int(ts.numel()) < num_train:
+            raise ValueError(
+                f"scheduler.timesteps too short: {int(ts.numel())} < num_train_timesteps={num_train}. "
+                "Do not call scheduler.set_timesteps() for this scheduler in inference."
+            )
+        return ts[:num_train].to(device=device, dtype=torch.float32)
 
     # Build a minimal ForwardBatch for forward_context bookkeeping.
     batch = ForwardBatch(data_type="ti2v_controlnet")
@@ -419,11 +431,25 @@ def _causal_dmd_rollout_ti2v_controlnet(
     if timestep_indices is None and dmd_steps is None:
         raise ValueError("Must provide either timestep_indices or dmd_steps.")
 
+    train_grid_ts = _get_train_grid_timesteps()
+    num_train = int(train_grid_ts.numel())
+    logger.info(
+        "train_grid: num=%s timesteps[min,max]=[%s,%s]",
+        num_train,
+        float(train_grid_ts[-1].detach().cpu().item()),
+        float(train_grid_ts[0].detach().cpu().item()),
+    )
+
     if timestep_indices is not None:
         if int(schedule_num_inference_steps) <= 0:
             raise ValueError("--schedule_num_inference_steps must be > 0 when using --timestep_indices")
-        _scheduler_set_timesteps(int(schedule_num_inference_steps))
-        full_ts = scheduler.timesteps.to(device=device)
+        # Build the K-step "teacher" grid by subsampling the 1000-step training grid.
+        k = max(1, int(schedule_num_inference_steps))
+        teacher_idx = torch.linspace(0,
+                                     num_train - 1,
+                                     steps=k,
+                                     device=device).round().long()
+        full_ts = train_grid_ts.index_select(0, teacher_idx)
         idx_list = list(timestep_indices)
         if update_rule == "euler_dt":
             # For deterministic Euler stepping, we need a "next" timestep after the last anchor.
@@ -438,13 +464,14 @@ def _causal_dmd_rollout_ti2v_controlnet(
             raise ValueError(
                 f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {idx_list}"
             )
-        t_list_full = full_ts.index_select(0, idx_t).to(device=device)
+        t_list_full = full_ts.index_select(0, idx_t).to(device=device,
+                                                        dtype=torch.float32)
         logger.info(
             "rollout schedule: timestep_indices=%s (effective_indices=%s, schedule_num_inference_steps=%s) -> timesteps=%s",
             list(timestep_indices),
             idx_list,
             int(schedule_num_inference_steps),
-            [int(x) for x in t_list_full.detach().cpu().tolist()],
+            [float(x) for x in t_list_full.detach().cpu().tolist()],
         )
     else:
         # DMD denoising steps (Self-Forcing style).
@@ -460,26 +487,22 @@ def _causal_dmd_rollout_ti2v_controlnet(
         # For inference, mirror that behavior so the solver matches training.
         dmd_steps_t = torch.tensor(dmd_steps, dtype=torch.long, device=device)
         if warp_denoising_step:
-            # Ensure the scheduler has a 1000-step grid available.
-            # FlowMatchEulerDiscreteScheduler usually exposes this by default, but be robust.
-            try:
-                if not hasattr(scheduler, "timesteps") or scheduler.timesteps is None or int(scheduler.timesteps.numel()) < 1000:
-                    _scheduler_set_timesteps(1000)
-            except Exception:
-                _scheduler_set_timesteps(1000)
-
-            schedule_ts = scheduler.timesteps.to(device=device)
+            # Mirror training exactly:
+            #   timesteps = cat([noise_scheduler.timesteps, 0])
+            #   denoise_ts = timesteps[1000 - dmd_steps]
+            schedule_ts = train_grid_ts
             # Training uses an extra terminal "0" entry.
             schedule_ts = torch.cat(
-                (schedule_ts, torch.tensor([0], device=device, dtype=schedule_ts.dtype)),
+                (schedule_ts,
+                 torch.tensor([0.0], device=device, dtype=schedule_ts.dtype)),
                 dim=0,
             )
             # Clamp to avoid OOB if scheduler grid differs slightly.
-            idx = (1000 - dmd_steps_t).clamp_(0, schedule_ts.numel() - 1)
+            idx = (num_train - dmd_steps_t).clamp_(0, schedule_ts.numel() - 1)
             t_list_full = schedule_ts.index_select(0, idx)
         else:
             # Treat provided steps as raw timestep values.
-            t_list_full = dmd_steps_t
+            t_list_full = dmd_steps_t.to(dtype=torch.float32)
         logger.info(
             "rollout schedule: dmd_steps=%s warp=%s -> timesteps=%s",
             list(dmd_steps),
@@ -1131,6 +1154,12 @@ def main() -> None:
         # Decode to pixels [B, C, T, H, W] in [0,1], then save mp4
         decoded = decoding.decode(latents, fastvideo_args).cpu().float()
         fps = int(args.fps)
+        logger.info(
+            "decoded_video: shape=%s fps=%s seconds=%.2f",
+            tuple(decoded.shape),
+            fps,
+            float(decoded.shape[2]) / float(max(1, fps)),
+        )
         out_path = str(Path(args.out_dir) / f"{sample.sample_id}.mp4")
         _save_mp4(decoded, out_path, fps=fps)
         if bool(args.save_frames):
