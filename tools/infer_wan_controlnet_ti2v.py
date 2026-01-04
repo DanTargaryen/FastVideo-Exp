@@ -715,7 +715,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
         elif update_rule == "euler_dt":
             # Deterministic Euler stepping in sigma space (Diff-Factory-style):
             #   x_{t_next} = x_{t} + (sigma(t_next) - sigma(t)) * v_theta(x_t, t)
-            # then at the final (low-noise) timestep, predict x0 once.
+            # NOTE: for few-step distilled students, `t_list` usually includes the last schedule index
+            # only as "next timestep" (nxt[i]) rather than an extra model forward. Therefore, we:
+            # - predict v at every t_cur (all but the last element)
+            # - update x to the last timestep
+            # - return x at the final (very low noise) sigma as the output (it is already ~x0).
             if t_list.numel() < 2:
                 raise ValueError("euler_dt requires at least 2 timesteps (need a next timestep).")
             timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
@@ -737,27 +741,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 if first_frame_latent_bcfhw is not None and start_index == 0:
                     current_latents = current_latents.clone()
                     current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
-
-            # Final x0 prediction at t_final (last element in t_list).
-            t_final = t_list[-1]
-            pred_flow_btchw = _predict_flow_at_t(t_final, step_index=int(t_list.numel()) - 1)
-            timestep_final = torch.ones((1, current_num_frames),
-                                        device=device,
-                                        dtype=torch.float32) * t_final
-            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
-                timestep_final = timestep_final.clone()
-                timestep_final[:, 0] = 0
-            noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-            denoised_pred = pred_noise_to_pred_video(
-                pred_noise=pred_flow_btchw.flatten(0, 1),
-                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
-                timestep=timestep_final,
-                scheduler=scheduler,
-            ).unflatten(0, pred_flow_btchw.shape[:2])
-            current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
-            if first_frame_latent_bcfhw is not None and start_index == 0:
-                current_latents = current_latents.clone()
-                current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         else:
             raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
@@ -962,11 +945,12 @@ def main() -> None:
     parser.add_argument(
         "--update_rule",
         type=str,
-        default="renoise_x0",
+        default="euler_dt",
         choices=["renoise_x0", "euler_dt"],
         help=
-        "How to propagate between anchors. `renoise_x0` matches the Self-Forcing simulation "
-        "(x0 reconstruction then add_noise). `euler_dt` is a deterministic Euler update in sigma space.",
+        "How to propagate between anchors. `euler_dt` matches Diff-Factory / ODE-style Euler integration "
+        "(deterministic update in sigma space). `renoise_x0` matches the Self-Forcing *training simulation* "
+        "(x0 reconstruction then add_noise with fresh noise), which is usually NOT what you want for inference quality.",
     )
     parser.add_argument(
         "--guidance_scale",
@@ -1122,6 +1106,15 @@ def main() -> None:
                 decoded_first[:, 0],
                 str(Path(args.out_dir) / f"{sample.sample_id}__first_frame.png"),
             )
+
+        logger.info(
+            "sampling: update_rule=%s guidance_scale=%s context_noise=%s reset_cache_each_block=%s disable_cache_update=%s",
+            str(args.update_rule),
+            float(args.guidance_scale),
+            int(args.context_noise),
+            bool(args.reset_cache_each_block),
+            bool(args.disable_cache_update),
+        )
 
         latents = _causal_dmd_rollout_ti2v_controlnet(
             transformer=transformer,
