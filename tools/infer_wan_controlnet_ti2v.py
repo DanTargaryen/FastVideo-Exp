@@ -326,6 +326,24 @@ def _initialize_crossattn_cache(*, model, batch_size: int, max_text_len: int,
     return cache
 
 
+def _reset_kv_and_crossattn_caches(
+    *,
+    kv_cache: list[dict] | None,
+    crossattn_cache: list[dict] | None,
+) -> None:
+    if kv_cache is not None:
+        for layer_cache in kv_cache:
+            layer_cache["global_end_index"].fill_(0)
+            layer_cache["local_end_index"].fill_(0)
+            layer_cache["k"].zero_()
+            layer_cache["v"].zero_()
+    if crossattn_cache is not None:
+        for layer_cache in crossattn_cache:
+            layer_cache["is_init"] = False
+            layer_cache["k"].zero_()
+            layer_cache["v"].zero_()
+
+
 @torch.no_grad()
 def _causal_dmd_rollout_ti2v_controlnet(
     *,
@@ -347,6 +365,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
     warp_denoising_step: bool,
     update_rule: str,
     first_frame_timestep_zero: bool,
+    reset_cache_each_block: bool,
+    disable_cache_update: bool,
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -532,6 +552,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
     num_blocks = latents.shape[2] // num_frames_per_block
     start_index = 0
     for _block_idx in range(num_blocks):
+        if reset_cache_each_block:
+            _reset_kv_and_crossattn_caches(kv_cache=kv_cache, crossattn_cache=crossattn_cache)
+            _reset_kv_and_crossattn_caches(kv_cache=kv_cache_uncond, crossattn_cache=crossattn_cache_uncond)
+            _reset_kv_and_crossattn_caches(kv_cache=control_kv_cache, crossattn_cache=control_crossattn_cache)
+            _reset_kv_and_crossattn_caches(kv_cache=control_kv_cache_uncond, crossattn_cache=control_crossattn_cache_uncond)
+
         current_num_frames = num_frames_per_block
         # Each chunk starts from fresh noise, then is denoised with the same DMD anchor schedule.
         current_latents = torch.randn(
@@ -715,78 +741,78 @@ def _causal_dmd_rollout_ti2v_controlnet(
         # Write back x0 chunk
         latents[:, :, start_index:start_index + current_num_frames] = current_latents
 
-        # Cache update with optional context noise (Self-Forcing style)
-        # Cache update with optional context noise (Self-Forcing style): add context noise then forward once to
-        # commit KV cache for the next chunk.
-        context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-        context_timestep = torch.ones((1, current_num_frames),
-                                      device=device,
-                                      dtype=torch.float32) * float(context_noise)
-        # Match Self-Forcing training: always add (small) context noise then commit cache.
-        ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
-        context_btchw = scheduler.add_noise(
-            context_btchw.flatten(0, 1),
-            ctx_noise,
-            context_timestep.flatten(),
-        ).unflatten(0, context_btchw.shape[:2])
+        if not disable_cache_update:
+            # Cache update with optional context noise (Self-Forcing style): add context noise then forward once to
+            # commit KV cache for the next chunk.
+            context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+            context_timestep = torch.ones((1, current_num_frames),
+                                          device=device,
+                                          dtype=torch.float32) * float(context_noise)
+            # Match Self-Forcing training: always add (small) context noise then commit cache.
+            ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
+            context_btchw = scheduler.add_noise(
+                context_btchw.flatten(0, 1),
+                ctx_noise,
+                context_timestep.flatten(),
+            ).unflatten(0, context_btchw.shape[:2])
 
-        context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
+            context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
-        if first_frame_latent_bcfhw is not None and start_index == 0:
-            context_bcfhw = context_bcfhw.clone()
-            context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                                  dtype=dtype)
+            if first_frame_latent_bcfhw is not None and start_index == 0:
+                context_bcfhw = context_bcfhw.clone()
+                context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                                      dtype=dtype)
 
-        with torch.autocast(device_type="cuda", dtype=dtype,
-                            enabled=(dtype != torch.float32)), \
-                set_forward_context(current_timestep=0,
-                                    attn_metadata=None,
-                                    forward_batch=batch):
-            control_res_ctx = controlnet(
-                hidden_states=context_bcfhw,
-                encoder_hidden_states=prompt_embeds_list,
-                timestep=context_timestep,
-                controlnet_states=control_chunk,
-                kv_cache=control_kv_cache,
-                crossattn_cache=control_crossattn_cache,
-                current_start=start_index * frame_seq_length,
-                start_frame=start_index,
-            )
-            _ = transformer(
-                context_bcfhw,
-                prompt_embeds_list,
-                context_timestep,
-                block_controlnet_hidden_states=control_res_ctx,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start=start_index * frame_seq_length,
-                start_frame=start_index,
-            )
-            if guidance_scale != 1.0:
-                if negative_prompt_embeds_list is None:
-                    raise ValueError(
-                        "guidance_scale != 1.0 requires negative_prompt_embeds_list."
-                    )
-                control_res_ctx_uncond = controlnet(
+            with torch.autocast(device_type="cuda", dtype=dtype,
+                                enabled=(dtype != torch.float32)), \
+                    set_forward_context(current_timestep=0,
+                                        attn_metadata=None,
+                                        forward_batch=batch):
+                control_res_ctx = controlnet(
                     hidden_states=context_bcfhw,
-                    encoder_hidden_states=negative_prompt_embeds_list,
+                    encoder_hidden_states=prompt_embeds_list,
                     timestep=context_timestep,
                     controlnet_states=control_chunk,
-                    kv_cache=control_kv_cache_uncond,
-                    crossattn_cache=control_crossattn_cache_uncond,
+                    kv_cache=control_kv_cache,
+                    crossattn_cache=control_crossattn_cache,
                     current_start=start_index * frame_seq_length,
                     start_frame=start_index,
                 )
                 _ = transformer(
                     context_bcfhw,
-                    negative_prompt_embeds_list,
+                    prompt_embeds_list,
                     context_timestep,
-                    block_controlnet_hidden_states=control_res_ctx_uncond,
-                    kv_cache=kv_cache_uncond,
-                    crossattn_cache=crossattn_cache_uncond,
+                    block_controlnet_hidden_states=control_res_ctx,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
                     current_start=start_index * frame_seq_length,
                     start_frame=start_index,
                 )
+                if guidance_scale != 1.0:
+                    if negative_prompt_embeds_list is None:
+                        raise ValueError(
+                            "guidance_scale != 1.0 requires negative_prompt_embeds_list."
+                        )
+                    control_res_ctx_uncond = controlnet(
+                        hidden_states=context_bcfhw,
+                        encoder_hidden_states=negative_prompt_embeds_list,
+                        timestep=context_timestep,
+                        controlnet_states=control_chunk,
+                        kv_cache=control_kv_cache_uncond,
+                        crossattn_cache=control_crossattn_cache_uncond,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    )
+                    _ = transformer(
+                        context_bcfhw,
+                        negative_prompt_embeds_list,
+                        context_timestep,
+                        block_controlnet_hidden_states=control_res_ctx_uncond,
+                        kv_cache=kv_cache_uncond,
+                        crossattn_cache=crossattn_cache_uncond,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    )
 
         start_index += current_num_frames
 
@@ -800,6 +826,18 @@ def _save_mp4(frames_bcthw: torch.Tensor, out_path: str, fps: int) -> None:
     frames_u8 = (frames * 255.0).round().astype(np.uint8)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(out_path, list(frames_u8), fps=fps, format="mp4")
+
+
+def _save_frames_png(frames_bcthw: torch.Tensor, out_dir: str, *, prefix: str) -> None:
+    import imageio
+
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    frames = frames_bcthw[0].permute(1, 2, 3, 0).clamp(0, 1).numpy()
+    frames_u8 = (frames * 255.0).round().astype(np.uint8)
+    for i, frame in enumerate(frames_u8):
+        imageio.imwrite(str(out_root / f"{prefix}_{i:04d}.png"), frame)
 
 
 def _tensor_stats(name: str, x: torch.Tensor) -> str:
@@ -921,6 +959,23 @@ def main() -> None:
             "Default OFF to match FastVideo self-forcing training."
         ),
     )
+    parser.add_argument(
+        "--reset_cache_each_block",
+        action="store_true",
+        help=(
+            "Debug: reset KV/cross-attn caches to zero at the beginning of every block, "
+            "so later blocks cannot attend to previous blocks. If outputs are still noisy, "
+            "the issue is NOT caused by cross-block KV cache."
+        ),
+    )
+    parser.add_argument(
+        "--disable_cache_update",
+        action="store_true",
+        help=(
+            "Debug: do not run the context-noise forward at the end of each block (no explicit cache commit). "
+            "This is mainly for diagnosing cache-related issues."
+        ),
+    )
     parser.add_argument("--context_noise",
                         type=int,
                         default=0,
@@ -937,6 +992,11 @@ def main() -> None:
         "--debug_dump",
         action="store_true",
         help="Dump latent stats and save a decoded first-frame PNG for debugging.",
+    )
+    parser.add_argument(
+        "--save_frames",
+        action="store_true",
+        help="Also save the decoded video as PNG frames under out_dir/frames/<sample_id>/",
     )
     args = parser.parse_args()
 
@@ -1059,6 +1119,8 @@ def main() -> None:
             warp_denoising_step=True,
             update_rule=args.update_rule,
             first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+            reset_cache_each_block=bool(args.reset_cache_each_block),
+            disable_cache_update=bool(args.disable_cache_update),
             seed=args.seed + i,
             dtype=dtype,
         )
@@ -1071,6 +1133,9 @@ def main() -> None:
         fps = int(args.fps)
         out_path = str(Path(args.out_dir) / f"{sample.sample_id}.mp4")
         _save_mp4(decoded, out_path, fps=fps)
+        if bool(args.save_frames):
+            frames_dir = str(Path(args.out_dir) / "frames" / sample.sample_id)
+            _save_frames_png(decoded, frames_dir, prefix=sample.sample_id)
         logger.info("saved: %s", out_path)
 
 
