@@ -64,6 +64,9 @@ from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from fastvideo.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
 from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.decoding import DecodingStage
@@ -439,7 +442,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     *,
     transformer,
     controlnet,
-    scheduler,
+    scheduler: FlowMatchEulerDiscreteScheduler | FlowUniPCMultistepScheduler,
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
@@ -489,14 +492,25 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
             )
 
-    t_list_full = _build_rollout_timesteps(
-        scheduler=scheduler,
-        schedule_num_inference_steps=schedule_num_inference_steps,
-        dmd_steps=dmd_steps,
-        timestep_indices=timestep_indices,
-        warp_denoising_step=warp_denoising_step,
-        device=device,
-    )
+    is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
+    if is_unipc:
+        scheduler.set_timesteps(int(schedule_num_inference_steps),
+                                device=device)
+        t_list_full = scheduler.timesteps.to(device=device)
+        logger.info(
+            "rollout schedule (unipc): num_steps=%s timesteps[0..3]=%s",
+            int(schedule_num_inference_steps),
+            [int(x) for x in t_list_full[:4].detach().cpu().tolist()],
+        )
+    else:
+        t_list_full = _build_rollout_timesteps(
+            scheduler=scheduler,
+            schedule_num_inference_steps=schedule_num_inference_steps,
+            dmd_steps=dmd_steps,
+            timestep_indices=timestep_indices,
+            warp_denoising_step=warp_denoising_step,
+            device=device,
+        )
 
     # Initialize the full latent sequence from pure noise (sigma_max == 1.0 for this scheduler).
     #
@@ -590,6 +604,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
         t_list = t_list_full
 
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
+            t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
             if first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
@@ -664,7 +679,23 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
             return pred_flow_cond_btchw
 
-        if update_rule == "renoise_x0":
+        if is_unipc:
+            # UniPC solver step
+            scheduler.set_timesteps(int(schedule_num_inference_steps),
+                                    device=device)
+            for step_i, t_cur in enumerate(t_list_full):
+                t_cur_f = t_cur.to(dtype=torch.float32)
+                pred_flow_btchw = _predict_flow_at_t(t_cur_f, step_index=step_i)
+                pred_flow_bcfhw = pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+                current_latents = scheduler.step(
+                    pred_flow_bcfhw,
+                    t_cur,
+                    current_latents,
+                ).prev_sample
+                if first_frame_latent_bcfhw is not None and start_index == 0:
+                    current_latents = current_latents.clone()
+                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        elif update_rule == "renoise_x0":
             # Stochastic renoise chain (Self-Forcing simulation style): predict x0 then add noise at the next anchor.
             for step_i, t_cur in enumerate(t_list):
                 noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
@@ -822,7 +853,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     *,
     transformer,
     controlnet,
-    scheduler: FlowMatchEulerDiscreteScheduler,
+    scheduler: FlowMatchEulerDiscreteScheduler | FlowUniPCMultistepScheduler,
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
@@ -858,14 +889,25 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         -1] * transformer.config.arch_config.patch_size[-2]
     frame_seq_len = (latent_h * latent_w) // patch_ratio
 
-    t_list_full = _build_rollout_timesteps(
-        scheduler=scheduler,
-        schedule_num_inference_steps=schedule_num_inference_steps,
-        dmd_steps=dmd_steps,
-        timestep_indices=timestep_indices,
-        warp_denoising_step=warp_denoising_step,
-        device=device,
-    )
+    is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
+    if is_unipc:
+        scheduler.set_timesteps(int(schedule_num_inference_steps),
+                                device=device)
+        t_list_full = scheduler.timesteps.to(device=device)
+        logger.info(
+            "rollout schedule (unipc): num_steps=%s timesteps[0..3]=%s",
+            int(schedule_num_inference_steps),
+            [int(x) for x in t_list_full[:4].detach().cpu().tolist()],
+        )
+    else:
+        t_list_full = _build_rollout_timesteps(
+            scheduler=scheduler,
+            schedule_num_inference_steps=schedule_num_inference_steps,
+            dmd_steps=dmd_steps,
+            timestep_indices=timestep_indices,
+            warp_denoising_step=warp_denoising_step,
+            device=device,
+        )
 
     latents = torch.randn(
         (1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -877,6 +919,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                                         dtype=dtype)
 
     def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
+        t_cur = t_cur.to(dtype=torch.float32)
         timestep_frame = torch.ones((1, latent_t),
                                     device=device,
                                     dtype=torch.float32) * t_cur
@@ -928,7 +971,19 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             ).permute(0, 2, 1, 3, 4)
         return pred_uncond + float(guidance_scale) * (pred_flow - pred_uncond)
 
-    if update_rule == "renoise_x0":
+    if is_unipc:
+        for step_i, t_cur in enumerate(t_list_full):
+            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+            pred_flow_bcfhw = pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+            latents = scheduler.step(
+                pred_flow_bcfhw,
+                t_cur,
+                latents,
+            ).prev_sample
+            if first_frame_latent_bcfhw is not None:
+                latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                                dtype=dtype)
+    elif update_rule == "renoise_x0":
         for step_i, t_cur in enumerate(t_list_full):
             noisy_input_bfchw = latents.permute(0, 2, 1, 3, 4).contiguous()
             pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
@@ -1061,6 +1116,13 @@ def main() -> None:
         choices=["causal", "bidirectional"],
         help=
         "Use chunk-wise causal rollout (default) or full bidirectional rollout (no cache).",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="flowmatch_euler",
+        choices=["flowmatch_euler", "unipc"],
+        help="Scheduler family for inference. Use 'unipc' to match Diff-Factory default inference.",
     )
     parser.add_argument(
         "--init_transformer_safetensors",
@@ -1205,6 +1267,13 @@ def main() -> None:
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
     dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
     timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
+    if args.scheduler == "unipc" and (dmd_steps_list is not None or timestep_indices_list is not None):
+        logger.warning(
+            "scheduler=unipc ignores dmd_steps/timestep_indices; using full %s-step schedule.",
+            int(args.schedule_num_inference_steps),
+        )
+        dmd_steps_list = None
+        timestep_indices_list = None
 
     fastvideo_args = FastVideoArgs.from_kwargs(
         model_path=args.base_model,
@@ -1252,9 +1321,12 @@ def main() -> None:
             "If you are testing phase-1 student init, you usually want to initialize BOTH transformer and controlnet "
             "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
         )
-    # Self-Forcing / DMD training uses Euler ODE (FlowMatchEulerDiscreteScheduler).
-    # Do NOT use the base model's UniPC scheduler here. Also, the `shift` MUST match training.
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=float(args.flow_shift))
+    if args.scheduler == "unipc":
+        scheduler = FlowUniPCMultistepScheduler(shift=float(args.flow_shift))
+    else:
+        # Self-Forcing / DMD training uses Euler ODE (FlowMatchEulerDiscreteScheduler).
+        # Do NOT use the base model's UniPC scheduler here. Also, the `shift` MUST match training.
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=float(args.flow_shift))
     vae = PipelineComponentLoader.load_module("vae",
                                               str(Path(args.base_model) / "vae"),
                                               "diffusers", fastvideo_args)
