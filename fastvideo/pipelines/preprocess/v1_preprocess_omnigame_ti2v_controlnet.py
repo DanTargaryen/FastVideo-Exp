@@ -240,10 +240,15 @@ def parse_args() -> argparse.Namespace:
                    type=str,
                    default="",
                    help="Output root from Diff-Factory/tools/depth_warp.py")
-    p.add_argument("--use_warp_out",
-                   action=argparse.BooleanOptionalAction,
-                   default=True,
+    p.add_argument("--use-warp-out",
+                   dest="use_warp_out",
+                   action="store_true",
                    help="Use warp_out_root for masked_rgb/mask (default: True).")
+    p.add_argument("--no-use-warp-out",
+                   dest="use_warp_out",
+                   action="store_false",
+                   help="Do NOT use warp_out_root; build masked_rgb from rgb*mask.")
+    p.set_defaults(use_warp_out=True)
     p.add_argument("--mask_root",
                    type=str,
                    default="",
