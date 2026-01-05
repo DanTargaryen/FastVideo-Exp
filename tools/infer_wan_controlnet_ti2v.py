@@ -530,8 +530,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
         device=device,
         dtype=dtype,
     )
-    if first_frame_latent_bcfhw is not None:
-        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
 
     num_frames_per_block = transformer.config.arch_config.num_frames_per_block
     if latents.shape[2] % num_frames_per_block != 0:
@@ -700,9 +698,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     t_cur,
                     current_latents,
                 ).prev_sample
-                if first_frame_latent_bcfhw is not None and start_index == 0:
-                    current_latents = current_latents.clone()
-                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         elif update_rule == "renoise_x0":
             # Stochastic renoise chain (Self-Forcing simulation style): predict x0 then add noise at the next anchor.
             for step_i, t_cur in enumerate(t_list):
@@ -739,9 +734,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 else:
                     current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
 
-                if first_frame_latent_bcfhw is not None and start_index == 0:
-                    current_latents = current_latents.clone()
-                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
 
         elif update_rule == "euler_dt":
             # Deterministic Euler stepping in sigma space (Diff-Factory-style):
@@ -769,9 +761,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
 
                 current_latents = current_latents + dt * pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
-                if first_frame_latent_bcfhw is not None and start_index == 0:
-                    current_latents = current_latents.clone()
-                    current_latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         else:
             raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
@@ -853,6 +842,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         start_index += current_num_frames
 
+    if first_frame_latent_bcfhw is not None:
+        latents = latents.clone()
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                        dtype=dtype)
     return latents
 
 
@@ -926,15 +919,17 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         device=device,
         dtype=dtype,
     )
-    if first_frame_latent_bcfhw is not None:
-        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                        dtype=dtype)
 
     def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
         t_cur = t_cur.to(dtype=torch.float32)
         timestep_frame = torch.ones((1, latent_t),
                                     device=device,
                                     dtype=torch.float32) * t_cur
+        latent_model_input = latents
+        if first_frame_latent_bcfhw is not None:
+            latent_model_input = latent_model_input.clone()
+            latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
+                device=device, dtype=dtype)
         if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
             timestep_frame = timestep_frame.clone()
             timestep_frame[:, 0] = 0
@@ -947,13 +942,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                  attn_metadata=None,
                                  forward_batch=batch):
             control_res = controlnet(
-                hidden_states=latents,
+                hidden_states=latent_model_input,
                 encoder_hidden_states=prompt_embeds_list,
                 timestep=timestep_frame,
                 controlnet_states=control_latent_bcfhw,
             )
             pred_flow = transformer(
-                latents,
+                latent_model_input,
                 prompt_embeds_list,
                 timestep_token,
                 block_controlnet_hidden_states=control_res,
@@ -970,13 +965,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                  attn_metadata=None,
                                  forward_batch=batch):
             control_res_uncond = controlnet(
-                hidden_states=latents,
+                hidden_states=latent_model_input,
                 encoder_hidden_states=negative_prompt_embeds_list,
                 timestep=timestep_frame,
                 controlnet_states=control_latent_bcfhw,
             )
             pred_uncond = transformer(
-                latents,
+                latent_model_input,
                 negative_prompt_embeds_list,
                 timestep_token,
                 block_controlnet_hidden_states=control_res_uncond,
@@ -992,9 +987,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 t_cur,
                 latents,
             ).prev_sample
-            if first_frame_latent_bcfhw is not None:
-                latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                                dtype=dtype)
     elif update_rule == "renoise_x0":
         for step_i, t_cur in enumerate(t_list_full):
             noisy_input_bfchw = latents.permute(0, 2, 1, 3, 4).contiguous()
@@ -1032,9 +1024,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 latents = denoised_pred.permute(0, 2, 1, 3,
                                                 4).contiguous()
 
-            if first_frame_latent_bcfhw is not None:
-                latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                                dtype=dtype)
     elif update_rule == "euler_dt":
         if t_list_full.numel() < 2:
             raise ValueError("euler_dt requires at least 2 timesteps.")
@@ -1053,12 +1042,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
             latents = latents + dt * pred_flow_btchw.permute(
                 0, 2, 1, 3, 4).contiguous()
-            if first_frame_latent_bcfhw is not None:
-                latents[:, :, :1] = first_frame_latent_bcfhw.to(
-                    device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
+    if first_frame_latent_bcfhw is not None:
+        latents = latents.clone()
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                        dtype=dtype)
     return latents
 
 
