@@ -188,6 +188,7 @@ def _build_rollout_timesteps(
     dmd_steps: list[int] | None,
     timestep_indices: list[int] | None,
     warp_denoising_step: bool,
+    full_schedule: bool,
     device: torch.device,
 ) -> torch.Tensor:
     def _get_train_grid_timesteps() -> torch.Tensor:
@@ -204,6 +205,8 @@ def _build_rollout_timesteps(
             )
         return ts[:num_train].to(device=device, dtype=torch.float32)
 
+    if full_schedule:
+        return scheduler.timesteps.to(device=device, dtype=torch.float32)
     if timestep_indices is None and dmd_steps is None:
         raise ValueError("Must provide either timestep_indices or dmd_steps.")
     if timestep_indices is not None and dmd_steps is not None:
@@ -457,6 +460,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     context_noise: int,
     warp_denoising_step: bool,
     update_rule: str,
+    full_schedule: bool,
     first_frame_timestep_zero: bool,
     reset_cache_each_block: bool,
     disable_cache_update: bool,
@@ -493,12 +497,14 @@ def _causal_dmd_rollout_ti2v_controlnet(
             )
 
     is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
-    if is_unipc:
+    use_step_schedule = is_unipc or bool(full_schedule)
+    if use_step_schedule:
         scheduler.set_timesteps(int(schedule_num_inference_steps),
                                 device=device)
         t_list_full = scheduler.timesteps.to(device=device)
         logger.info(
-            "rollout schedule (unipc): num_steps=%s timesteps[0..3]=%s",
+            "rollout schedule (%s): num_steps=%s timesteps[0..3]=%s",
+            "unipc" if is_unipc else "flowmatch_full",
             int(schedule_num_inference_steps),
             [int(x) for x in t_list_full[:4].detach().cpu().tolist()],
         )
@@ -509,6 +515,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             dmd_steps=dmd_steps,
             timestep_indices=timestep_indices,
             warp_denoising_step=warp_denoising_step,
+            full_schedule=False,
             device=device,
         )
 
@@ -679,10 +686,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
             return pred_flow_cond_btchw
 
-        if is_unipc:
-            # UniPC solver step
+        if use_step_schedule:
+            # Full-schedule solver step (FlowMatchEuler or UniPC)
             scheduler.set_timesteps(int(schedule_num_inference_steps),
                                     device=device)
+            t_list_full = scheduler.timesteps.to(device=device)
             for step_i, t_cur in enumerate(t_list_full):
                 t_cur_f = t_cur.to(dtype=torch.float32)
                 pred_flow_btchw = _predict_flow_at_t(t_cur_f, step_index=step_i)
@@ -868,6 +876,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     context_noise: int,
     warp_denoising_step: bool,
     update_rule: str,
+    full_schedule: bool,
     first_frame_timestep_zero: bool,
     seed: int,
     dtype: torch.dtype,
@@ -890,12 +899,14 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     frame_seq_len = (latent_h * latent_w) // patch_ratio
 
     is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
-    if is_unipc:
+    use_step_schedule = is_unipc or bool(full_schedule)
+    if use_step_schedule:
         scheduler.set_timesteps(int(schedule_num_inference_steps),
                                 device=device)
         t_list_full = scheduler.timesteps.to(device=device)
         logger.info(
-            "rollout schedule (unipc): num_steps=%s timesteps[0..3]=%s",
+            "rollout schedule (%s): num_steps=%s timesteps[0..3]=%s",
+            "unipc" if is_unipc else "flowmatch_full",
             int(schedule_num_inference_steps),
             [int(x) for x in t_list_full[:4].detach().cpu().tolist()],
         )
@@ -906,6 +917,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             dmd_steps=dmd_steps,
             timestep_indices=timestep_indices,
             warp_denoising_step=warp_denoising_step,
+            full_schedule=False,
             device=device,
         )
 
@@ -971,7 +983,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             ).permute(0, 2, 1, 3, 4)
         return pred_uncond + float(guidance_scale) * (pred_flow - pred_uncond)
 
-    if is_unipc:
+    if use_step_schedule:
         for step_i, t_cur in enumerate(t_list_full):
             pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
             pred_flow_bcfhw = pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
@@ -1122,7 +1134,7 @@ def main() -> None:
         type=str,
         default="flowmatch_euler",
         choices=["flowmatch_euler", "unipc"],
-        help="Scheduler family for inference. Use 'unipc' to match Diff-Factory default inference.",
+        help="Scheduler family for inference. Use 'flowmatch_euler' to match Diff-Factory / Self-Forcing defaults.",
     )
     parser.add_argument(
         "--init_transformer_safetensors",
@@ -1191,6 +1203,15 @@ def main() -> None:
         "How to propagate between anchors. `euler_dt` matches Diff-Factory / ODE-style Euler integration "
         "(deterministic update in sigma space). `renoise_x0` matches the Self-Forcing *training simulation* "
         "(x0 reconstruction then add_noise with fresh noise), which is usually NOT what you want for inference quality.",
+    )
+    parser.add_argument(
+        "--full_schedule",
+        action="store_true",
+        help=(
+            "Ignore timestep_indices/dmd_steps and run the full scheduler.set_timesteps("
+            "schedule_num_inference_steps) loop (Diff-Factory-style inference). "
+            "Recommended for teacher baselines or full-step checks."
+        ),
     )
     parser.add_argument(
         "--guidance_scale",
@@ -1267,6 +1288,9 @@ def main() -> None:
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
     dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
     timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
+    if bool(args.full_schedule):
+        dmd_steps_list = None
+        timestep_indices_list = None
     if args.scheduler == "unipc" and (dmd_steps_list is not None or timestep_indices_list is not None):
         logger.warning(
             "scheduler=unipc ignores dmd_steps/timestep_indices; using full %s-step schedule.",
@@ -1349,6 +1373,11 @@ def main() -> None:
                                                                 dtype=dtype)
         control_latent = sample.control_latent_bcfhw.to(device="cuda",
                                                         dtype=dtype)
+        if (first_frame_latent is not None and not bool(args.first_frame_timestep_zero)):
+            logger.warning(
+                "TI2V alignment: Diff-Factory sets first-frame timestep to 0 when first-frame conditioning is present. "
+                "Consider adding --first_frame_timestep_zero for closer matching."
+            )
 
         if args.debug_dump:
             logger.info(_tensor_stats("text_embedding", prompt_embeds))
@@ -1391,6 +1420,7 @@ def main() -> None:
                 context_noise=args.context_noise,
                 warp_denoising_step=True,
                 update_rule=args.update_rule,
+                full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
                 seed=args.seed + i,
                 dtype=dtype,
@@ -1414,6 +1444,7 @@ def main() -> None:
                 context_noise=args.context_noise,
                 warp_denoising_step=True,
                 update_rule=args.update_rule,
+                full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
                 reset_cache_each_block=bool(args.reset_cache_each_block),
                 disable_cache_update=bool(args.disable_cache_update),
