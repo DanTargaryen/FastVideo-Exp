@@ -854,6 +854,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     latent_t = int(control_latent_bcfhw.shape[2])
     latent_h = int(control_latent_bcfhw.shape[3])
     latent_w = int(control_latent_bcfhw.shape[4])
+    patch_ratio = transformer.config.arch_config.patch_size[
+        -1] * transformer.config.arch_config.patch_size[-2]
+    frame_seq_len = (latent_h * latent_w) // patch_ratio
 
     t_list_full = _build_rollout_timesteps(
         scheduler=scheduler,
@@ -874,12 +877,16 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                                         dtype=dtype)
 
     def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
-        timestep = torch.ones((1, latent_t),
-                              device=device,
-                              dtype=torch.float32) * t_cur
+        timestep_frame = torch.ones((1, latent_t),
+                                    device=device,
+                                    dtype=torch.float32) * t_cur
         if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
-            timestep = timestep.clone()
-            timestep[:, 0] = 0
+            timestep_frame = timestep_frame.clone()
+            timestep_frame[:, 0] = 0
+        timestep_token = timestep_frame.repeat_interleave(frame_seq_len, dim=1)
+        if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
+            timestep_token = timestep_token.clone()
+            timestep_token[:, :frame_seq_len] = 0
 
         with set_forward_context(current_timestep=int(step_index),
                                  attn_metadata=None,
@@ -887,13 +894,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             control_res = controlnet(
                 hidden_states=latents,
                 encoder_hidden_states=prompt_embeds_list,
-                timestep=timestep,
+                timestep=timestep_frame,
                 controlnet_states=control_latent_bcfhw,
             )
             pred_flow = transformer(
                 latents,
                 prompt_embeds_list,
-                timestep,
+                timestep_token,
                 block_controlnet_hidden_states=control_res,
             ).permute(0, 2, 1, 3, 4)
 
@@ -910,13 +917,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             control_res_uncond = controlnet(
                 hidden_states=latents,
                 encoder_hidden_states=negative_prompt_embeds_list,
-                timestep=timestep,
+                timestep=timestep_frame,
                 controlnet_states=control_latent_bcfhw,
             )
             pred_uncond = transformer(
                 latents,
                 negative_prompt_embeds_list,
-                timestep,
+                timestep_token,
                 block_controlnet_hidden_states=control_res_uncond,
             ).permute(0, 2, 1, 3, 4)
         return pred_uncond + float(guidance_scale) * (pred_flow - pred_uncond)
