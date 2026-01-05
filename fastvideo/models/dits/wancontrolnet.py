@@ -222,14 +222,23 @@ class WanControlnet3DModel(BaseDiT):
         ],
                                           dim=1)
 
+        # Match WanTransformer3DModel behavior for TI2V:
+        # If timestep is per-frame, expand to per-token (seq_len) so that
+        # timestep_proj aligns with hidden_states length.
+        frame_seq_len = post_patch_height * post_patch_width
+        if timestep_2d.shape[1] == num_frames:
+            timestep_seq = timestep_2d.repeat_interleave(frame_seq_len, dim=1)
+        else:
+            timestep_seq = timestep_2d
+
+        ts_seq_len = int(timestep_seq.shape[1]) if timestep_seq.dim() == 2 else None
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep_2d.flatten(), encoder_hidden_states,
-            encoder_hidden_states_image)
-        timestep_proj = timestep_proj.unflatten(1,
-                                                (6,
-                                                 self.hidden_size)).unflatten(
-                                                     dim=0,
-                                                     sizes=timestep_2d.shape)
+            timestep_seq.flatten(), encoder_hidden_states,
+            encoder_hidden_states_image, timestep_seq_len=ts_seq_len)
+        if ts_seq_len is not None:
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        else:
+            timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
