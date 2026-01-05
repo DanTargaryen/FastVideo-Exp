@@ -30,6 +30,8 @@ _TEXT_TO_VIDEO_DIT_MODELS = {
     "CausalWanTransformer3DModel": ("dits", "causal_wanvideo", "CausalWanTransformer3DModel"),
     # Wan ControlNet (diffusers-format) -> FastVideo-native causal controlnet
     "WanControlnet": ("dits", "causal_wancontrolnet", "CausalWanControlnet3DModel"),
+    # Bidirectional Wan ControlNet (for teacher / full-sequence inference)
+    "WanControlnet3DModel": ("dits", "wancontrolnet", "WanControlnet3DModel"),
     "CausalWanControlnet3DModel": ("dits", "causal_wancontrolnet", "CausalWanControlnet3DModel"),
     "StepVideoModel": ("dits", "stepvideo", "StepVideoModel"),
     "CosmosTransformer3DModel": ("dits", "cosmos", "CosmosTransformer3DModel"),

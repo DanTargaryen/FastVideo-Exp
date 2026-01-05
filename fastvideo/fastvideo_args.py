@@ -171,6 +171,7 @@ class FastVideoArgs:
         "vae": True,
     })
     override_transformer_cls_name: str | None = None
+    override_controlnet_cls_name: str | None = None
     init_weights_from_safetensors: str = ""  # path to safetensors file for initial weight loading
     init_weights_from_safetensors_2: str = ""  # path to safetensors file for initial weight loading for transformer_2
     init_controlnet_weights_from_safetensors: str = ""  # path to safetensors file for initial ControlNet weight loading
@@ -482,6 +483,12 @@ class FastVideoArgs:
             type=str,
             default=FastVideoArgs.override_transformer_cls_name,
             help="Override transformer cls name",
+        )
+        parser.add_argument(
+            "--override-controlnet-cls-name",
+            type=str,
+            default=FastVideoArgs.override_controlnet_cls_name,
+            help="Override ControlNet cls name",
         )
         parser.add_argument(
             "--override-pipeline-cls-name",

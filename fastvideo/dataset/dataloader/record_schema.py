@@ -168,6 +168,56 @@ def ode_text_only_record_creator(
     return record
 
 
+def ode_ti2v_controlnet_record_creator(
+        video_name: str,
+        text_embedding: np.ndarray,
+        caption: str,
+        *,
+        first_frame_latent: np.ndarray,
+        control_latent: np.ndarray,
+        trajectory_latents: np.ndarray,
+        trajectory_timesteps: np.ndarray,
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: float) -> dict[str, Any]:
+    """Create an ODE trajectory record for TI2V + ControlNet."""
+    assert trajectory_latents is not None, "trajectory_latents is required"
+    assert trajectory_timesteps is not None, "trajectory_timesteps is required"
+
+    duration_val = 0.0
+    if fps and fps > 0:
+        duration_val = float(num_frames) / float(fps)
+
+    record = {
+        "id": video_name,
+        "text_embedding_bytes": text_embedding.tobytes(),
+        "text_embedding_shape": list(text_embedding.shape),
+        "text_embedding_dtype": str(text_embedding.dtype),
+        "first_frame_latent_bytes": first_frame_latent.tobytes(),
+        "first_frame_latent_shape": list(first_frame_latent.shape),
+        "first_frame_latent_dtype": str(first_frame_latent.dtype),
+        "control_latent_bytes": control_latent.tobytes(),
+        "control_latent_shape": list(control_latent.shape),
+        "control_latent_dtype": str(control_latent.dtype),
+        "trajectory_latents_bytes": trajectory_latents.tobytes(),
+        "trajectory_latents_shape": list(trajectory_latents.shape),
+        "trajectory_latents_dtype": str(trajectory_latents.dtype),
+        "trajectory_timesteps_bytes": trajectory_timesteps.tobytes(),
+        "trajectory_timesteps_shape": list(trajectory_timesteps.shape),
+        "trajectory_timesteps_dtype": str(trajectory_timesteps.dtype),
+        "file_name": video_name,
+        "caption": caption,
+        "media_type": "video",
+        "width": int(width),
+        "height": int(height),
+        "num_frames": int(num_frames),
+        "duration_sec": duration_val,
+        "fps": float(fps),
+    }
+    return record
+
+
 def text_only_record_creator(text_name: str, text_embedding: np.ndarray,
                              caption: str) -> dict[str, Any]:
     """Create a text-only record matching pyarrow_schema_text_only.

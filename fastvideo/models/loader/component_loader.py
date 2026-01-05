@@ -524,6 +524,9 @@ class ControlNetLoader(ComponentLoader):
                 "Only diffusers format is supported.")
 
         logger.info("controlnet cls_name: %s", cls_name)
+        if fastvideo_args.override_controlnet_cls_name is not None:
+            cls_name = fastvideo_args.override_controlnet_cls_name
+            logger.info("Overriding controlnet cls_name to %s", cls_name)
         fastvideo_args.model_paths["controlnet"] = model_path
 
         # Important: do NOT mutate pipeline_config.dit_config in-place (ControlNet arch differs).

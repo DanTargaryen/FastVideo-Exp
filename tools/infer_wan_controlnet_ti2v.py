@@ -178,6 +178,96 @@ def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _build_rollout_timesteps(
+    *,
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    schedule_num_inference_steps: int,
+    dmd_steps: list[int] | None,
+    timestep_indices: list[int] | None,
+    warp_denoising_step: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    def _get_train_grid_timesteps() -> torch.Tensor:
+        ts = getattr(scheduler, "timesteps", None)
+        num_train = int(
+            getattr(getattr(scheduler, "config", None), "num_train_timesteps",
+                    1000))
+        if ts is None:
+            raise ValueError("scheduler.timesteps is None")
+        if int(ts.numel()) < num_train:
+            raise ValueError(
+                f"scheduler.timesteps too short: {int(ts.numel())} < num_train_timesteps={num_train}. "
+                "Do not call scheduler.set_timesteps() for this scheduler in inference."
+            )
+        return ts[:num_train].to(device=device, dtype=torch.float32)
+
+    if timestep_indices is None and dmd_steps is None:
+        raise ValueError("Must provide either timestep_indices or dmd_steps.")
+    if timestep_indices is not None and dmd_steps is not None:
+        raise ValueError("Pass only one of dmd_steps or timestep_indices.")
+
+    train_grid_ts = _get_train_grid_timesteps()
+    num_train = int(train_grid_ts.numel())
+    logger.info(
+        "train_grid: num=%s timesteps[min,max]=[%s,%s]",
+        num_train,
+        float(train_grid_ts[-1].detach().cpu().item()),
+        float(train_grid_ts[0].detach().cpu().item()),
+    )
+
+    if timestep_indices is not None:
+        if int(schedule_num_inference_steps) <= 0:
+            raise ValueError(
+                "--schedule_num_inference_steps must be > 0 when using --timestep_indices"
+            )
+        k = max(1, int(schedule_num_inference_steps))
+        teacher_idx = torch.linspace(0,
+                                     num_train - 1,
+                                     steps=k,
+                                     device=device).round().long()
+        full_ts = train_grid_ts.index_select(0, teacher_idx)
+        idx_list = list(timestep_indices)
+        if len(idx_list) > 0:
+            last_idx = int(schedule_num_inference_steps) - 1
+            if last_idx >= 0 and idx_list[-1] != last_idx:
+                idx_list = idx_list + [last_idx]
+        idx_t = torch.tensor(idx_list, device=device, dtype=torch.long)
+        if torch.any(idx_t < 0) or torch.any(idx_t >= full_ts.numel()):
+            raise ValueError(
+                f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {idx_list}"
+            )
+        t_list_full = full_ts.index_select(0, idx_t).to(device=device,
+                                                        dtype=torch.float32)
+        logger.info(
+            "rollout schedule: timestep_indices=%s (effective_indices=%s, schedule_num_inference_steps=%s) -> timesteps=%s",
+            list(timestep_indices),
+            idx_list,
+            int(schedule_num_inference_steps),
+            [float(x) for x in t_list_full.detach().cpu().tolist()],
+        )
+        return t_list_full
+
+    dmd_steps_t = torch.tensor(dmd_steps, dtype=torch.long, device=device)
+    if warp_denoising_step:
+        schedule_ts = train_grid_ts
+        schedule_ts = torch.cat(
+            (schedule_ts,
+             torch.tensor([0.0], device=device, dtype=schedule_ts.dtype)),
+            dim=0,
+        )
+        idx = (num_train - dmd_steps_t).clamp_(0, schedule_ts.numel() - 1)
+        t_list_full = schedule_ts.index_select(0, idx)
+    else:
+        t_list_full = dmd_steps_t.to(dtype=torch.float32)
+    logger.info(
+        "rollout schedule: dmd_steps=%s warp=%s -> timesteps=%s",
+        list(dmd_steps),
+        bool(warp_denoising_step),
+        [float(x) for x in t_list_full.detach().cpu().tolist()],
+    )
+    return t_list_full
+
+
 @dataclass(frozen=True)
 class Sample:
     sample_id: str
@@ -379,28 +469,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
 
-    def _get_train_grid_timesteps() -> torch.Tensor:
-        """
-        FastVideo training uses `FlowMatchEulerDiscreteScheduler(shift=...)` on the *full* training grid
-        (1000 points) without calling `set_timesteps()`.
-
-        IMPORTANT: calling `set_timesteps()` on this scheduler applies `shift` again, which makes the final
-        (low-noise) timestep much larger (~60 instead of ~8 when shift=8). That mismatch typically produces
-        "all-noise" videos (frame 0 looks OK because it's clamped from the dataset).
-        """
-        ts = getattr(scheduler, "timesteps", None)
-        num_train = int(
-            getattr(getattr(scheduler, "config", None), "num_train_timesteps",
-                    1000))
-        if ts is None:
-            raise ValueError("scheduler.timesteps is None")
-        if int(ts.numel()) < num_train:
-            raise ValueError(
-                f"scheduler.timesteps too short: {int(ts.numel())} < num_train_timesteps={num_train}. "
-                "Do not call scheduler.set_timesteps() for this scheduler in inference."
-            )
-        return ts[:num_train].to(device=device, dtype=torch.float32)
-
     # Build a minimal ForwardBatch for forward_context bookkeeping.
     batch = ForwardBatch(data_type="ti2v_controlnet")
     batch.prompt_embeds = prompt_embeds_list
@@ -421,99 +489,28 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
             )
 
-    # Scheduler grid choice:
-    # - If `timestep_indices` is provided: we run on a K-step inference grid (e.g. 50) and select those indices.
-    # - If `dmd_steps` is provided: interpret as 0..1000 coordinates and (optionally) warp to the scheduler's
-    #   1000-step grid (Self-Forcing style).
-    if timestep_indices is not None and dmd_steps is not None:
-        raise ValueError("Pass only one of dmd_steps or timestep_indices (not both).")
-
-    if timestep_indices is None and dmd_steps is None:
-        raise ValueError("Must provide either timestep_indices or dmd_steps.")
-
-    train_grid_ts = _get_train_grid_timesteps()
-    num_train = int(train_grid_ts.numel())
-    logger.info(
-        "train_grid: num=%s timesteps[min,max]=[%s,%s]",
-        num_train,
-        float(train_grid_ts[-1].detach().cpu().item()),
-        float(train_grid_ts[0].detach().cpu().item()),
+    t_list_full = _build_rollout_timesteps(
+        scheduler=scheduler,
+        schedule_num_inference_steps=schedule_num_inference_steps,
+        dmd_steps=dmd_steps,
+        timestep_indices=timestep_indices,
+        warp_denoising_step=warp_denoising_step,
+        device=device,
     )
 
-    if timestep_indices is not None:
-        if int(schedule_num_inference_steps) <= 0:
-            raise ValueError("--schedule_num_inference_steps must be > 0 when using --timestep_indices")
-        # Build the K-step "teacher" grid by subsampling the 1000-step training grid.
-        k = max(1, int(schedule_num_inference_steps))
-        teacher_idx = torch.linspace(0,
-                                     num_train - 1,
-                                     steps=k,
-                                     device=device).round().long()
-        full_ts = train_grid_ts.index_select(0, teacher_idx)
-        idx_list = list(timestep_indices)
-        if update_rule == "euler_dt":
-            # For deterministic Euler stepping, we need a "next" timestep after the last anchor.
-            # In Diff-Factory phase-1 setups this is often the last schedule index (e.g. 49 for a 50-step grid),
-            # even if it is not considered an "anchor" for training (it only serves as nxt[i]).
-            last_idx = int(schedule_num_inference_steps) - 1
-            if last_idx >= 0 and (len(idx_list) == 0 or idx_list[-1] != last_idx):
-                idx_list = idx_list + [last_idx]
-
-        idx_t = torch.tensor(idx_list, device=device, dtype=torch.long)
-        if torch.any(idx_t < 0) or torch.any(idx_t >= full_ts.numel()):
-            raise ValueError(
-                f"timestep_indices out of range for schedule_num_inference_steps={schedule_num_inference_steps}: {idx_list}"
-            )
-        t_list_full = full_ts.index_select(0, idx_t).to(device=device,
-                                                        dtype=torch.float32)
-        logger.info(
-            "rollout schedule: timestep_indices=%s (effective_indices=%s, schedule_num_inference_steps=%s) -> timesteps=%s",
-            list(timestep_indices),
-            idx_list,
-            int(schedule_num_inference_steps),
-            [float(x) for x in t_list_full.detach().cpu().tolist()],
-        )
-    else:
-        # DMD denoising steps (Self-Forcing style).
-        #
-        # IMPORTANT: FastVideo training treats `dmd_denoising_steps` as *indices* in the 0..1000 grid
-        # (largest = highest noise), then optionally "warps" them to the scheduler's actual
-        # timesteps via:
-        #   timesteps = cat([scheduler.timesteps, 0])
-        #   denoise_ts = timesteps[1000 - dmd_steps]
-        #
-        # See: `fastvideo/training/distillation_pipeline.py` where `Warping denoising_step_list` is logged.
-        #
-        # For inference, mirror that behavior so the solver matches training.
-        dmd_steps_t = torch.tensor(dmd_steps, dtype=torch.long, device=device)
-        if warp_denoising_step:
-            # Mirror training exactly:
-            #   timesteps = cat([noise_scheduler.timesteps, 0])
-            #   denoise_ts = timesteps[1000 - dmd_steps]
-            schedule_ts = train_grid_ts
-            # Training uses an extra terminal "0" entry.
-            schedule_ts = torch.cat(
-                (schedule_ts,
-                 torch.tensor([0.0], device=device, dtype=schedule_ts.dtype)),
-                dim=0,
-            )
-            # Clamp to avoid OOB if scheduler grid differs slightly.
-            idx = (num_train - dmd_steps_t).clamp_(0, schedule_ts.numel() - 1)
-            t_list_full = schedule_ts.index_select(0, idx)
-        else:
-            # Treat provided steps as raw timestep values.
-            t_list_full = dmd_steps_t.to(dtype=torch.float32)
-        logger.info(
-            "rollout schedule: dmd_steps=%s warp=%s -> timesteps=%s",
-            list(dmd_steps),
-            bool(warp_denoising_step),
-            [float(x) for x in t_list_full.detach().cpu().tolist()],
-        )
-
-    # Allocate output latents buffer; each chunk will be generated independently then written back.
-    latents = torch.zeros((1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
-                          device=device,
-                          dtype=dtype)
+    # Initialize the full latent sequence from pure noise (sigma_max == 1.0 for this scheduler).
+    #
+    # IMPORTANT (training alignment):
+    # Self-Forcing / causal DMD rollouts start from ONE global noise sample for the whole sequence,
+    # then process temporal blocks by slicing this tensor. Do NOT resample per block; that changes the
+    # underlying noise "z" between blocks and often collapses to noise.
+    latents = torch.randn(
+        (1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
+        device=device,
+        dtype=dtype,
+    )
+    if first_frame_latent_bcfhw is not None:
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
 
     num_frames_per_block = transformer.config.arch_config.num_frames_per_block
     if latents.shape[2] % num_frames_per_block != 0:
@@ -582,13 +579,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
             _reset_kv_and_crossattn_caches(kv_cache=control_kv_cache_uncond, crossattn_cache=control_crossattn_cache_uncond)
 
         current_num_frames = num_frames_per_block
-        # Each chunk starts from fresh noise, then is denoised with the same DMD anchor schedule.
-        current_latents = torch.randn(
-            (1, transformer.num_channels_latents, current_num_frames, latent_h,
-             latent_w),
-            device=device,
-            dtype=dtype,
-        )
+        # Slice the global noise tensor for this block (do NOT resample).
+        current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
 
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
@@ -744,7 +736,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
         else:
             raise ValueError(f"Unsupported update_rule: {update_rule!r}")
 
-        # Write back x0 chunk
+        # Write back the updated chunk.
         latents[:, :, start_index:start_index + current_num_frames] = current_latents
 
         if not disable_cache_update:
@@ -825,6 +817,177 @@ def _causal_dmd_rollout_ti2v_controlnet(
     return latents
 
 
+@torch.no_grad()
+def _bidirectional_dmd_rollout_ti2v_controlnet(
+    *,
+    transformer,
+    controlnet,
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    prompt_embeds_list: list[torch.Tensor],
+    negative_prompt_embeds_list: list[torch.Tensor] | None,
+    guidance_scale: float,
+    first_frame_latent_bcfhw: torch.Tensor | None,
+    control_latent_bcfhw: torch.Tensor,
+    height: int,
+    width: int,
+    num_frames: int,
+    schedule_num_inference_steps: int,
+    dmd_steps: list[int] | None,
+    timestep_indices: list[int] | None,
+    context_noise: int,
+    warp_denoising_step: bool,
+    update_rule: str,
+    first_frame_timestep_zero: bool,
+    seed: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+    batch = ForwardBatch(data_type="ti2v_controlnet")
+    batch.prompt_embeds = prompt_embeds_list
+    batch.height = height
+    batch.width = width
+    batch.num_frames = num_frames
+
+    latent_t = int(control_latent_bcfhw.shape[2])
+    latent_h = int(control_latent_bcfhw.shape[3])
+    latent_w = int(control_latent_bcfhw.shape[4])
+
+    t_list_full = _build_rollout_timesteps(
+        scheduler=scheduler,
+        schedule_num_inference_steps=schedule_num_inference_steps,
+        dmd_steps=dmd_steps,
+        timestep_indices=timestep_indices,
+        warp_denoising_step=warp_denoising_step,
+        device=device,
+    )
+
+    latents = torch.randn(
+        (1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
+        device=device,
+        dtype=dtype,
+    )
+    if first_frame_latent_bcfhw is not None:
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                        dtype=dtype)
+
+    def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
+        timestep = torch.ones((1, latent_t),
+                              device=device,
+                              dtype=torch.float32) * t_cur
+        if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
+            timestep = timestep.clone()
+            timestep[:, 0] = 0
+
+        with set_forward_context(current_timestep=int(step_index),
+                                 attn_metadata=None,
+                                 forward_batch=batch):
+            control_res = controlnet(
+                hidden_states=latents,
+                encoder_hidden_states=prompt_embeds_list,
+                timestep=timestep,
+                controlnet_states=control_latent_bcfhw,
+            )
+            pred_flow = transformer(
+                latents,
+                prompt_embeds_list,
+                timestep,
+                block_controlnet_hidden_states=control_res,
+            ).permute(0, 2, 1, 3, 4)
+
+        if float(guidance_scale) == 1.0:
+            return pred_flow
+
+        if negative_prompt_embeds_list is None:
+            raise ValueError(
+                "guidance_scale != 1.0 requires negative_prompt_embeds_list."
+            )
+        with set_forward_context(current_timestep=int(step_index),
+                                 attn_metadata=None,
+                                 forward_batch=batch):
+            control_res_uncond = controlnet(
+                hidden_states=latents,
+                encoder_hidden_states=negative_prompt_embeds_list,
+                timestep=timestep,
+                controlnet_states=control_latent_bcfhw,
+            )
+            pred_uncond = transformer(
+                latents,
+                negative_prompt_embeds_list,
+                timestep,
+                block_controlnet_hidden_states=control_res_uncond,
+            ).permute(0, 2, 1, 3, 4)
+        return pred_uncond + float(guidance_scale) * (pred_flow - pred_uncond)
+
+    if update_rule == "renoise_x0":
+        for step_i, t_cur in enumerate(t_list_full):
+            noisy_input_bfchw = latents.permute(0, 2, 1, 3, 4).contiguous()
+            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+
+            timestep = torch.ones((1, latent_t),
+                                  device=device,
+                                  dtype=torch.float32) * t_cur
+            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
+                timestep = timestep.clone()
+                timestep[:, 0] = 0
+
+            denoised_pred = pred_noise_to_pred_video(
+                pred_noise=pred_flow_btchw.flatten(0, 1),
+                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
+                timestep=timestep,
+                scheduler=scheduler,
+            ).unflatten(0, pred_flow_btchw.shape[:2])
+
+            if step_i < len(t_list_full) - 1:
+                next_timestep = t_list_full[step_i + 1]
+                noise = torch.randn_like(denoised_pred.flatten(0, 1))
+                noisy_input_bfchw = scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    noise,
+                    next_timestep * torch.ones(
+                        (1 * latent_t),
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                ).unflatten(0, denoised_pred.shape[:2])
+                latents = noisy_input_bfchw.permute(0, 2, 1, 3,
+                                                    4).contiguous()
+            else:
+                latents = denoised_pred.permute(0, 2, 1, 3,
+                                                4).contiguous()
+
+            if first_frame_latent_bcfhw is not None:
+                latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                                dtype=dtype)
+    elif update_rule == "euler_dt":
+        if t_list_full.numel() < 2:
+            raise ValueError("euler_dt requires at least 2 timesteps.")
+        timesteps_1d = scheduler.timesteps.to(device=device,
+                                              dtype=torch.float32)
+        sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
+        for step_i in range(int(t_list_full.numel()) - 1):
+            t_cur = t_list_full[step_i]
+            t_next = t_list_full[step_i + 1]
+            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+
+            idx_cur = torch.argmin((timesteps_1d - t_cur.float()).abs())
+            idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
+            sigma_cur = sigmas_1d[idx_cur]
+            sigma_next = sigmas_1d[idx_next]
+            dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
+            latents = latents + dt * pred_flow_btchw.permute(
+                0, 2, 1, 3, 4).contiguous()
+            if first_frame_latent_bcfhw is not None:
+                latents[:, :, :1] = first_frame_latent_bcfhw.to(
+                    device=device, dtype=dtype)
+    else:
+        raise ValueError(f"Unsupported update_rule: {update_rule!r}")
+
+    return latents
+
+
 def _save_mp4(frames_bcthw: torch.Tensor, out_path: str, fps: int) -> None:
     import imageio
 
@@ -883,6 +1046,14 @@ def main() -> None:
         help=
         "Diffusers-format folder used for ControlNet config (contains config.json + *.safetensors). "
         "Can be either (a) consolidated inference export dir, or (b) teacher ControlNet dir.",
+    )
+    parser.add_argument(
+        "--attention_mode",
+        type=str,
+        default="causal",
+        choices=["causal", "bidirectional"],
+        help=
+        "Use chunk-wise causal rollout (default) or full bidirectional rollout (no cache).",
     )
     parser.add_argument(
         "--init_transformer_safetensors",
@@ -1045,9 +1216,14 @@ def main() -> None:
         vae_cpu_offload=False,
         pin_cpu_memory=True,
     )
-    # Ensure student rollout uses the chunk-wise causal transformer (KV cache),
-    # even if the exported config.json says "WanTransformer3DModel".
-    fastvideo_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
+    if args.attention_mode == "bidirectional":
+        fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
+        fastvideo_args.override_controlnet_cls_name = "WanControlnet3DModel"
+    else:
+        # Ensure student rollout uses the chunk-wise causal transformer (KV cache),
+        # even if the exported config.json says "WanTransformer3DModel".
+        fastvideo_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
+        fastvideo_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     fastvideo_args.pipeline_config.warp_denoising_step = True
@@ -1108,7 +1284,8 @@ def main() -> None:
             )
 
         logger.info(
-            "sampling: update_rule=%s guidance_scale=%s context_noise=%s reset_cache_each_block=%s disable_cache_update=%s",
+            "sampling: attention_mode=%s update_rule=%s guidance_scale=%s context_noise=%s reset_cache_each_block=%s disable_cache_update=%s",
+            str(args.attention_mode),
             str(args.update_rule),
             float(args.guidance_scale),
             int(args.context_noise),
@@ -1116,30 +1293,54 @@ def main() -> None:
             bool(args.disable_cache_update),
         )
 
-        latents = _causal_dmd_rollout_ti2v_controlnet(
-            transformer=transformer,
-            controlnet=controlnet,
-            scheduler=scheduler,
-            prompt_embeds_list=[prompt_embeds],
-            negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
-            guidance_scale=float(args.guidance_scale),
-            first_frame_latent_bcfhw=first_frame_latent,
-            control_latent_bcfhw=control_latent,
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            schedule_num_inference_steps=int(args.schedule_num_inference_steps),
-            dmd_steps=dmd_steps_list,
-            timestep_indices=timestep_indices_list,
-            context_noise=args.context_noise,
-            warp_denoising_step=True,
-            update_rule=args.update_rule,
-            first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
-            reset_cache_each_block=bool(args.reset_cache_each_block),
-            disable_cache_update=bool(args.disable_cache_update),
-            seed=args.seed + i,
-            dtype=dtype,
-        )
+        if args.attention_mode == "bidirectional":
+            latents = _bidirectional_dmd_rollout_ti2v_controlnet(
+                transformer=transformer,
+                controlnet=controlnet,
+                scheduler=scheduler,
+                prompt_embeds_list=[prompt_embeds],
+                negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
+                guidance_scale=float(args.guidance_scale),
+                first_frame_latent_bcfhw=first_frame_latent,
+                control_latent_bcfhw=control_latent,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                schedule_num_inference_steps=int(args.schedule_num_inference_steps),
+                dmd_steps=dmd_steps_list,
+                timestep_indices=timestep_indices_list,
+                context_noise=args.context_noise,
+                warp_denoising_step=True,
+                update_rule=args.update_rule,
+                first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+                seed=args.seed + i,
+                dtype=dtype,
+            )
+        else:
+            latents = _causal_dmd_rollout_ti2v_controlnet(
+                transformer=transformer,
+                controlnet=controlnet,
+                scheduler=scheduler,
+                prompt_embeds_list=[prompt_embeds],
+                negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
+                guidance_scale=float(args.guidance_scale),
+                first_frame_latent_bcfhw=first_frame_latent,
+                control_latent_bcfhw=control_latent,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                schedule_num_inference_steps=int(args.schedule_num_inference_steps),
+                dmd_steps=dmd_steps_list,
+                timestep_indices=timestep_indices_list,
+                context_noise=args.context_noise,
+                warp_denoising_step=True,
+                update_rule=args.update_rule,
+                first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+                reset_cache_each_block=bool(args.reset_cache_each_block),
+                disable_cache_update=bool(args.disable_cache_update),
+                seed=args.seed + i,
+                dtype=dtype,
+            )
 
         if args.debug_dump:
             logger.info(_tensor_stats("generated_latents", latents))
