@@ -7,9 +7,11 @@ Preprocess OmniWorld-Game (pickle manifest) into FastVideo parquet for:
 Inputs:
   - `--in_pickle`: a list[dict] manifest (same structure as Diff-Factory phase1 recorder)
       keys used: scene_name, frame_indices, caption_path, video_path, control_path
-  - `--warp_out_root`: output from Diff-Factory `tools/depth_warp.py`
-      warp_out/<scene_name>/warped_masked_rgb/{frame:06d}.png
-      warp_out/<scene_name>/warped_mask/{frame:06d}.png
+  - `--warp_out_root` (default) or `--no-use-warp-out` + `--mask_root`:
+      - warp_out/<scene_name>/warped_masked_rgb/{frame:06d}.png
+      - warp_out/<scene_name>/warped_mask/{frame:06d}.png
+    If you disable warp_out, the script will read masks from the pickle's
+    `mask_path` (if present) or `--mask_root`, and build masked_rgb = rgb * mask.
 
 Output:
   - Parquet dataset directory compatible with `pyarrow_schema_ti2v_controlnet`.
@@ -236,8 +238,16 @@ def parse_args() -> argparse.Namespace:
                    help="Input pickle manifest (list[dict])")
     p.add_argument("--warp_out_root",
                    type=str,
-                   required=True,
+                   default="",
                    help="Output root from Diff-Factory/tools/depth_warp.py")
+    p.add_argument("--use_warp_out",
+                   action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Use warp_out_root for masked_rgb/mask (default: True).")
+    p.add_argument("--mask_root",
+                   type=str,
+                   default="",
+                   help="Mask root dir when not using warp_out (fallback if pickle has no mask_path).")
     p.add_argument("--output_dir",
                    type=str,
                    required=True,
@@ -320,7 +330,9 @@ def main(args: argparse.Namespace) -> None:
 
     start = int(args.start)
     end = len(samples) if int(args.end) < 0 else min(int(args.end), len(samples))
-    warp_root = Path(_maybe_expand(args.warp_out_root))
+    if args.use_warp_out and not args.warp_out_root:
+        raise ValueError("--warp_out_root is required when --use_warp_out is True")
+    warp_root = Path(_maybe_expand(args.warp_out_root)) if args.warp_out_root else None
 
     # Multi-GPU preprocessing: each rank writes to its own subdir to avoid file name collisions.
     out_dir_rank = os.path.join(args.output_dir, f"rank_{rank:02d}")
@@ -385,21 +397,48 @@ def main(args: argparse.Namespace) -> None:
                                                     args.max_height,
                                                     args.max_width)  # T,3,H,W
 
-        masked_rgb_tchw = torch.stack([
-            _load_rgb_frame(
-                str(warp_root / scene_name / "warped_masked_rgb" /
-                    f"{int(i):06d}.png"), args.max_height, args.max_width)
-            for i in frame_indices
-        ],
-                                       dim=0)
+        if args.use_warp_out:
+            assert warp_root is not None
+            masked_rgb_tchw = torch.stack([
+                _load_rgb_frame(
+                    str(warp_root / scene_name / "warped_masked_rgb" /
+                        f"{int(i):06d}.png"), args.max_height, args.max_width)
+                for i in frame_indices
+            ],
+                                           dim=0)
 
-        mask_tchw = torch.stack([
-            _load_mask_frame(
-                str(warp_root / scene_name / "warped_mask" /
-                    f"{int(i):06d}.png"), args.max_height, args.max_width)
-            for i in frame_indices
-        ],
-                              dim=0)
+            mask_tchw = torch.stack([
+                _load_mask_frame(
+                    str(warp_root / scene_name / "warped_mask" /
+                        f"{int(i):06d}.png"), args.max_height, args.max_width)
+                for i in frame_indices
+            ],
+                                  dim=0)
+        else:
+            mask_dir = s.get("mask_path", "")
+            if not mask_dir:
+                if not args.mask_root:
+                    raise ValueError(
+                        "mask_path missing in pickle; pass --mask_root when --no-use-warp-out")
+                mask_dir = args.mask_root
+            mask_dir = _maybe_expand(str(mask_dir))
+            if os.path.isdir(mask_dir) and not os.path.exists(
+                    os.path.join(mask_dir, f"{int(frame_indices[0]):06d}.png")):
+                mask_dir = os.path.join(mask_dir, scene_name)
+
+            rgb_tchw = torch.stack([
+                _load_rgb_frame(os.path.join(video_dir, f"{int(i):06d}.png"),
+                                args.max_height, args.max_width)
+                for i in frame_indices
+            ],
+                                   dim=0)
+            mask_tchw = torch.stack([
+                _load_mask_frame(os.path.join(mask_dir, f"{int(i):06d}.png"),
+                                 args.max_height, args.max_width)
+                for i in frame_indices
+            ],
+                                  dim=0)
+            masked_rgb_tchw = rgb_tchw * mask_tchw
 
         # Encode 3 sequences in a single batched call: (3,3,T,H,W)
         video_3 = torch.cat([
