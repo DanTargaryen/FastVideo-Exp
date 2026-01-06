@@ -871,6 +871,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     update_rule: str,
     full_schedule: bool,
     first_frame_timestep_zero: bool,
+    expand_timesteps: bool,
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -887,32 +888,14 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     latent_t = int(control_latent_bcfhw.shape[2])
     latent_h = int(control_latent_bcfhw.shape[3])
     latent_w = int(control_latent_bcfhw.shape[4])
-    patch_ratio = transformer.config.arch_config.patch_size[
-        -1] * transformer.config.arch_config.patch_size[-2]
-    frame_seq_len = (latent_h * latent_w) // patch_ratio
 
-    is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
-    use_step_schedule = is_unipc or bool(full_schedule)
-    if use_step_schedule:
-        scheduler.set_timesteps(int(schedule_num_inference_steps),
-                                device=device)
-        t_list_full = scheduler.timesteps.to(device=device)
-        logger.info(
-            "rollout schedule (%s): num_steps=%s timesteps[0..3]=%s",
-            "unipc" if is_unipc else "flowmatch_full",
-            int(schedule_num_inference_steps),
-            [int(x) for x in t_list_full[:4].detach().cpu().tolist()],
-        )
-    else:
-        t_list_full = _build_rollout_timesteps(
-            scheduler=scheduler,
-            schedule_num_inference_steps=schedule_num_inference_steps,
-            dmd_steps=dmd_steps,
-            timestep_indices=timestep_indices,
-            warp_denoising_step=warp_denoising_step,
-            full_schedule=False,
-            device=device,
-        )
+    scheduler.set_timesteps(int(schedule_num_inference_steps), device=device)
+    timesteps = scheduler.timesteps.to(device=device)
+    logger.info(
+        "bidir rollout (diff-factory): num_steps=%s timesteps[0..3]=%s",
+        int(schedule_num_inference_steps),
+        [int(x) for x in timesteps[:4].detach().cpu().tolist()],
+    )
 
     latents = torch.randn(
         (1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
@@ -920,135 +903,84 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         dtype=dtype,
     )
 
-    def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
-        t_cur = t_cur.to(dtype=torch.float32)
-        timestep_frame = torch.ones((1, latent_t),
-                                    device=device,
-                                    dtype=torch.float32) * t_cur
-        latent_model_input = latents
-        if first_frame_latent_bcfhw is not None:
-            latent_model_input = latent_model_input.clone()
-            latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(
-                device=device, dtype=dtype)
-        if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
-            timestep_frame = timestep_frame.clone()
-            timestep_frame[:, 0] = 0
-        timestep_token = timestep_frame.repeat_interleave(frame_seq_len, dim=1)
-        if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
-            timestep_token = timestep_token.clone()
-            timestep_token[:, :frame_seq_len] = 0
+    image_latents = None
+    first_frame_mask = torch.ones(
+        (1, 1, latent_t, latent_h, latent_w),
+        device=device,
+        dtype=torch.float32,
+    )
+    if first_frame_latent_bcfhw is not None:
+        image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        first_frame_mask[:, :, 0] = 0
 
-        with set_forward_context(current_timestep=int(step_index),
+    patch_size = getattr(getattr(transformer.config, "arch_config", None),
+                         "patch_size", (2, 2))
+    patch_h = int(patch_size[-2])
+    patch_w = int(patch_size[-1])
+
+    def _build_latent_model_input() -> torch.Tensor:
+        if expand_timesteps:
+            if image_latents is None:
+                return latents
+            return (1 - first_frame_mask) * image_latents + first_frame_mask * latents
+        if image_latents is None:
+            return latents
+        return torch.cat([latents, image_latents], dim=1)
+
+    def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
+        if not expand_timesteps:
+            return t_cur.expand(latents.shape[0])
+        temp_ts = (first_frame_mask[0, 0] * t_cur)
+        temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
+        return temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+
+    for step_i, t_cur in enumerate(timesteps):
+        if float(guidance_scale) != 1.0 and negative_prompt_embeds_list is None:
+            raise ValueError(
+                "guidance_scale != 1.0 requires negative_prompt_embeds_list."
+            )
+
+        latent_model_input = _build_latent_model_input().to(
+            device=device, dtype=dtype)
+        timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
+
+        with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
                                  forward_batch=batch):
             control_res = controlnet(
                 hidden_states=latent_model_input,
                 encoder_hidden_states=prompt_embeds_list,
-                timestep=timestep_frame,
+                timestep=timestep,
                 controlnet_states=control_latent_bcfhw,
             )
-            pred_flow = transformer(
+            if isinstance(control_res, (list, tuple)):
+                control_res = [x.to(dtype=latents.dtype) for x in control_res]
+
+            noise_pred = transformer(
                 latent_model_input,
                 prompt_embeds_list,
-                timestep_token,
+                timestep,
                 block_controlnet_hidden_states=control_res,
             ).permute(0, 2, 1, 3, 4)
 
-        if float(guidance_scale) == 1.0:
-            return pred_flow
+            if float(guidance_scale) != 1.0:
+                noise_uncond = transformer(
+                    latent_model_input,
+                    negative_prompt_embeds_list,
+                    timestep,
+                    block_controlnet_hidden_states=control_res,
+                ).permute(0, 2, 1, 3, 4)
+                noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
-        if negative_prompt_embeds_list is None:
-            raise ValueError(
-                "guidance_scale != 1.0 requires negative_prompt_embeds_list."
-            )
-        with set_forward_context(current_timestep=int(step_index),
-                                 attn_metadata=None,
-                                 forward_batch=batch):
-            control_res_uncond = controlnet(
-                hidden_states=latent_model_input,
-                encoder_hidden_states=negative_prompt_embeds_list,
-                timestep=timestep_frame,
-                controlnet_states=control_latent_bcfhw,
-            )
-            pred_uncond = transformer(
-                latent_model_input,
-                negative_prompt_embeds_list,
-                timestep_token,
-                block_controlnet_hidden_states=control_res_uncond,
-            ).permute(0, 2, 1, 3, 4)
-        return pred_uncond + float(guidance_scale) * (pred_flow - pred_uncond)
+        noise_pred = noise_pred.permute(0, 2, 1, 3, 4).contiguous()
+        latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
 
-    if use_step_schedule:
-        for step_i, t_cur in enumerate(t_list_full):
-            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
-            pred_flow_bcfhw = pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
-            latents = scheduler.step(
-                pred_flow_bcfhw,
-                t_cur,
-                latents,
-            ).prev_sample
-    elif update_rule == "renoise_x0":
-        for step_i, t_cur in enumerate(t_list_full):
-            noisy_input_bfchw = latents.permute(0, 2, 1, 3, 4).contiguous()
-            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
-
-            timestep = torch.ones((1, latent_t),
-                                  device=device,
-                                  dtype=torch.float32) * t_cur
-            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None:
-                timestep = timestep.clone()
-                timestep[:, 0] = 0
-
-            denoised_pred = pred_noise_to_pred_video(
-                pred_noise=pred_flow_btchw.flatten(0, 1),
-                noise_input_latent=noisy_input_bfchw.flatten(0, 1),
-                timestep=timestep,
-                scheduler=scheduler,
-            ).unflatten(0, pred_flow_btchw.shape[:2])
-
-            if step_i < len(t_list_full) - 1:
-                next_timestep = t_list_full[step_i + 1]
-                noise = torch.randn_like(denoised_pred.flatten(0, 1))
-                noisy_input_bfchw = scheduler.add_noise(
-                    denoised_pred.flatten(0, 1),
-                    noise,
-                    next_timestep * torch.ones(
-                        (1 * latent_t),
-                        device=device,
-                        dtype=torch.long,
-                    ),
-                ).unflatten(0, denoised_pred.shape[:2])
-                latents = noisy_input_bfchw.permute(0, 2, 1, 3,
-                                                    4).contiguous()
-            else:
-                latents = denoised_pred.permute(0, 2, 1, 3,
-                                                4).contiguous()
-
-    elif update_rule == "euler_dt":
-        if t_list_full.numel() < 2:
-            raise ValueError("euler_dt requires at least 2 timesteps.")
-        timesteps_1d = scheduler.timesteps.to(device=device,
-                                              dtype=torch.float32)
-        sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
-        for step_i in range(int(t_list_full.numel()) - 1):
-            t_cur = t_list_full[step_i]
-            t_next = t_list_full[step_i + 1]
-            pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
-
-            idx_cur = torch.argmin((timesteps_1d - t_cur.float()).abs())
-            idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
-            sigma_cur = sigmas_1d[idx_cur]
-            sigma_next = sigmas_1d[idx_next]
-            dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
-            latents = latents + dt * pred_flow_btchw.permute(
-                0, 2, 1, 3, 4).contiguous()
-    else:
-        raise ValueError(f"Unsupported update_rule: {update_rule!r}")
-
-    if first_frame_latent_bcfhw is not None:
+    if expand_timesteps and image_latents is not None:
+        latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
+    elif first_frame_latent_bcfhw is not None:
         latents = latents.clone()
-        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                        dtype=dtype)
+        latents[:, :, :1] = image_latents
+
     return latents
 
 
@@ -1152,6 +1084,22 @@ def main() -> None:
         "Diffusers-format folder used for ControlNet config (contains config.json + *.safetensors). "
         "Can be either (a) consolidated inference export dir, or (b) teacher ControlNet dir.",
     )
+    parser.add_argument("--controlnet_weight",
+                        type=float,
+                        default=0.8,
+                        help="ControlNet weight (Diff-Factory default: 0.8).")
+    parser.add_argument("--controlnet_guidance_start",
+                        type=float,
+                        default=0.0,
+                        help="ControlNet guidance start (Diff-Factory default: 0.0).")
+    parser.add_argument("--controlnet_guidance_end",
+                        type=float,
+                        default=0.8,
+                        help="ControlNet guidance end (Diff-Factory default: 0.8).")
+    parser.add_argument("--controlnet_stride",
+                        type=int,
+                        default=3,
+                        help="ControlNet stride (Diff-Factory default: 3).")
     parser.add_argument(
         "--attention_mode",
         type=str,
@@ -1494,6 +1442,12 @@ def main() -> None:
         )
 
         if args.attention_mode == "bidirectional":
+            if dmd_steps_list is not None or timestep_indices_list is not None or not bool(
+                    args.full_schedule):
+                logger.warning(
+                    "bidir alignment: ignoring dmd_steps/timestep_indices/update_rule; using full %s-step schedule.",
+                    int(args.schedule_num_inference_steps),
+                )
             latents = _bidirectional_dmd_rollout_ti2v_controlnet(
                 transformer=transformer,
                 controlnet=controlnet,
@@ -1514,6 +1468,8 @@ def main() -> None:
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+                expand_timesteps=bool(
+                    getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
                 seed=args.seed + i,
                 dtype=dtype,
             )
