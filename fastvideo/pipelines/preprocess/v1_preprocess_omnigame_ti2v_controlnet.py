@@ -128,8 +128,23 @@ def _load_mask_frame(path: str,
                      threshold: float | None,
                      invert: bool) -> torch.Tensor:
     img = Image.open(_maybe_expand(path)).convert("L")
-    img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
-    arr = (np.asarray(img).astype(np.float32) / 255.0)  # HW in [0,1]
+    arr_u8 = np.asarray(img).astype(np.uint8)
+    # Match Diff-Factory: center-crop to aspect, then resize with NEAREST.
+    h0, w0 = arr_u8.shape[:2]
+    target_ratio = float(width) / float(height)
+    current_ratio = float(w0) / float(h0)
+    if current_ratio > target_ratio:
+        new_w = int(h0 * target_ratio)
+        left = max(0, (w0 - new_w) // 2)
+        arr_u8 = arr_u8[:, left:left + new_w]
+    else:
+        new_h = int(w0 / target_ratio)
+        top = max(0, (h0 - new_h) // 2)
+        arr_u8 = arr_u8[top:top + new_h, :]
+    arr_u8 = np.array(
+        Image.fromarray(arr_u8).resize((int(width), int(height)),
+                                       resample=Image.NEAREST))
+    arr = arr_u8.astype(np.float32) / 255.0  # HW in [0,1]
     if threshold is not None:
         arr = (arr > float(threshold)).astype(np.float32)
     if invert:
