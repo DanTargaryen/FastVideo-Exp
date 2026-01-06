@@ -24,12 +24,17 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import pickle
+import re
 from pathlib import Path
 from typing import Any
 
+import cv2
+import ftfy
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -98,6 +103,13 @@ def _read_text_file(path: str) -> str:
     return text
 
 
+def _prompt_clean(text: str) -> str:
+    text = ftfy.fix_text(str(text))
+    text = html.unescape(html.unescape(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _resize_for_crop_pil(img: Image.Image, crop_h: int,
                          crop_w: int) -> Image.Image:
     img_w, img_h = img.size
@@ -156,59 +168,54 @@ def _load_mask_frame(path: str,
 def _load_depth_frames_from_folder(control_dir: str, frame_indices: list[int],
                                    height: int, width: int) -> torch.Tensor:
     """
-    Mirrors Diff-Factory `wan_controlnet_phase2_pickle.py::_load_depth_frames_from_folder`.
-    Returns (T,3,H,W) in [0,1].
+    Mirrors Diff-Factory `process_control_depth` in run_wan_controlnet_depth_mask.py.
+    Returns (T,3,H,W) with valid depth in [0,1] and invalid pixels = -1.
     """
+    folder = _maybe_expand(control_dir)
+    depths: list[np.ndarray] = []
+    target_ratio = float(width) / float(height)
+    for idx in frame_indices:
+        fname = os.path.join(folder, f"{int(idx):06d}.png")
+        depthmap = imageio.imread(fname).astype(np.float32)
+        if depthmap.ndim == 3:
+            depthmap = depthmap[..., 0]
+        depthmap = depthmap / 65535.0
 
-    def _center_crop_to_aspect_2d(arr2d: np.ndarray) -> np.ndarray:
-        h0, w0 = arr2d.shape[:2]
-        target_ratio = float(width) / float(height)
+        h0, w0 = depthmap.shape
         current_ratio = float(w0) / float(h0)
         if current_ratio > target_ratio:
             new_w = int(h0 * target_ratio)
             left = max(0, (w0 - new_w) // 2)
-            return arr2d[:, left:left + new_w]
-        new_h = int(w0 / target_ratio)
-        top = max(0, (h0 - new_h) // 2)
-        return arr2d[top:top + new_h, :]
+            depthmap = depthmap[:, left:left + new_w]
+        else:
+            new_h = int(w0 / target_ratio)
+            top = max(0, (h0 - new_h) // 2)
+            depthmap = depthmap[top:top + new_h, :]
 
-    def _resize_2d(arr2d: np.ndarray) -> np.ndarray:
-        img = Image.fromarray(arr2d)
-        img = img.resize((int(width), int(height)), resample=Image.NEAREST)
-        return np.array(img)
+        depthmap = cv2.resize(depthmap, (int(width), int(height)),
+                              interpolation=cv2.INTER_NEAREST)
 
-    folder = _maybe_expand(control_dir)
-    hist = np.zeros(65536, dtype=np.int64)
-    raws: list[np.ndarray] = []
-    for idx in frame_indices:
-        fname = os.path.join(folder, f"{int(idx):06d}.png")
-        arr = np.array(Image.open(fname))
-        if arr.ndim == 3:
-            arr = arr[..., 0]
-        if arr.dtype != np.uint16:
-            arr = arr.astype(np.uint16)
-        hist += np.bincount(arr.reshape(-1), minlength=65536).astype(np.int64)
-        raws.append(arr)
+        near_mask = depthmap < 0.0015
+        far_mask = depthmap > (65500.0 / 65535.0)
+        valid = ~(near_mask | far_mask)
+        depthmap[~valid] = np.nan
+        depths.append(depthmap)
 
-    uniq_vals = np.flatnonzero(hist)
-    if uniq_vals.size == 0:
-        low, high = 0.0, 1.0
-    else:
-        low = float(np.percentile(uniq_vals, 5))
-        high = float(np.percentile(uniq_vals, 95))
-        if high - low < 1e-6:
-            high = low + 1e-6
+    stacked = np.stack(depths, 0)
+    global_min = np.nanmin(stacked)
+    global_max = np.nanmax(stacked)
+    if not np.isfinite(global_min) or not np.isfinite(global_max):
+        global_min, global_max = 0.0, 1.0
+    if (global_max - global_min) < 1e-6:
+        global_max = global_min + 1e-6
 
     frames = []
-    for raw in raws:
-        depth = raw.astype(np.float32)
-        depth = (depth - low) / (high - low)
-        depth = np.clip(depth, 0.0, 1.0)
-        depth = _center_crop_to_aspect_2d(depth)
-        depth = _resize_2d(depth)
-        depth = 1.0 - depth
-        depth3 = np.repeat(depth[..., None], 3, axis=2)
-        frames.append(torch.from_numpy(depth3).permute(2, 0, 1).contiguous())
+    for depthmap in depths:
+        depthmap = (depthmap - global_min) / (global_max - global_min)
+        depthmap = 1.0 - depthmap
+        depthmap = np.nan_to_num(depthmap, nan=-1.0)
+        t = torch.from_numpy(depthmap).float().unsqueeze(0).repeat(3, 1, 1)
+        frames.append(t)
 
     return torch.stack(frames, dim=0)  # TCHW
 
@@ -297,6 +304,17 @@ def parse_args() -> argparse.Namespace:
                    action="store_false",
                    help="Do NOT use warp_out_root; build masked_rgb from rgb*mask.")
     p.set_defaults(use_warp_out=True)
+    p.add_argument(
+        "--mask_source",
+        type=str,
+        default="",
+        choices=["", "warp_out", "pickle"],
+        help=(
+            "Override mask/masked_rgb source. "
+            "'warp_out' uses warp_out_root; 'pickle' uses mask_path/mask_root with masked_rgb=rgb*mask. "
+            "Empty means follow --use-warp-out/--no-use-warp-out."
+        ),
+    )
     p.add_argument("--mask_root",
                    type=str,
                    default="",
@@ -412,8 +430,11 @@ def main(args: argparse.Namespace) -> None:
 
     start = int(args.start)
     end = len(samples) if int(args.end) < 0 else min(int(args.end), len(samples))
-    if args.use_warp_out and not args.warp_out_root:
-        raise ValueError("--warp_out_root is required when --use_warp_out is True")
+    use_warp_out = bool(args.use_warp_out)
+    if str(args.mask_source).strip():
+        use_warp_out = str(args.mask_source).strip().lower() == "warp_out"
+    if use_warp_out and not args.warp_out_root:
+        raise ValueError("--warp_out_root is required when mask_source=warp_out or --use-warp-out is True")
     warp_root = Path(_maybe_expand(args.warp_out_root)) if args.warp_out_root else None
 
     # Multi-GPU preprocessing: each rank writes to its own subdir to avoid file name collisions.
@@ -446,6 +467,7 @@ def main(args: argparse.Namespace) -> None:
             prompt = _read_text_file(str(caption_path))
         else:
             prompt = ""
+        prompt = _prompt_clean(prompt)
 
         video_dir = _maybe_expand(str(s["video_path"]))  # .../<scene>/color
         control_dir = _maybe_expand(str(s["control_path"]))  # .../<scene>/depth
@@ -485,7 +507,7 @@ def main(args: argparse.Namespace) -> None:
                                                     args.max_height,
                                                     args.max_width)  # T,3,H,W
 
-        if args.use_warp_out:
+        if use_warp_out:
             assert warp_root is not None
             masked_rgb_tchw = torch.stack([
                 _load_rgb_frame(
@@ -537,6 +559,12 @@ def main(args: argparse.Namespace) -> None:
             ],
                                   dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
+
+        # Align with Diff-Factory inference: first mask = all ones, masked_rgb = original first RGB.
+        if mask_tchw.numel() > 0:
+            mask_tchw[0].fill_(1.0)
+        if masked_rgb_tchw.numel() > 0:
+            masked_rgb_tchw[0] = first_rgb
 
         # Encode 3 sequences in a single batched call: (3,3,T,H,W)
         # Match Diff-Factory: depth/mask in [0,1], masked_rgb mapped to [-1,1].

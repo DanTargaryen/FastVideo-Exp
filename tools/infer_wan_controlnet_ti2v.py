@@ -1163,9 +1163,9 @@ def main() -> None:
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="flowmatch_euler",
+        default="unipc",
         choices=["flowmatch_euler", "unipc"],
-        help="Scheduler family for inference. Use 'flowmatch_euler' to match Diff-Factory / Self-Forcing defaults.",
+        help="Scheduler family for inference. Use 'unipc' to match Diff-Factory Wan ControlNet inference defaults.",
     )
     parser.add_argument(
         "--init_transformer_safetensors",
