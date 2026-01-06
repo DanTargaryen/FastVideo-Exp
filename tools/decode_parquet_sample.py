@@ -169,8 +169,32 @@ def main() -> None:
     control_latent = _decode_tensor(row, "control_latent")
     control_latent = _ensure_bcfhw(control_latent, name="control_latent")
 
+    def _denorm_latents(latents: torch.Tensor) -> torch.Tensor:
+        # Match FastVideo DecodingStage: undo preprocessing normalization.
+        if hasattr(vae.config, "latents_mean") and hasattr(vae.config, "latents_std"):
+            mean = torch.tensor(vae.config.latents_mean,
+                                device=latents.device,
+                                dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            std = torch.tensor(vae.config.latents_std,
+                               device=latents.device,
+                               dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            latents = latents * std + mean
+        else:
+            scale = getattr(vae, "scaling_factor", None)
+            if scale is not None:
+                if isinstance(scale, torch.Tensor):
+                    scale = scale.to(latents.device, latents.dtype)
+                latents = latents / scale
+            shift = getattr(vae, "shift_factor", None)
+            if shift is not None:
+                if isinstance(shift, torch.Tensor):
+                    shift = shift.to(latents.device, latents.dtype)
+                latents = latents + shift
+        return latents
+
     def decode_latent(latent: torch.Tensor) -> torch.Tensor:
         latent = latent.to(device=device, dtype=torch.float32)
+        latent = _denorm_latents(latent)
         with torch.no_grad():
             decoded = vae.decode(latent, return_dict=False)[0]
         return decoded
