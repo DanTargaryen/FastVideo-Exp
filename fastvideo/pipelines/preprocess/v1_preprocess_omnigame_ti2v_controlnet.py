@@ -198,10 +198,11 @@ def _load_depth_frames_from_folder(control_dir: str, frame_indices: list[int],
     return torch.stack(frames, dim=0)  # TCHW
 
 
-def _to_vae_input(video_tchw: torch.Tensor) -> torch.Tensor:
-    # (T,3,H,W) in [0,1] -> (1,3,T,H,W) in [-1,1]
+def _to_vae_input(video_tchw: torch.Tensor, *, normalize: bool) -> torch.Tensor:
+    # (T,3,H,W) -> (1,3,T,H,W); normalize controls [0,1] -> [-1,1] mapping.
     x = video_tchw.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
-    x = x * 2.0 - 1.0
+    if normalize:
+        x = x * 2.0 - 1.0
     return x
 
 
@@ -452,7 +453,8 @@ def main(args: argparse.Namespace) -> None:
         # ---- first-frame latent (store as float32 [F=1,C=16,H,W]) ----
         first_rgb = _load_rgb_frame(first_rgb_path, args.max_height,
                                     args.max_width)  # 3HW in [0,1]
-        first_bcthw = _to_vae_input(first_rgb[None, ...])  # 1,3,1,H,W
+        first_bcthw = _to_vae_input(first_rgb[None, ...],
+                                    normalize=True)  # 1,3,1,H,W
         first_bcthw = first_bcthw.to(device=device, dtype=torch.float32)
         # Match Diff-Factory inference: use deterministic VAE mode for first-frame.
         first_lat = _encode_video_latents(vae,
@@ -522,15 +524,16 @@ def main(args: argparse.Namespace) -> None:
             masked_rgb_tchw = rgb_tchw * mask_tchw
 
         # Encode 3 sequences in a single batched call: (3,3,T,H,W)
+        # Match Diff-Factory: depth/mask in [0,1], masked_rgb mapped to [-1,1].
         video_3 = torch.cat([
-            _to_vae_input(depth_tchw),
-            _to_vae_input(masked_rgb_tchw),
-            _to_vae_input(mask_tchw),
+            _to_vae_input(depth_tchw, normalize=False),
+            _to_vae_input(masked_rgb_tchw, normalize=True),
+            _to_vae_input(mask_tchw, normalize=False),
         ],
                             dim=0).to(device=device, dtype=torch.float32)
-        # Control latents follow Diff-Factory training (stochastic VAE sample).
+        # Diff-Factory pipeline uses deterministic argmax for control latents.
         lat_3 = _encode_video_latents(vae, video_3,
-                                      sample_mode="sample")  # 3,16,T_lat,h,w
+                                      sample_mode="mode")  # 3,16,T_lat,h,w
         lat_3 = lat_3.to("cpu", dtype=torch.float32)
 
         depth_lat = lat_3[0]  # 16,T_lat,h,w
