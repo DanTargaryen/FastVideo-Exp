@@ -775,6 +775,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
             context_timestep = torch.ones((1, current_num_frames),
                                           device=device,
                                           dtype=torch.float32) * float(context_noise)
+            if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
+                schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
+                t_flat = context_timestep.flatten()
+                diff = (t_flat[:, None] - schedule_ts[None, :]).abs()
+                nearest_idx = diff.argmin(dim=1)
+                context_timestep = schedule_ts.index_select(0, nearest_idx).view_as(context_timestep)
             # Match Self-Forcing training: always add (small) context noise then commit cache.
             ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
             context_btchw = scheduler.add_noise(
