@@ -1303,6 +1303,14 @@ def main() -> None:
         action="store_true",
         help="Also save the decoded video as PNG frames under out_dir/frames/<sample_id>/",
     )
+    parser.add_argument(
+        "--control_depth_only",
+        action="store_true",
+        help=(
+            "Use only the depth chunk from control_latent and zero out masked_rgb/mask chunks. "
+            "This is useful to debug mask-conditioned artifacts without regenerating parquet."
+        ),
+    )
     args = parser.parse_args()
 
     _ensure_single_process_dist_env()
@@ -1443,6 +1451,20 @@ def main() -> None:
                                                                 dtype=dtype)
         control_latent = sample.control_latent_bcfhw.to(device="cuda",
                                                         dtype=dtype)
+        if args.control_depth_only:
+            total_c = int(control_latent.shape[1])
+            if total_c % 3 != 0:
+                raise ValueError(
+                    f"control_latent channels must be divisible by 3, got {total_c}"
+                )
+            base_c = total_c // 3
+            control_latent = control_latent.clone()
+            control_latent[:, base_c:] = 0
+            logger.info(
+                "control_depth_only enabled: kept first %s channels, zeroed remaining %s",
+                base_c,
+                total_c - base_c,
+            )
         if (first_frame_latent is not None and not bool(args.first_frame_timestep_zero)):
             logger.warning(
                 "TI2V alignment: Diff-Factory sets first-frame timestep to 0 when first-frame conditioning is present. "
