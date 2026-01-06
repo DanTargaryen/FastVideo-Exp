@@ -617,7 +617,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
-                    dtype=torch.float32,
+                    dtype=dtype,
                 )
                 first_frame_mask[:, :, 0] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
@@ -625,6 +625,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             elif first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
                 latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+            latent_model_input = latent_model_input.to(dtype=dtype)
 
             timestep = torch.ones((1, current_num_frames),
                                   device=device,
@@ -809,7 +810,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
-                    dtype=torch.float32,
+                    dtype=dtype,
                 )
                 first_frame_mask[:, :, 0] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
@@ -818,6 +819,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 context_bcfhw = context_bcfhw.clone()
                 context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
                                                                       dtype=dtype)
+            context_bcfhw = context_bcfhw.to(dtype=dtype)
 
             with torch.autocast(device_type="cuda", dtype=dtype,
                                 enabled=(dtype != torch.float32)), \
@@ -876,7 +878,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
         first_frame_mask = torch.ones(
             (1, 1, latent_t, latent_h, latent_w),
             device=device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
         first_frame_mask[:, :, 0] = 0
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
