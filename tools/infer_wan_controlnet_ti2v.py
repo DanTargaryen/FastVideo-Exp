@@ -463,6 +463,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     update_rule: str,
     full_schedule: bool,
     first_frame_timestep_zero: bool,
+    expand_timesteps: bool,
     reset_cache_each_block: bool,
     disable_cache_update: bool,
     seed: int,
@@ -612,7 +613,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
-            if first_frame_latent_bcfhw is not None and start_index == 0:
+            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+                first_frame_mask = torch.ones(
+                    (1, 1, current_num_frames, latent_h, latent_w),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                first_frame_mask[:, :, 0] = 0
+                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
+            elif first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
                 latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
 
@@ -624,7 +634,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
             # overwriting `hidden_states[:, :, 0]`, but does NOT override its timestep.
             # Keep the original timestep by default; allow forcing to 0 for Diff-Factory-style
             # expand_timesteps debugging via `--first_frame_timestep_zero`.
-            if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
+            if (first_frame_timestep_zero or
+                    (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
                 timestep = timestep.clone()
                 timestep[:, 0] = 0
 
@@ -794,7 +805,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
-            if first_frame_latent_bcfhw is not None and start_index == 0:
+            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+                first_frame_mask = torch.ones(
+                    (1, 1, current_num_frames, latent_h, latent_w),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                first_frame_mask[:, :, 0] = 0
+                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
+            elif first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
                 context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
                                                                       dtype=dtype)
@@ -852,7 +872,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         start_index += current_num_frames
 
-    if first_frame_latent_bcfhw is not None:
+    if expand_timesteps and first_frame_latent_bcfhw is not None:
+        first_frame_mask = torch.ones(
+            (1, 1, latent_t, latent_h, latent_w),
+            device=device,
+            dtype=torch.float32,
+        )
+        first_frame_mask[:, :, 0] = 0
+        image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
+    elif first_frame_latent_bcfhw is not None:
         latents = latents.clone()
         latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
                                                         dtype=dtype)
@@ -1511,6 +1540,8 @@ def main() -> None:
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+                expand_timesteps=bool(
+                    getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
                 reset_cache_each_block=bool(args.reset_cache_each_block),
                 disable_cache_update=bool(args.disable_cache_update),
                 seed=args.seed + i,
