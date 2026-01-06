@@ -151,8 +151,12 @@ class WanControlnet3DModel(BaseDiT):
 
         batch_size, _c, num_frames, height, width = hidden_states.shape
 
-        # Normalize timestep shape to (B, num_frames) so that downstream
-        # modulation tensors can be reshaped consistently.
+        _, p_h, p_w = self.patch_size
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+        frame_seq_len = post_patch_height * post_patch_width
+
+        # Normalize timestep shape to (B, num_frames) or (B, num_frames * frame_seq_len).
         if not isinstance(timestep, torch.Tensor):
             timestep = torch.as_tensor(timestep, device=hidden_states.device)
         else:
@@ -169,6 +173,9 @@ class WanControlnet3DModel(BaseDiT):
                     batch_size, num_frames)
             elif timestep_2d.numel() == batch_size * num_frames:
                 timestep_2d = timestep_2d.view(batch_size, num_frames)
+            elif timestep_2d.numel() == batch_size * num_frames * frame_seq_len:
+                timestep_2d = timestep_2d.view(batch_size,
+                                               num_frames * frame_seq_len)
             elif batch_size == 1 and timestep_2d.numel() == num_frames:
                 timestep_2d = timestep_2d.view(1, num_frames)
             else:
@@ -178,7 +185,12 @@ class WanControlnet3DModel(BaseDiT):
         elif timestep_2d.dim() == 2:
             if timestep_2d.shape == (batch_size, 1):
                 timestep_2d = timestep_2d.expand(batch_size, num_frames)
-            elif timestep_2d.shape != (batch_size, num_frames):
+            elif timestep_2d.shape == (batch_size, num_frames):
+                pass
+            elif timestep_2d.shape == (batch_size,
+                                       num_frames * frame_seq_len):
+                pass
+            else:
                 raise ValueError(
                     f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
                 )
@@ -186,10 +198,6 @@ class WanControlnet3DModel(BaseDiT):
             raise ValueError(
                 f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
             )
-
-        _, p_h, p_w = self.patch_size
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
 
         # Rotary embeddings (bidirectional)
         d = self.hidden_size // self.num_attention_heads
@@ -225,7 +233,6 @@ class WanControlnet3DModel(BaseDiT):
         # Match WanTransformer3DModel behavior for TI2V:
         # If timestep is per-frame, expand to per-token (seq_len) so that
         # timestep_proj aligns with hidden_states length.
-        frame_seq_len = post_patch_height * post_patch_width
         if timestep_2d.shape[1] == num_frames:
             timestep_seq = timestep_2d.repeat_interleave(frame_seq_len, dim=1)
         else:
