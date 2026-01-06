@@ -55,6 +55,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+from diffusers import UniPCMultistepScheduler as DiffusersUniPCMultistepScheduler
 
 from fastvideo.distributed import maybe_init_distributed_environment_and_model_parallel
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -854,7 +855,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     *,
     transformer,
     controlnet,
-    scheduler: FlowMatchEulerDiscreteScheduler | FlowUniPCMultistepScheduler,
+    scheduler: FlowMatchEulerDiscreteScheduler | FlowUniPCMultistepScheduler
+    | DiffusersUniPCMultistepScheduler,
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
@@ -1369,7 +1371,13 @@ def main() -> None:
             "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
         )
     if args.scheduler == "unipc":
-        scheduler = FlowUniPCMultistepScheduler(shift=float(args.flow_shift))
+        if args.attention_mode == "bidirectional":
+            scheduler = DiffusersUniPCMultistepScheduler.from_pretrained(
+                args.base_model, subfolder="scheduler")
+            scheduler = DiffusersUniPCMultistepScheduler.from_config(
+                scheduler.config, flow_shift=float(args.flow_shift))
+        else:
+            scheduler = FlowUniPCMultistepScheduler(shift=float(args.flow_shift))
     else:
         # Self-Forcing / DMD training uses Euler ODE (FlowMatchEulerDiscreteScheduler).
         # Do NOT use the base model's UniPC scheduler here. Also, the `shift` MUST match training.
