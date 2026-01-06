@@ -121,11 +121,19 @@ def _load_rgb_frame(path: str, height: int, width: int) -> torch.Tensor:
     return t
 
 
-def _load_mask_frame(path: str, height: int, width: int) -> torch.Tensor:
+def _load_mask_frame(path: str,
+                     height: int,
+                     width: int,
+                     *,
+                     threshold: float | None,
+                     invert: bool) -> torch.Tensor:
     img = Image.open(_maybe_expand(path)).convert("L")
     img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
     arr = (np.asarray(img).astype(np.float32) / 255.0)  # HW in [0,1]
-    arr = (arr > 0.5).astype(np.float32)
+    if threshold is not None:
+        arr = (arr > float(threshold)).astype(np.float32)
+    if invert:
+        arr = 1.0 - arr
     t = torch.from_numpy(arr)[None, ...].repeat(3, 1, 1).contiguous()  # 3HW
     return t
 
@@ -213,16 +221,40 @@ def _postprocess_vae_latents(vae, latents: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _encode_video_latents(vae, video_bcthw: torch.Tensor) -> torch.Tensor:
+def _encode_video_latents(vae,
+                          video_bcthw: torch.Tensor,
+                          *,
+                          sample_mode: str) -> torch.Tensor:
     # Returns (B,16,T_lat,H_lat,W_lat) float32 on device.
     with torch.autocast(device_type="cuda",
                         dtype=torch.float32,
                         enabled=torch.cuda.is_available()
                         and video_bcthw.is_cuda):
         out = vae.encode(video_bcthw)
-    latents = out.mean
+    if sample_mode == "mode":
+        latents = out.mode()
+    elif sample_mode == "sample":
+        latents = out.sample()
+    else:
+        raise ValueError(f"Unsupported sample_mode: {sample_mode}")
     latents = _postprocess_vae_latents(vae, latents)
     return latents
+
+
+def _infer_latent_repeat(model_path: str, z_dim: int) -> int:
+    cfg_path = Path(model_path) / "transformer" / "config.json"
+    if not cfg_path.exists():
+        return 1
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 1
+    in_channels = cfg.get("in_channels")
+    if isinstance(in_channels, (int, float)):
+        in_channels = int(in_channels)
+        if in_channels > 0 and in_channels % int(z_dim) == 0:
+            return in_channels // int(z_dim)
+    return 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +285,18 @@ def parse_args() -> argparse.Namespace:
                    type=str,
                    default="",
                    help="Mask root dir when not using warp_out (fallback if pickle has no mask_path).")
+    p.add_argument("--mask_threshold",
+                   type=float,
+                   default=0.5,
+                   help="Mask binarization threshold in [0,1]. Set <0 to keep soft mask values.")
+    p.add_argument("--mask_invert",
+                   action="store_true",
+                   help="Invert mask after loading/binarization (1->0, 0->1).")
+    p.add_argument("--latent_repeat",
+                   type=int,
+                   default=0,
+                   help="Repeat VAE latent channels to match transformer in_channels. "
+                   "0=auto-detect from transformer config; 1=keep as-is; 3=repeat 3x, etc.")
     p.add_argument("--output_dir",
                    type=str,
                    required=True,
@@ -327,6 +371,23 @@ def main(args: argparse.Namespace) -> None:
     text_stage = TextEncodingStage(text_encoders=[text_encoder],
                                    tokenizers=[tokenizer])
 
+    z_dim = getattr(vae, "z_dim", None)
+    if z_dim is None:
+        z_dim = getattr(getattr(vae, "config", None), "z_dim", None)
+    if z_dim is None:
+        z_dim = getattr(getattr(vae, "config", None), "arch_config", None)
+        z_dim = getattr(z_dim, "z_dim", None)
+    if z_dim is None:
+        z_dim = 16
+    if int(args.latent_repeat) > 0:
+        latent_repeat = int(args.latent_repeat)
+    else:
+        latent_repeat = _infer_latent_repeat(model_path, int(z_dim))
+    latent_repeat = max(1, int(latent_repeat))
+    if latent_repeat != 1:
+        logger.info("latent_repeat=%s (z_dim=%s) -> in_channels=%s", latent_repeat, z_dim,
+                    int(z_dim) * int(latent_repeat))
+
     samples = pickle.load(open(_maybe_expand(args.in_pickle), "rb"))
     if isinstance(samples, dict) and "samples" in samples:
         samples = samples["samples"]
@@ -393,7 +454,12 @@ def main(args: argparse.Namespace) -> None:
                                     args.max_width)  # 3HW in [0,1]
         first_bcthw = _to_vae_input(first_rgb[None, ...])  # 1,3,1,H,W
         first_bcthw = first_bcthw.to(device=device, dtype=torch.float32)
-        first_lat = _encode_video_latents(vae, first_bcthw)  # 1,16,1,h,w
+        # Match Diff-Factory inference: use deterministic VAE mode for first-frame.
+        first_lat = _encode_video_latents(vae,
+                                          first_bcthw,
+                                          sample_mode="mode")  # 1,16,1,h,w
+        if latent_repeat != 1:
+            first_lat = first_lat.repeat(1, latent_repeat, 1, 1, 1)
         first_lat = first_lat[0, :, 0].unsqueeze(0)  # 1,16,h,w (F,C,H,W)
         first_lat_np = first_lat.to("cpu", dtype=torch.float32).numpy()
 
@@ -415,7 +481,12 @@ def main(args: argparse.Namespace) -> None:
             mask_tchw = torch.stack([
                 _load_mask_frame(
                     str(warp_root / scene_name / "warped_mask" /
-                        f"{int(i):06d}.png"), args.max_height, args.max_width)
+                        f"{int(i):06d}.png"),
+                    args.max_height,
+                    args.max_width,
+                    threshold=None if float(args.mask_threshold) < 0 else float(args.mask_threshold),
+                    invert=bool(args.mask_invert),
+                )
                 for i in frame_indices
             ],
                                   dim=0)
@@ -438,8 +509,13 @@ def main(args: argparse.Namespace) -> None:
             ],
                                    dim=0)
             mask_tchw = torch.stack([
-                _load_mask_frame(os.path.join(mask_dir, f"{int(i):06d}.png"),
-                                 args.max_height, args.max_width)
+                _load_mask_frame(
+                    os.path.join(mask_dir, f"{int(i):06d}.png"),
+                    args.max_height,
+                    args.max_width,
+                    threshold=None if float(args.mask_threshold) < 0 else float(args.mask_threshold),
+                    invert=bool(args.mask_invert),
+                )
                 for i in frame_indices
             ],
                                   dim=0)
@@ -452,12 +528,18 @@ def main(args: argparse.Namespace) -> None:
             _to_vae_input(mask_tchw),
         ],
                             dim=0).to(device=device, dtype=torch.float32)
-        lat_3 = _encode_video_latents(vae, video_3)  # 3,16,T_lat,h,w
+        # Control latents follow Diff-Factory training (stochastic VAE sample).
+        lat_3 = _encode_video_latents(vae, video_3,
+                                      sample_mode="sample")  # 3,16,T_lat,h,w
         lat_3 = lat_3.to("cpu", dtype=torch.float32)
 
         depth_lat = lat_3[0]  # 16,T_lat,h,w
         masked_lat = lat_3[1]
         mask_lat = lat_3[2]
+        if latent_repeat != 1:
+            depth_lat = depth_lat.repeat(latent_repeat, 1, 1, 1)
+            masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
+            mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
         control_lat = torch.cat([depth_lat, masked_lat, mask_lat],
                                 dim=0)  # 48,T_lat,h,w
         control_lat_np = control_lat.numpy()

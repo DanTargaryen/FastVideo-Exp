@@ -1082,6 +1082,47 @@ def _tensor_stats(name: str, x: torch.Tensor) -> str:
     )
 
 
+def _compute_negative_prompt_embeddings(
+    *,
+    tokenizer,
+    text_encoder,
+    negative_prompt: str,
+    max_sequence_length: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+) -> torch.Tensor:
+    """
+    Encode a negative prompt into embeddings that align with the transformer's text length.
+    """
+    assert negative_prompt, "Negative prompt must be provided for classifier-free guidance."
+    encoder_device = next(text_encoder.parameters()).device
+    text_encoder.eval()
+    with torch.no_grad():
+        tokens = tokenizer(
+            [negative_prompt],
+            padding="max_length",
+            truncation=True,
+            max_length=max_sequence_length,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        prompt_embeds = text_encoder(
+            tokens.input_ids.to(encoder_device),
+            tokens.attention_mask.to(encoder_device),
+        ).last_hidden_state
+
+    seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())
+    seq_len = min(seq_len, prompt_embeds.shape[1])
+    prompt_embeds = prompt_embeds[:, :seq_len, :]
+    if prompt_embeds.shape[1] < max_sequence_length:
+        pad_len = max_sequence_length - prompt_embeds.shape[1]
+        pad = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
+        prompt_embeds = torch.cat([prompt_embeds, pad], dim=1)
+
+    return prompt_embeds.to(dtype=dtype, device=target_device)
+
+
 def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
     import imageio
 
@@ -1162,10 +1203,10 @@ def main() -> None:
     parser.add_argument(
         "--flow_shift",
         type=float,
-        default=8.0,
+        default=5.0,
         help=(
             "FlowMatch Euler scheduler shift used during training/inference. "
-            "IMPORTANT: this must match the value used for training (your phase2 config uses flow_shift=8)."
+            "Diff-Factory Wan ControlNet distillation checkpoints expect 5.0, so keep this in sync."
         ),
     )
     parser.add_argument(
@@ -1208,6 +1249,12 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Classifier-free guidance scale. For student inference, 1.0 (no CFG) matches training by default.",
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="bad quality, worst quality",
+        help="Negative prompt text used when guidance_scale != 1. Matches Diff-Factory run defaults.",
     )
     parser.add_argument(
         "--first_frame_timestep_zero",
@@ -1273,6 +1320,8 @@ def main() -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }[args.dtype]
+    guidance_scale_value = float(args.guidance_scale)
+    inference_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
 
     timestep_indices = [int(x) for x in args.timestep_indices.split(",") if x.strip() != ""]
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
@@ -1333,7 +1382,35 @@ def main() -> None:
         logger.warning(
             "You set --init_transformer_safetensors but did not set --init_controlnet_safetensors. "
             "If you are testing phase-1 student init, you usually want to initialize BOTH transformer and controlnet "
-            "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
+        "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
+        )
+    negative_prompt_embeds_global: torch.Tensor | None = None
+    negative_prompt_text = str(args.negative_prompt or "").strip()
+    if negative_prompt_text and guidance_scale_value != 1.0:
+        tokenizer = PipelineComponentLoader.load_module(
+            "tokenizer", str(Path(args.base_model) / "tokenizer"), "transformers",
+            fastvideo_args)
+        text_encoder = PipelineComponentLoader.load_module(
+            "text_encoder", str(Path(args.base_model) / "text_encoder"), "transformers",
+            fastvideo_args)
+        max_text_len = int(getattr(transformer, "text_len", 226))
+        negative_prompt_embeds_global = _compute_negative_prompt_embeddings(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            negative_prompt=negative_prompt_text,
+            max_sequence_length=max_text_len,
+            dtype=dtype,
+            target_device=inference_device,
+        )
+        logger.info(
+            "negative_prompt=%r -> embeddings shape=%s",
+            negative_prompt_text,
+            tuple(negative_prompt_embeds_global.shape),
+        )
+        del tokenizer, text_encoder
+    elif guidance_scale_value != 1.0 and not negative_prompt_text:
+        logger.warning(
+            "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
         )
     if args.scheduler == "unipc":
         scheduler = FlowUniPCMultistepScheduler(shift=float(args.flow_shift))
@@ -1357,8 +1434,11 @@ def main() -> None:
                                                      dtype=dtype)
         negative_prompt_embeds = None
         if float(args.guidance_scale) != 1.0:
-            # Match FastVideo training convention: unconditional prompt embedding is all-zeros.
-            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+            if negative_prompt_embeds_global is not None:
+                negative_prompt_embeds = negative_prompt_embeds_global
+            else:
+                # Match FastVideo training convention: unconditional prompt embedding is all-zeros.
+                negative_prompt_embeds = torch.zeros_like(prompt_embeds)
         first_frame_latent = sample.first_frame_latent_bcfhw.to(device="cuda",
                                                                 dtype=dtype)
         control_latent = sample.control_latent_bcfhw.to(device="cuda",
