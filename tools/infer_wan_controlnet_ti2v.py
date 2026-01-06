@@ -775,19 +775,22 @@ def _causal_dmd_rollout_ti2v_controlnet(
             context_timestep = torch.ones((1, current_num_frames),
                                           device=device,
                                           dtype=torch.float32) * float(context_noise)
-            if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
-                schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
-                t_flat = context_timestep.flatten()
-                diff = (t_flat[:, None] - schedule_ts[None, :]).abs()
-                nearest_idx = diff.argmin(dim=1)
-                context_timestep = schedule_ts.index_select(0, nearest_idx).view_as(context_timestep)
-            # Match Self-Forcing training: always add (small) context noise then commit cache.
-            ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
-            context_btchw = scheduler.add_noise(
-                context_btchw.flatten(0, 1),
-                ctx_noise,
-                context_timestep.flatten(),
-            ).unflatten(0, context_btchw.shape[:2])
+            if float(context_noise) <= 0.0:
+                context_timestep = context_timestep.zero_()
+            else:
+                if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
+                    schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
+                    t_flat = context_timestep.flatten()
+                    diff = (t_flat[:, None] - schedule_ts[None, :]).abs()
+                    nearest_idx = diff.argmin(dim=1)
+                    context_timestep = schedule_ts.index_select(0, nearest_idx).view_as(context_timestep)
+                # Match Self-Forcing training: always add (small) context noise then commit cache.
+                ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
+                context_btchw = scheduler.add_noise(
+                    context_btchw.flatten(0, 1),
+                    ctx_noise,
+                    context_timestep.flatten(),
+                ).unflatten(0, context_btchw.shape[:2])
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
