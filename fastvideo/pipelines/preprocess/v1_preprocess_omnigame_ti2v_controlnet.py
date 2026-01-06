@@ -560,12 +560,6 @@ def main(args: argparse.Namespace) -> None:
                                   dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
 
-        # Align with Diff-Factory inference: first mask = all ones, masked_rgb = original first RGB.
-        if mask_tchw.numel() > 0:
-            mask_tchw[0].fill_(1.0)
-        if masked_rgb_tchw.numel() > 0:
-            masked_rgb_tchw[0] = first_rgb
-
         # Encode 3 sequences in a single batched call: (3,3,T,H,W)
         # Match Diff-Factory: depth/mask in [0,1], masked_rgb mapped to [-1,1].
         video_3 = torch.cat([
