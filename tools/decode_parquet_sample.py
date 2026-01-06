@@ -57,12 +57,28 @@ def _read_row(data_path: str, index: int, columns: list[str]) -> dict:
     raise IndexError(f"sample_index {index} out of range")
 
 
-def _ensure_bcfhw(x: torch.Tensor) -> torch.Tensor:
+def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
     if x.dim() == 4:
         return x.unsqueeze(0)
     if x.dim() == 5:
+        # BFCHW -> BCFHW
+        if x.shape[1] in (1, 3, 16, 48) and x.shape[2] >= 8:
+            return x.permute(0, 2, 1, 3, 4).contiguous()
         return x
-    raise ValueError(f"Unexpected tensor shape {tuple(x.shape)}")
+    raise ValueError(f"Unsupported {name} shape: {tuple(x.shape)}")
+
+
+def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 3:
+        x = x.unsqueeze(0).unsqueeze(2)
+    elif x.dim() == 4:
+        x = x.unsqueeze(2)
+    else:
+        x = _ensure_bcfhw(x, name="first_frame_latent")
+    if x.shape[2] != 1:
+        raise ValueError(
+            f"first_frame_latent must have F==1, got shape={tuple(x.shape)}")
+    return x
 
 
 def _save_video_frames(video: torch.Tensor, prefix: str, out_dir: Path) -> None:
@@ -149,9 +165,9 @@ def main() -> None:
     sample_id = str(row.get("id", f"index_{args.sample_index:06d}"))
 
     first_frame_latent = _decode_tensor(row, "first_frame_latent")
-    first_frame_latent = _ensure_bcfhw(first_frame_latent)
+    first_frame_latent = _ensure_first_frame_bcfhw(first_frame_latent)
     control_latent = _decode_tensor(row, "control_latent")
-    control_latent = _ensure_bcfhw(control_latent)
+    control_latent = _ensure_bcfhw(control_latent, name="control_latent")
 
     def decode_latent(latent: torch.Tensor) -> torch.Tensor:
         latent = latent.to(device=device, dtype=torch.float32)
