@@ -141,6 +141,7 @@ def collate_rows_from_parquet_schema(rows,
             # Get tensor data from row using the existing helper function pattern
             shape_key = f"{tensor_name}_shape"
             bytes_key = f"{tensor_name}_bytes"
+            dtype_key = f"{tensor_name}_dtype"
 
             if shape_key in row and bytes_key in row:
                 shape = row[shape_key]
@@ -154,8 +155,20 @@ def collate_rows_from_parquet_schema(rows,
                     ) if rng else random.random()) < cfg_rate:
                         data = np.zeros((512, 4096), dtype=np.float32)
                     else:
-                        data = np.frombuffer(
-                            bytes_data, dtype=np.float32).reshape(shape).copy()
+                        dtype_str = row.get(dtype_key, "float32")
+                        np_dtype = np.float32
+                        if isinstance(dtype_str, str):
+                            dtype_str_l = dtype_str.lower()
+                            if dtype_str_l in ("float16", "fp16"):
+                                np_dtype = np.float16
+                            elif dtype_str_l in ("float32", "fp32"):
+                                np_dtype = np.float32
+                            elif dtype_str_l in ("bfloat16", "bf16"):
+                                # NumPy has no native bfloat16; read as float32.
+                                np_dtype = np.float32
+                        data = np.frombuffer(bytes_data,
+                                             dtype=np_dtype).reshape(
+                                                 shape).copy()
                     tensor = torch.from_numpy(data)
                     # if len(data.shape) == 3:
                     #     B, L, D = tensor.shape
