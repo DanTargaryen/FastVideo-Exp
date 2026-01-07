@@ -33,3 +33,4 @@ warp-denoising-step: true
 dataloader-num-workers: 4
 
 training-state-checkpointing-steps: 500
+independent-first-frame: true
