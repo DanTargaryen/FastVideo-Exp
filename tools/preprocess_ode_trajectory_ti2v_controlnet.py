@@ -49,6 +49,55 @@ from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 logger = init_logger(__name__)
 
 
+def _compute_negative_prompt_embeddings(
+    *,
+    tokenizer,
+    text_encoder,
+    negative_prompt: str,
+    max_sequence_length: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+) -> torch.Tensor:
+    encoder_device = next(text_encoder.parameters()).device
+    text_encoder.eval()
+    with torch.no_grad():
+        tokens = tokenizer(
+            [negative_prompt],
+            padding="max_length",
+            truncation=True,
+            max_length=max_sequence_length,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        prompt_embeds = text_encoder(
+            tokens.input_ids.to(encoder_device),
+            tokens.attention_mask.to(encoder_device),
+        ).last_hidden_state
+
+    seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())
+    seq_len = min(seq_len, prompt_embeds.shape[1])
+    prompt_embeds = prompt_embeds[:, :seq_len, :]
+    if prompt_embeds.shape[1] < max_sequence_length:
+        pad_len = max_sequence_length - prompt_embeds.shape[1]
+        pad = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
+        prompt_embeds = torch.cat([prompt_embeds, pad], dim=1)
+
+    return prompt_embeds.to(dtype=dtype, device=target_device)
+
+
+def _align_prompt_len(prompt_embeds: torch.Tensor,
+                      ref_embeds: torch.Tensor) -> torch.Tensor:
+    if prompt_embeds.shape[1] == ref_embeds.shape[1]:
+        return prompt_embeds
+    if prompt_embeds.shape[1] > ref_embeds.shape[1]:
+        return prompt_embeds[:, :ref_embeds.shape[1], :]
+    pad_len = ref_embeds.shape[1] - prompt_embeds.shape[1]
+    pad = prompt_embeds.new_zeros((prompt_embeds.shape[0], pad_len,
+                                   prompt_embeds.shape[2]))
+    return torch.cat([prompt_embeds, pad], dim=1)
+
+
 def _ensure_single_process_env() -> None:
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
@@ -231,6 +280,11 @@ def parse_args() -> argparse.Namespace:
                    type=float,
                    default=1.0,
                    help="CFG scale for teacher sampling (1.0 disables CFG)")
+    p.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="bad quality, worst quality",
+        help="Negative prompt text used when guidance_scale != 1.0.")
     p.add_argument("--teacher_mode",
                    type=str,
                    default="bidirectional",
@@ -325,6 +379,37 @@ def main() -> None:
         shift=float(args.flow_shift))
     timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
     sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
+    guidance_scale = float(args.guidance_scale)
+    negative_prompt_text = str(args.negative_prompt or "").strip()
+    negative_prompt_embeds: torch.Tensor | None = None
+    if guidance_scale != 1.0:
+        if negative_prompt_text:
+            tokenizer = PipelineComponentLoader.load_module(
+                "tokenizer",
+                str(Path(base_model) / "tokenizer"),
+                "transformers",
+                fastvideo_args,
+            )
+            text_encoder = PipelineComponentLoader.load_module(
+                "text_encoder",
+                str(Path(base_model) / "text_encoder"),
+                "transformers",
+                fastvideo_args,
+            )
+            max_text_len = int(getattr(transformer, "text_len", 226))
+            negative_prompt_embeds = _compute_negative_prompt_embeddings(
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                negative_prompt=negative_prompt_text,
+                max_sequence_length=max_text_len,
+                dtype=dtype,
+                target_device=device,
+            )
+            del tokenizer, text_encoder
+        else:
+            logger.warning(
+                "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
+            )
 
     # Load parquet indices
     parquet_files = _list_parquet_files(args.data_path)
@@ -470,10 +555,14 @@ def main() -> None:
                     block_controlnet_hidden_states=control_res,
                 ).permute(0, 2, 1, 3, 4)
 
-            if float(args.guidance_scale) == 1.0:
+            if guidance_scale == 1.0:
                 return pred_flow
 
-            negative = torch.zeros_like(text_embedding)
+            if negative_prompt_embeds is not None:
+                negative = _align_prompt_len(negative_prompt_embeds,
+                                             text_embedding)
+            else:
+                negative = torch.zeros_like(text_embedding)
             with set_forward_context(current_timestep=int(step_index),
                                      attn_metadata=None,
                                      forward_batch=forward_batch):
@@ -489,8 +578,7 @@ def main() -> None:
                     timestep,
                     block_controlnet_hidden_states=control_res_uncond,
                 ).permute(0, 2, 1, 3, 4)
-            scale = float(args.guidance_scale)
-            return pred_uncond + scale * (pred_flow - pred_uncond)
+            return pred_uncond + guidance_scale * (pred_flow - pred_uncond)
 
         # Euler update across timesteps
         for step_i in range(int(t_list.numel()) - 1):
