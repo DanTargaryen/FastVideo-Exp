@@ -183,6 +183,9 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         # [B, S, C, T, H, W] -> [B, S, T, C, H, W]
         trajectory_latents = trajectory_latents.permute(0, 1, 3, 2, 4, 5)
+        bsz, _steps, num_frames, num_channels, height, width = trajectory_latents.shape
+        training_batch.raw_latent_shape = torch.Size(
+            [bsz, num_channels, num_frames, height, width])
 
         device = get_local_torch_device()
         training_batch.encoder_hidden_states = encoder_hidden_states.to(
