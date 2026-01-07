@@ -277,18 +277,39 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         latent_model_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
         latent_model_input[:, :, :1] = first_frame_latent
-        control_dtype = next(self.controlnet.parameters()).dtype
-        transformer_dtype = next(self.transformer.parameters()).dtype
+        control_dtype = getattr(
+            getattr(self.controlnet, "patch_embedding", None),
+            "proj",
+            None,
+        )
+        control_dtype = (control_dtype.bias.dtype
+                         if control_dtype is not None
+                         and control_dtype.bias is not None else
+                         (control_dtype.weight.dtype
+                          if control_dtype is not None else
+                          next(self.controlnet.parameters()).dtype))
+        transformer_proj = getattr(getattr(self.transformer, "patch_embedding", None),
+                                   "proj", None)
+        transformer_dtype = (transformer_proj.weight.dtype
+                             if transformer_proj is not None else
+                             next(self.transformer.parameters()).dtype)
         if not hasattr(self, "_dtype_debug_logged"):
             self._dtype_debug_logged = True
             logger.info(
-                "dtypes: latent_model_input=%s encoder_hidden_states=%s control_latent=%s timestep=%s controlnet=%s transformer=%s",
+                "dtypes: latent_model_input=%s encoder_hidden_states=%s control_latent=%s timestep=%s controlnet=%s transformer=%s controlnet_proj=(w:%s b:%s) transformer_proj=%s",
                 latent_model_input.dtype,
                 encoder_hidden_states.dtype,
                 control_latent.dtype,
                 timestep.dtype,
                 control_dtype,
                 transformer_dtype,
+                (getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).weight.dtype
+                 if getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None) is not None else None),
+                (getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).bias.dtype
+                 if getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None) is not None
+                 and getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).bias is not None else None),
+                (getattr(getattr(self.transformer, "patch_embedding", None), "proj", None).weight.dtype
+                 if getattr(getattr(self.transformer, "patch_embedding", None), "proj", None) is not None else None),
             )
 
         batch = ForwardBatch(data_type="ti2v_controlnet")
