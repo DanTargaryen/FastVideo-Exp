@@ -34,6 +34,7 @@ from fastvideo.dataset.dataloader.record_schema import (
     ode_ti2v_controlnet_record_creator)
 from fastvideo.dataset.dataloader.schema import (
     pyarrow_schema_ode_trajectory_ti2v_controlnet)
+from fastvideo.configs.pipelines.base import PipelineConfig
 from fastvideo.distributed import (get_world_rank, get_world_size,
                                    maybe_init_distributed_environment_and_model_parallel)
 from fastvideo.fastvideo_args import ExecutionMode, FastVideoArgs, WorkloadType
@@ -281,10 +282,12 @@ def main() -> None:
     transformer_dir = args.transformer_dir or str(
         Path(base_model) / "transformer")
 
+    pipeline_config = PipelineConfig.from_pretrained(base_model)
     fastvideo_args = FastVideoArgs(
         model_path=base_model,
         mode=ExecutionMode.INFERENCE,
         workload_type=WorkloadType.I2V,
+        pipeline_config=pipeline_config,
         inference_mode=True,
         tp_size=1,
         sp_size=1,
