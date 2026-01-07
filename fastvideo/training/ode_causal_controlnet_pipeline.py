@@ -279,6 +279,17 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
         latent_model_input[:, :, :1] = first_frame_latent
         control_dtype = next(self.controlnet.parameters()).dtype
         transformer_dtype = next(self.transformer.parameters()).dtype
+        if not hasattr(self, "_dtype_debug_logged"):
+            self._dtype_debug_logged = True
+            logger.info(
+                "dtypes: latent_model_input=%s encoder_hidden_states=%s control_latent=%s timestep=%s controlnet=%s transformer=%s",
+                latent_model_input.dtype,
+                encoder_hidden_states.dtype,
+                control_latent.dtype,
+                timestep.dtype,
+                control_dtype,
+                transformer_dtype,
+            )
 
         batch = ForwardBatch(data_type="ti2v_controlnet")
         batch.prompt_embeds = [encoder_hidden_states]
