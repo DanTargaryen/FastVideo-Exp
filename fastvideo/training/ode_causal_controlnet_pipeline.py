@@ -277,6 +277,10 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         latent_model_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
         latent_model_input[:, :, :1] = first_frame_latent
+        model_dtype = next(self.transformer.parameters()).dtype
+        latent_model_input = latent_model_input.to(dtype=model_dtype)
+        encoder_hidden_states = encoder_hidden_states.to(dtype=model_dtype)
+        control_latent = control_latent.to(dtype=model_dtype)
 
         batch = ForwardBatch(data_type="ti2v_controlnet")
         batch.prompt_embeds = [encoder_hidden_states]
@@ -290,20 +294,20 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
             control_res = self.controlnet(
                 hidden_states=latent_model_input,
                 encoder_hidden_states=[encoder_hidden_states],
-                timestep=timestep.to(device, dtype=torch.bfloat16),
+                timestep=timestep.to(device, dtype=model_dtype),
                 controlnet_states=control_latent,
             )
             pred_flow = self.transformer(
                 latent_model_input,
                 [encoder_hidden_states],
-                timestep.to(device, dtype=torch.bfloat16),
+                timestep.to(device, dtype=model_dtype),
                 block_controlnet_hidden_states=control_res,
             ).permute(0, 2, 1, 3, 4)
 
         pred_video = pred_noise_to_pred_video(
             pred_noise=pred_flow.flatten(0, 1),
             noise_input_latent=noisy_input.flatten(0, 1),
-            timestep=timestep.to(dtype=torch.bfloat16).flatten(0, 1),
+            timestep=timestep.to(dtype=model_dtype).flatten(0, 1),
             scheduler=self.noise_scheduler).unflatten(0, pred_flow.shape[:2])
 
         latent_vis_dict["pred_video"] = pred_video.permute(
