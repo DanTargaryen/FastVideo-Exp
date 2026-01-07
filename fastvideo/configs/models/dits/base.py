@@ -25,6 +25,8 @@ class DiTArchConfig(ArchConfig):
     num_channels_latents: int = 0
     in_channels: int = 0
     out_channels: int = 0
+    # Optional text KV projection dim (for Wan2.2 / Diffusers configs).
+    added_kv_proj_dim: int | None = None
     exclude_lora_layers: list[str] = field(default_factory=list)
     boundary_ratio: float | None = None
 
