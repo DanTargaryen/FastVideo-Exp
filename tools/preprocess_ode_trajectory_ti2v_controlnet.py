@@ -389,6 +389,24 @@ def main() -> None:
         num_steps = int(args.num_steps)
 
         t_list = _build_schedule_timesteps(scheduler, num_steps, device)
+        expand_timesteps = bool(
+            getattr(fastvideo_args.pipeline_config, "expand_timesteps", False))
+        image_latents = first_frame_latent.to(
+            device=device, dtype=dtype) if first_frame_latent is not None else None
+        first_frame_mask = torch.ones(
+            (1, 1, latent_t, latent_h, latent_w),
+            device=device,
+            dtype=torch.float32,
+        )
+        if image_latents is not None:
+            first_frame_mask[:, :, 0] = 0
+        patch_size = getattr(
+            getattr(transformer.config, "arch_config", None),
+            "patch_size",
+            (2, 2),
+        )
+        patch_h = int(patch_size[-2])
+        patch_w = int(patch_size[-1])
 
         # Prepare forward context (needed by attention backends)
         forward_batch = ForwardBatch(data_type="ti2v_controlnet")
@@ -411,11 +429,30 @@ def main() -> None:
         traj_latents.append(current_latents.detach().clone())
 
         def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
-            timestep = torch.full((1, latent_t),
-                                  float(t_cur),
-                                  device=device,
-                                  dtype=torch.float32)
-            latent_model_input = current_latents
+            if expand_timesteps:
+                if image_latents is None:
+                    latent_model_input = current_latents
+                else:
+                    latent_model_input = (
+                        (1 - first_frame_mask) * image_latents +
+                        first_frame_mask * current_latents
+                    )
+                temp_ts = (first_frame_mask[0, 0] * float(t_cur))
+                temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
+                timestep = temp_ts.unsqueeze(0).expand(
+                    latent_model_input.shape[0], -1)
+            else:
+                if image_latents is None:
+                    latent_model_input = current_latents
+                else:
+                    latent_model_input = torch.cat(
+                        [current_latents, image_latents], dim=1)
+                timestep = torch.full((latent_model_input.shape[0],),
+                                      float(t_cur),
+                                      device=device,
+                                      dtype=torch.float32)
+            latent_model_input = latent_model_input.to(device=device,
+                                                       dtype=dtype)
 
             with set_forward_context(current_timestep=int(step_index),
                                      attn_metadata=None,
