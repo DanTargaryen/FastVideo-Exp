@@ -33,7 +33,7 @@ from fastvideo.layers.visual_embedding import (PatchEmbed)
 from fastvideo.logger import init_logger
 from fastvideo.models.dits.base import BaseDiT
 from fastvideo.models.dits.wanvideo import WanT2VCrossAttention, WanTimeTextImageEmbedding
-from fastvideo.platforms import AttentionBackendEnum
+from fastvideo.platforms import AttentionBackendEnum, current_platform
 
 logger = init_logger(__name__)
 class CausalWanSelfAttention(nn.Module):
