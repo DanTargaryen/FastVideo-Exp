@@ -36,7 +36,7 @@ from fastvideo.dataset.dataloader.schema import (
     pyarrow_schema_ode_trajectory_ti2v_controlnet)
 from fastvideo.distributed import (get_world_rank, get_world_size,
                                    maybe_init_distributed_environment_and_model_parallel)
-from fastvideo.fastvideo_args import FastVideoArgs
+from fastvideo.fastvideo_args import ExecutionMode, FastVideoArgs, WorkloadType
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
@@ -283,8 +283,8 @@ def main() -> None:
 
     fastvideo_args = FastVideoArgs(
         model_path=base_model,
-        mode="inference",
-        workload_type="i2v",
+        mode=ExecutionMode.INFERENCE,
+        workload_type=WorkloadType.I2V,
         inference_mode=True,
         tp_size=1,
         sp_size=1,
