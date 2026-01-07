@@ -277,39 +277,22 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         latent_model_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
         latent_model_input[:, :, :1] = first_frame_latent
-        control_dtype = getattr(
-            getattr(self.controlnet, "patch_embedding", None),
-            "proj",
-            None,
-        )
-        control_dtype = (control_dtype.bias.dtype
-                         if control_dtype is not None
-                         and control_dtype.bias is not None else
-                         (control_dtype.weight.dtype
-                          if control_dtype is not None else
-                          next(self.controlnet.parameters()).dtype))
-        transformer_proj = getattr(getattr(self.transformer, "patch_embedding", None),
-                                   "proj", None)
-        transformer_dtype = (transformer_proj.weight.dtype
-                             if transformer_proj is not None else
-                             next(self.transformer.parameters()).dtype)
+        from fastvideo.utils import get_compute_dtype
+        model_dtype = get_compute_dtype()
         if not hasattr(self, "_dtype_debug_logged"):
             self._dtype_debug_logged = True
+            ctrl_proj = getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None)
+            tr_proj = getattr(getattr(self.transformer, "patch_embedding", None), "proj", None)
             logger.info(
-                "dtypes: latent_model_input=%s encoder_hidden_states=%s control_latent=%s timestep=%s controlnet=%s transformer=%s controlnet_proj=(w:%s b:%s) transformer_proj=%s",
+                "dtypes: latent_model_input=%s encoder_hidden_states=%s control_latent=%s timestep=%s compute=%s ctrl_proj=(w:%s b:%s) tr_proj=%s",
                 latent_model_input.dtype,
                 encoder_hidden_states.dtype,
                 control_latent.dtype,
                 timestep.dtype,
-                control_dtype,
-                transformer_dtype,
-                (getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).weight.dtype
-                 if getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None) is not None else None),
-                (getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).bias.dtype
-                 if getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None) is not None
-                 and getattr(getattr(self.controlnet, "patch_embedding", None), "proj", None).bias is not None else None),
-                (getattr(getattr(self.transformer, "patch_embedding", None), "proj", None).weight.dtype
-                 if getattr(getattr(self.transformer, "patch_embedding", None), "proj", None) is not None else None),
+                model_dtype,
+                (ctrl_proj.weight.dtype if ctrl_proj is not None else None),
+                (ctrl_proj.bias.dtype if ctrl_proj is not None and ctrl_proj.bias is not None else None),
+                (tr_proj.weight.dtype if tr_proj is not None else None),
             )
 
         batch = ForwardBatch(data_type="ti2v_controlnet")
@@ -322,26 +305,22 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
                                  attn_metadata=None,
                                  forward_batch=batch):
             control_res = self.controlnet(
-                hidden_states=latent_model_input.to(dtype=control_dtype),
-                encoder_hidden_states=[encoder_hidden_states.to(dtype=control_dtype)],
-                timestep=timestep.to(device, dtype=control_dtype),
-                controlnet_states=control_latent.to(dtype=control_dtype),
+                hidden_states=latent_model_input.to(dtype=model_dtype),
+                encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
+                timestep=timestep.to(device, dtype=model_dtype),
+                controlnet_states=control_latent.to(dtype=model_dtype),
             )
-            if transformer_dtype != control_dtype:
-                control_res = tuple(
-                    x.to(dtype=transformer_dtype) for x in control_res
-                )
             pred_flow = self.transformer(
-                latent_model_input.to(dtype=transformer_dtype),
-                [encoder_hidden_states.to(dtype=transformer_dtype)],
-                timestep.to(device, dtype=transformer_dtype),
+                latent_model_input.to(dtype=model_dtype),
+                [encoder_hidden_states.to(dtype=model_dtype)],
+                timestep.to(device, dtype=model_dtype),
                 block_controlnet_hidden_states=control_res,
             ).permute(0, 2, 1, 3, 4)
 
         pred_video = pred_noise_to_pred_video(
             pred_noise=pred_flow.flatten(0, 1),
             noise_input_latent=noisy_input.flatten(0, 1),
-            timestep=timestep.to(dtype=transformer_dtype).flatten(0, 1),
+            timestep=timestep.to(dtype=model_dtype).flatten(0, 1),
             scheduler=self.noise_scheduler).unflatten(0, pred_flow.shape[:2])
 
         latent_vis_dict["pred_video"] = pred_video.permute(
