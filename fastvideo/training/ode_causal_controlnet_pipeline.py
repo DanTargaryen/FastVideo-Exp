@@ -368,7 +368,14 @@ def _ensure_first_frame(x: torch.Tensor) -> torch.Tensor:
     elif x.dim() == 4:
         x = x.unsqueeze(2)
     elif x.dim() == 5:
-        return x
+        # Accept [B, F, C, H, W] and convert to [B, C, F, H, W].
+        if x.shape[1] in (1, 3) and x.shape[2] >= 8:
+            x = x.permute(0, 2, 1, 3, 4).contiguous()
+    else:
+        raise ValueError(f"Unsupported first_frame_latent shape: {tuple(x.shape)}")
+    if x.shape[2] != 1:
+        raise ValueError(
+            f"first_frame_latent must have F==1, got shape={tuple(x.shape)}")
     return x
 
 
