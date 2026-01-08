@@ -32,5 +32,5 @@ dmd-denoising-steps: "1000,750,500,250"
 warp-denoising-step: true
 dataloader-num-workers: 4
 
-training-state-checkpointing-steps: 500
+training-state-checkpointing-steps: 250
 independent-first-frame: true
