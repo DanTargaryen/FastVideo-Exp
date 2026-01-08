@@ -229,7 +229,8 @@ def save_checkpoint(transformer,
                     optimizer=None,
                     dataloader=None,
                     scheduler=None,
-                    noise_generator=None) -> None:
+                    noise_generator=None,
+                    controlnet=None) -> None:
     """
     Save checkpoint following finetrainer's distributed checkpoint approach.
     Saves both distributed checkpoint and consolidated model weights.
@@ -237,13 +238,28 @@ def save_checkpoint(transformer,
     save_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(save_dir, exist_ok=True)
 
+    # If the optimizer includes parameters not present in `transformer`
+    # (e.g. when training an external ControlNet), wrap the involved modules
+    # under a single container so DCP can map optimizer state correctly.
+    class _CheckpointContainer(torch.nn.Module):
+        def __init__(self, **modules):
+            super().__init__()
+            for name, module in modules.items():
+                if module is not None:
+                    setattr(self, name, module)
+
+    ckpt_model = transformer
+    if controlnet is not None:
+        ckpt_model = _CheckpointContainer(
+            transformer=transformer, controlnet=controlnet)
+
     states = {
-        "model": ModelWrapper(transformer),
+        "model": ModelWrapper(ckpt_model),
         "random_state": RandomStateWrapper(noise_generator),
     }
 
     if optimizer is not None:
-        states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+        states["optimizer"] = OptimizerWrapper(ckpt_model, optimizer)
 
     if dataloader is not None:
         states["dataloader"] = dataloader
@@ -695,7 +711,8 @@ def load_checkpoint(transformer,
                     optimizer=None,
                     dataloader=None,
                     scheduler=None,
-                    noise_generator=None) -> int:
+                    noise_generator=None,
+                    controlnet=None) -> int:
     """
     Load checkpoint following finetrainer's distributed checkpoint approach.
     Returns the step number from which training should resume.
@@ -718,13 +735,25 @@ def load_checkpoint(transformer,
                        dcp_dir)
         return 0
 
+    class _CheckpointContainer(torch.nn.Module):
+        def __init__(self, **modules):
+            super().__init__()
+            for name, module in modules.items():
+                if module is not None:
+                    setattr(self, name, module)
+
+    ckpt_model = transformer
+    if controlnet is not None:
+        ckpt_model = _CheckpointContainer(
+            transformer=transformer, controlnet=controlnet)
+
     states = {
-        "model": ModelWrapper(transformer),
+        "model": ModelWrapper(ckpt_model),
         "random_state": RandomStateWrapper(noise_generator),
     }
 
     if optimizer is not None:
-        states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+        states["optimizer"] = OptimizerWrapper(ckpt_model, optimizer)
 
     if dataloader is not None:
         states["dataloader"] = dataloader

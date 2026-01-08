@@ -532,11 +532,14 @@ class TrainingPipeline(LoRAPipeline, ABC):
     def _resume_from_checkpoint(self) -> None:
         logger.info("Loading checkpoint from %s",
                     self.training_args.resume_from_checkpoint)
+        controlnet = getattr(self, "controlnet", None)
         resumed_step = load_checkpoint(
-            self.transformer, self.global_rank,
+            self.transformer,
+            self.global_rank,
             self.training_args.resume_from_checkpoint, self.optimizer,
             self.train_dataloader, self.lr_scheduler,
-            self.noise_random_generator)
+            self.noise_random_generator,
+            controlnet=controlnet)
         if resumed_step > 0:
             self.init_steps = resumed_step
             logger.info("Successfully resumed from step %s", resumed_step)
@@ -659,11 +662,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
             if step % self.training_args.training_state_checkpointing_steps == 0:
                 with self.profiler_controller.region(
                         "profiler_region_training_save_checkpoint"):
+                    controlnet = getattr(self, "controlnet", None)
                     save_checkpoint(self.transformer, self.global_rank,
                                     self.training_args.output_dir, step,
                                     self.optimizer, self.train_dataloader,
                                     self.lr_scheduler,
-                                    self.noise_random_generator)
+                                    self.noise_random_generator,
+                                    controlnet=controlnet)
                 self.transformer.train()
                 self.sp_group.barrier()
             if self.training_args.log_validation and step % self.training_args.validation_steps == 0:
@@ -683,11 +688,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
                         gpu_memory_usage, trainable_params)
 
         self.tracker.finish()
+        controlnet = getattr(self, "controlnet", None)
         save_checkpoint(self.transformer, self.global_rank,
                         self.training_args.output_dir,
                         self.training_args.max_train_steps, self.optimizer,
                         self.train_dataloader, self.lr_scheduler,
-                        self.noise_random_generator)
+                        self.noise_random_generator,
+                        controlnet=controlnet)
 
         if envs.FASTVIDEO_TORCH_PROFILER_DIR:
             logger.info("Stopping profiler...")
