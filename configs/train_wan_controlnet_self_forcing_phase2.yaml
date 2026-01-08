@@ -37,7 +37,7 @@ init_controlnet_weights_from_safetensors: ""
 # init_controlnet_weights_from_safetensors: /path/to/student_controlnet_init.safetensors
 
 # ---- Dataset ----
-data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_8
+data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_120
 dataloader_num_workers: 2
 train_batch_size: 1
 train_sp_batch_size: 1
@@ -59,7 +59,7 @@ real_score_guidance_scale: 5
 training_cfg_rate: 0.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
 dmd_denoising_steps: "1000,750,500,250"
-warp_denoising_step: false
+warp_denoising_step: true
 negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 # ---- Training ----
