@@ -71,9 +71,9 @@ betas: "0.9,0.999"
 mixed_precision: bf16
 max_grad_norm: 1.0
 enable_gradient_checkpointing_type: full
-# Disable EMA to save GPU memory (EMA keeps an extra copy of generator weights).
-ema_decay: 0.0
-ema_start_step: 0
+# Enable EMA to stabilize training (adds extra memory).
+ema_decay: 0.999
+ema_start_step: 200
 seed: 1024
 
 # ---- Parallelism (8 GPUs typical) ----
