@@ -21,6 +21,7 @@ from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
 
 from fastvideo.models.schedulers.scheduling_self_forcing_flow_match import SelfForcingFlowMatchScheduler
+from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.training.distillation_pipeline import DistillationPipeline
@@ -67,9 +68,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         except Exception:
             logger.info("Entered initialize_training_pipeline (rank unknown)")
 
+        flow_shift = getattr(training_args.pipeline_config, "flow_shift", None)
+        if flow_shift is None:
+            flow_shift = 5.0
         self.noise_scheduler = SelfForcingFlowMatchScheduler(
             num_inference_steps=1000,
-            shift=5.0,
+            shift=float(flow_shift),
             sigma_min=0.0,
             extra_one_step=True,
             training=True)
@@ -88,11 +92,85 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         self.kv_cache1: list[dict[str, Any]] | None = None
         self.crossattn_cache: list[dict[str, Any]] | None = None
 
+        neg_prompt = str(getattr(training_args, "negative_prompt", "") or "").strip()
+        if neg_prompt:
+            model_root = training_args.pretrained_model_name_or_path or training_args.model_path
+            tokenizer = PipelineComponentLoader.load_module(
+                "tokenizer",
+                os.path.join(model_root, "tokenizer"),
+                "transformers",
+                training_args,
+            )
+            text_encoder = PipelineComponentLoader.load_module(
+                "text_encoder",
+                os.path.join(model_root, "text_encoder"),
+                "transformers",
+                training_args,
+            )
+            max_text_len = int(getattr(self.transformer, "text_len", 226))
+            self.negative_prompt_embeds, self.negative_prompt_attention_mask = (
+                _compute_negative_prompt_embeddings(
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    negative_prompt=neg_prompt,
+                    max_sequence_length=max_text_len,
+                    dtype=torch.bfloat16,
+                    target_device=get_local_torch_device(),
+                )
+            )
+            logger.info("Using training negative_prompt: %s", neg_prompt)
+            del tokenizer, text_encoder
+
         logger.info("Self-forcing generator update ratio: %s",
                     self.dfake_gen_update_ratio)
         logger.info("RANK: %s, exiting initialize_training_pipeline",
                     self.global_rank,
                     local_main_process_only=False)
+
+
+def _compute_negative_prompt_embeddings(
+    *,
+    tokenizer,
+    text_encoder,
+    negative_prompt: str,
+    max_sequence_length: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert negative_prompt, "Negative prompt must be provided for CFG."
+    encoder_device = next(text_encoder.parameters()).device
+    text_encoder.eval()
+    with torch.no_grad():
+        tokens = tokenizer(
+            [negative_prompt],
+            padding="max_length",
+            truncation=True,
+            max_length=max_sequence_length,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        prompt_embeds = text_encoder(
+            tokens.input_ids.to(encoder_device),
+            tokens.attention_mask.to(encoder_device),
+        ).last_hidden_state
+
+    attn_mask = tokens.attention_mask
+    seq_len = int(attn_mask.sum(dim=1)[0].item())
+    seq_len = min(seq_len, prompt_embeds.shape[1])
+    prompt_embeds = prompt_embeds[:, :seq_len, :]
+    attn_mask = attn_mask[:, :seq_len]
+
+    if prompt_embeds.shape[1] < max_sequence_length:
+        pad_len = max_sequence_length - prompt_embeds.shape[1]
+        pad_embed = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
+        prompt_embeds = torch.cat([prompt_embeds, pad_embed], dim=1)
+        pad_mask = attn_mask.new_zeros((1, pad_len))
+        attn_mask = torch.cat([attn_mask, pad_mask], dim=1)
+
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=target_device)
+    attn_mask = attn_mask.to(dtype=dtype, device=target_device)
+    return prompt_embeds, attn_mask
 
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int,
                                device: torch.device) -> list[int]:

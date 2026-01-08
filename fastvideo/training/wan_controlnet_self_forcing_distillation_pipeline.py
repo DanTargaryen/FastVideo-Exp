@@ -72,12 +72,19 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         if training_args.controlnet_model_path:
             logger.info("Loading student controlnet from: %s",
                         training_args.controlnet_model_path)
-            self.controlnet = PipelineComponentLoader.load_module(
-                module_name="controlnet",
-                component_model_path=training_args.controlnet_model_path,
-                transformers_or_diffusers="diffusers",
-                fastvideo_args=training_args,
-            )
+            prev_cn_override = getattr(training_args,
+                                       "override_controlnet_cls_name", None)
+            # Align student with causal inference path.
+            training_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+            try:
+                self.controlnet = PipelineComponentLoader.load_module(
+                    module_name="controlnet",
+                    component_model_path=training_args.controlnet_model_path,
+                    transformers_or_diffusers="diffusers",
+                    fastvideo_args=training_args,
+                )
+            finally:
+                training_args.override_controlnet_cls_name = prev_cn_override
             modules["controlnet"] = self.controlnet
         else:
             self.controlnet = None

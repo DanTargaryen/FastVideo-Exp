@@ -758,6 +758,7 @@ class TrainingArgs(FastVideoArgs):
     trackers: list[str] = dataclasses.field(default_factory=list)
     tracker_project_name: str = ""
     wandb_run_name: str = ""
+    wandb_mode: str = ""
     seed: int | None = None
 
     # output
@@ -841,6 +842,7 @@ class TrainingArgs(FastVideoArgs):
     same_step_across_blocks: bool = False  # Use same exit timestep for all blocks
     last_step_only: bool = False  # Only use the last timestep for training
     context_noise: int = 0  # Context noise level for cache updates
+    negative_prompt: str = ""  # Optional negative prompt for teacher CFG
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "TrainingArgs":
@@ -944,6 +946,18 @@ class TrainingArgs(FastVideoArgs):
                             type=str,
                             required=True,
                             help="Path to pretrained model or model name")
+        parser.add_argument(
+            "--wandb-mode",
+            type=str,
+            default="",
+            help="Optional WANDB_MODE (e.g. offline) for training runs",
+        )
+        parser.add_argument(
+            "--negative-prompt",
+            type=str,
+            default="",
+            help="Optional negative prompt text used for teacher CFG during training",
+        )
         parser.add_argument("--dit-model-name-or-path",
                             type=str,
                             required=False,

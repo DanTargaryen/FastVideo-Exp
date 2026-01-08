@@ -1275,10 +1275,23 @@ def main() -> None:
                         type=int,
                         default=0,
                         help="Context timestep used for cache update (0 = clean).")
-    parser.add_argument("--warp_denoising_step",
-                        action="store_true",
-                        default=True,
-                        help="Snap DMD anchors (0..1000) to the nearest values in scheduler.timesteps.")
+    warp_group = parser.add_mutually_exclusive_group()
+    warp_group.add_argument(
+        "--warp_denoising_step",
+        dest="warp_denoising_step",
+        action="store_true",
+        default=True,
+        help=(
+            "Snap DMD anchors (0..1000) to the nearest values in scheduler.timesteps. "
+            "Enabled by default to match training behavior."
+        ),
+    )
+    warp_group.add_argument(
+        "--no_warp_denoising_step",
+        dest="warp_denoising_step",
+        action="store_false",
+        help="Disable warping and treat dmd_steps as real timesteps.",
+    )
     parser.add_argument("--dtype",
                         type=str,
                         default="bf16",
@@ -1363,7 +1376,8 @@ def main() -> None:
         fastvideo_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
-    fastvideo_args.pipeline_config.warp_denoising_step = True
+    fastvideo_args.pipeline_config.warp_denoising_step = bool(
+        args.warp_denoising_step)
     fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps if dmd_steps_list is not None else []
     fastvideo_args.pipeline_config.context_noise = int(args.context_noise)
 
@@ -1512,7 +1526,7 @@ def main() -> None:
                 dmd_steps=dmd_steps_list,
                 timestep_indices=timestep_indices_list,
                 context_noise=args.context_noise,
-                warp_denoising_step=True,
+                warp_denoising_step=bool(args.warp_denoising_step),
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
@@ -1538,7 +1552,7 @@ def main() -> None:
                 dmd_steps=dmd_steps_list,
                 timestep_indices=timestep_indices_list,
                 context_noise=args.context_noise,
-                warp_denoising_step=True,
+                warp_denoising_step=bool(args.warp_denoising_step),
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=bool(args.first_frame_timestep_zero),

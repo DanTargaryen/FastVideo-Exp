@@ -92,6 +92,9 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
     def initialize_training_pipeline(self, training_args: TrainingArgs):
         logger.info("Initializing training pipeline...")
+        wandb_mode = str(getattr(training_args, "wandb_mode", "") or "").strip()
+        if wandb_mode:
+            os.environ["WANDB_MODE"] = wandb_mode
         self.device = get_local_torch_device()
         self.training_args = training_args
         world_group = get_world_group()

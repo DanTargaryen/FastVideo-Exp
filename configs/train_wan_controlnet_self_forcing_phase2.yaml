@@ -26,8 +26,8 @@ controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_wei
 real_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
 fake_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
 
-init_weights_from_safetensors: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/stu_phase1/phase1_fastvideo_inits/transformer_init.safetensors
-init_controlnet_weights_from_safetensors: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/stu_phase1/phase1_fastvideo_inits/controlnet_init.safetensors
+init_weights_from_safetensors: ""
+init_controlnet_weights_from_safetensors: ""
 
 # Optional: initialize STUDENT transformer weights from a custom safetensors file.
 # You can create this from your Diff-Factory fp32 state_dict via the helper script:
@@ -37,7 +37,7 @@ init_controlnet_weights_from_safetensors: /apdcephfs_zwfy2/share_303204533/suanh
 # init_controlnet_weights_from_safetensors: /path/to/student_controlnet_init.safetensors
 
 # ---- Dataset ----
-data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_120
+data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_8
 dataloader_num_workers: 2
 train_batch_size: 1
 train_sp_batch_size: 1
@@ -55,16 +55,17 @@ context_noise: 0
 dfake_gen_update_ratio: 5
 
 # ---- DMD / CFG ----
-real_score_guidance_scale: 3.5
+real_score_guidance_scale: 5
 training_cfg_rate: 0.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
 dmd_denoising_steps: "1000,750,500,250"
-warp_denoising_step: true
+warp_denoising_step: false
+negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 # ---- Training ----
 max_train_steps: 4000
 gradient_accumulation_steps: 4
-learning_rate: 2.0e-6
+learning_rate: 2.0e-5
 weight_decay: 0.01
 betas: "0.9,0.999"
 mixed_precision: bf16
@@ -84,7 +85,7 @@ hsdp_shard_dim: 8
 num_gpus: 8
 
 # ---- Scheduler ----
-flow_shift: 8
+flow_shift: 5
 
 # ---- Checkpointing / logs ----
 output_dir: outputs/wan_controlnet_self_forcing_phase2
@@ -102,8 +103,9 @@ log_validation: false
 # Enable wandb by setting `tracker_project_name` (FastVideo will auto-enable WANDB on rank0).
 tracker_project_name: worldrender_phase2
 wandb_run_name: wan_controlnet_self_forcing_phase2
+wandb_mode: offline
 
 # At each checkpoint save, decode the current student "clean" latent prediction and log/save an mp4.
 checkpoint_preview: true
-checkpoint_preview_fps: 24
+checkpoint_preview_fps: 16
 checkpoint_preview_max_frames: 0
