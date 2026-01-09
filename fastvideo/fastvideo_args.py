@@ -765,6 +765,7 @@ class TrainingArgs(FastVideoArgs):
     output_dir: str = ""
     checkpoints_total_limit: int = 0
     resume_from_checkpoint: str = ""  # specify the checkpoint folder to resume from
+    resume_weights_only: bool = False  # resume model weights only, skip optimizer/scheduler/dataloader
 
     # optimizer & scheduler
     num_train_epochs: int = 0
@@ -1059,6 +1060,12 @@ class TrainingArgs(FastVideoArgs):
         parser.add_argument("--resume-from-checkpoint",
                             type=str,
                             help="Path to checkpoint to resume from")
+        parser.add_argument(
+            "--resume-weights-only",
+            action=StoreBoolean,
+            help=
+            "Resume model weights only (skip optimizer/scheduler/dataloader states)."
+        )
         parser.add_argument("--logging-dir",
                             type=str,
                             help="Directory for logging")

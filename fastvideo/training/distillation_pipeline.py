@@ -1093,17 +1093,37 @@ class DistillationPipeline(TrainingPipeline):
         logger.info("Loading distillation checkpoint from %s",
                     self.training_args.resume_from_checkpoint)
 
+        resume_weights_only = bool(
+            getattr(self.training_args, "resume_weights_only", False))
+        if resume_weights_only:
+            logger.warning(
+                "resume_weights_only=True: skipping optimizer/scheduler/dataloader/RNG state restore; "
+                "LR schedule will restart from initial settings.")
+            generator_optimizer = None
+            fake_score_optimizer = None
+            dataloader = None
+            generator_scheduler = None
+            fake_score_scheduler = None
+            noise_generator = None
+        else:
+            generator_optimizer = self.optimizer
+            fake_score_optimizer = self.fake_score_optimizer
+            dataloader = self.train_dataloader
+            generator_scheduler = self.lr_scheduler
+            fake_score_scheduler = self.fake_score_lr_scheduler
+            noise_generator = self.noise_random_generator
+
         resumed_step = load_distillation_checkpoint(
             self.transformer,
             self.fake_score_transformer,
             self.global_rank,
             self.training_args.resume_from_checkpoint,
-            self.optimizer,
-            self.fake_score_optimizer,
-            self.train_dataloader,
-            self.lr_scheduler,
-            self.fake_score_lr_scheduler,
-            self.noise_random_generator,
+            generator_optimizer,
+            fake_score_optimizer,
+            dataloader,
+            generator_scheduler,
+            fake_score_scheduler,
+            noise_generator,
             self.generator_ema,
             generator_controlnet=getattr(self, "controlnet", None),
             fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
