@@ -362,6 +362,37 @@ def save_distillation_checkpoint(
         fake_score_scheduler_2: Scheduler for fake_score_transformer_2 (optional)
         generator_ema_2: EMA for generator_transformer_2 (optional)
     """
+    def _ensure_adam_state(optimizer: torch.optim.Optimizer | None) -> None:
+        if optimizer is None:
+            return
+        if not isinstance(optimizer,
+                          (torch.optim.Adam, torch.optim.AdamW)):
+            return
+        for group in optimizer.param_groups:
+            for p in group.get("params", []):
+                if p is None:
+                    continue
+                state = optimizer.state.setdefault(p, {})
+                if "step" not in state:
+                    state["step"] = torch.tensor(0,
+                                                 dtype=torch.int64,
+                                                 device=p.device)
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(
+                        p.data, memory_format=torch.preserve_format)
+                if "exp_avg_sq" not in state:
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p.data, memory_format=torch.preserve_format)
+                if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
+                    state["max_exp_avg_sq"] = torch.zeros_like(
+                        p.data, memory_format=torch.preserve_format)
+
+    # Ensure optimizer state is complete for all params to avoid resume failures.
+    _ensure_adam_state(generator_optimizer)
+    _ensure_adam_state(fake_score_optimizer)
+    _ensure_adam_state(generator_optimizer_2)
+    _ensure_adam_state(fake_score_optimizer_2)
+
     save_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(save_dir, exist_ok=True)
 
