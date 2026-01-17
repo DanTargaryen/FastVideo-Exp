@@ -1,9 +1,9 @@
 mode: distillation
 workload_type: i2v
 inference_mode: false
-pretrained_model_name_or_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
+pretrained_model_name_or_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
 data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_ode_0_120
 output_dir: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_ckpt
 

@@ -1390,6 +1390,18 @@ def main() -> None:
         "transformer", args.transformer_dir, "diffusers", fastvideo_args)
     controlnet = PipelineComponentLoader.load_module(
         "controlnet", args.controlnet_dir, "diffusers", fastvideo_args)
+    if controlnet is None:
+        logger.warning(
+            "ControlNet loader returned None; retrying direct ControlNetLoader for %s",
+            args.controlnet_dir,
+        )
+        from fastvideo.models.loader.component_loader import ControlNetLoader
+        controlnet = ControlNetLoader().load(args.controlnet_dir, fastvideo_args)
+    if controlnet is None:
+        raise RuntimeError(
+            f"ControlNet load failed for {args.controlnet_dir}. "
+            "Ensure the directory contains config.json and *.safetensors."
+        )
     if args.init_transformer_safetensors and not args.init_controlnet_safetensors:
         logger.warning(
             "You set --init_transformer_safetensors but did not set --init_controlnet_safetensors. "

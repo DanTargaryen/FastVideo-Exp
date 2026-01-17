@@ -17,14 +17,14 @@ dit_precision: fp32
 inference_mode: false
 
 # ---- Paths ----
-pretrained_model_name_or_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-real_score_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
-fake_score_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+pretrained_model_name_or_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+real_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+fake_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 
-controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
-real_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
-fake_score_controlnet_model_path: /apdcephfs_zwfy2/share_303204533/suanhuang/pretrained_weights/worldrender/world-renderer-controlnet-warp-mask
+controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
+real_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
+fake_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
 
 init_weights_from_safetensors: ""
 init_controlnet_weights_from_safetensors: ""
@@ -37,7 +37,7 @@ init_controlnet_weights_from_safetensors: ""
 # init_controlnet_weights_from_safetensors: /path/to/student_controlnet_init.safetensors
 
 # ---- Dataset ----
-data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_parquet_0_120
+data_path: /vePFS-buaa/linming/workspace/worldrender/remote_data/omnigame_ti2v_controlnet_parquet_0_120
 dataloader_num_workers: 2
 train_batch_size: 1
 train_sp_batch_size: 1
