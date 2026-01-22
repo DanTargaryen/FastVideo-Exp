@@ -103,7 +103,7 @@ log_validation: false
 # Enable wandb by setting `tracker_project_name` (FastVideo will auto-enable WANDB on rank0).
 tracker_project_name: worldrender_phase2
 wandb_run_name: wan_controlnet_self_forcing_phase2
-wandb_mode: offline
+wandb_mode: online
 
 # At each checkpoint save, decode the current student "clean" latent prediction and log/save an mp4.
 checkpoint_preview: true
