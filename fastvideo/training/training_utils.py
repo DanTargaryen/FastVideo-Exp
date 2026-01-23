@@ -282,6 +282,9 @@ def save_checkpoint(transformer,
                 local_main_process_only=False)
 
     cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
+    controlnet_cpu_state = None
+    if controlnet is not None:
+        controlnet_cpu_state = gather_state_dict_on_cpu_rank0(controlnet, device=None)
     if rank == 0:
         # Save model weights (consolidated)
         transformer_save_dir = os.path.join(save_dir, "transformer")
@@ -312,6 +315,38 @@ def save_checkpoint(transformer,
         with open(config_path, "w") as f:
             json.dump(config_dict, f, indent=4)
         logger.info("--> checkpoint saved at step %s to %s", step, weight_path)
+
+        if controlnet is not None and controlnet_cpu_state is not None:
+            reverse_mapping = getattr(controlnet, "reverse_param_names_mapping", {})
+            if not reverse_mapping:
+                logger.warning(
+                    "controlnet reverse_param_names_mapping is empty; skipping consolidated controlnet export."
+                )
+            else:
+                controlnet_save_dir = os.path.join(
+                    save_dir, "generator_inference_controlnet")
+                os.makedirs(controlnet_save_dir, exist_ok=True)
+                controlnet_weight_path = os.path.join(
+                    controlnet_save_dir, "diffusion_pytorch_model.safetensors")
+                logger.info("rank: %s, saving controlnet checkpoint to %s",
+                            rank,
+                            controlnet_weight_path,
+                            local_main_process_only=False)
+                controlnet_state = custom_to_hf_state_dict(
+                    controlnet_cpu_state, reverse_mapping)
+                save_file(controlnet_state, controlnet_weight_path)
+
+                controlnet_config = getattr(controlnet, "hf_config", {})
+                if isinstance(controlnet_config, dict):
+                    controlnet_config = dict(controlnet_config)
+                    if "dtype" in controlnet_config:
+                        del controlnet_config["dtype"]
+                controlnet_config_path = os.path.join(controlnet_save_dir,
+                                                      "config.json")
+                with open(controlnet_config_path, "w") as f:
+                    json.dump(controlnet_config, f, indent=4)
+                logger.info("--> controlnet checkpoint saved at step %s to %s",
+                            step, controlnet_weight_path)
 
 
 def save_distillation_checkpoint(
