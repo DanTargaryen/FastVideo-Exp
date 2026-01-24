@@ -4,8 +4,8 @@ inference_mode: false
 pretrained_model_name_or_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
-data_path: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/omnigame_ti2v_controlnet_ode_0_120
-output_dir: /apdcephfs_cq5/share_300600172/suanhuang/users/linming/worldrender/phase1_ckpt
+data_path: /vePFS-buaa/linming/workspace/worldrender/remote_data/omnigame_ti2v_controlnet_parquet_0_120
+output_dir: /vePFS-buaa/linming/workspace/worldrender/phase1_ckpt
 
 train_batch_size: 1
 train_sp_batch_size: 1
