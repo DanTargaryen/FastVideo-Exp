@@ -74,6 +74,36 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
 
+def _override_local_attn_size(model: torch.nn.Module, local_attn_size: int) -> None:
+    """
+    Force causal self-attention to use a sliding local window (in *latent frames*).
+
+    IMPORTANT:
+    - KV cache allocation in this script consults `model.local_attn_size` (top-level).
+    - Eviction/windowing during forward consults each `CausalWanSelfAttention.local_attn_size`.
+      So we must set BOTH for the override to take effect.
+    """
+    if int(local_attn_size) <= 0:
+        return
+
+    # Top-level attribute used by KV cache initialization.
+    try:
+        setattr(model, "local_attn_size", int(local_attn_size))
+    except Exception:
+        pass
+
+    # Per-block attention modules used during forward.
+    for m in model.modules():
+        if m.__class__.__name__ != "CausalWanSelfAttention":
+            continue
+        try:
+            m.local_attn_size = int(local_attn_size)
+            # Keep logic consistent with module __init__.
+            if hasattr(m, "max_attention_size"):
+                m.max_attention_size = int(local_attn_size) * 1560
+        except Exception:
+            continue
+
 
 def _ensure_single_process_dist_env() -> None:
     os.environ.setdefault("RANK", "0")
@@ -319,9 +349,14 @@ def _load_sample(data_path: str, index: int) -> Sample:
                   control_latent_bcfhw=control_latent)
 
 
-def _initialize_kv_cache(*, model, batch_size: int, dtype: torch.dtype,
+def _initialize_kv_cache(*,
+                         model,
+                         batch_size: int,
+                         dtype: torch.dtype,
                          device: torch.device,
-                         frame_seq_length: int) -> list[dict]:
+                         frame_seq_length: int,
+                         sliding_window_num_frames_override: int | None = None
+                         ) -> list[dict]:
     num_blocks = len(model.blocks)
     # Different model variants expose these attributes differently.
     # - CausalWanTransformer3DModel / CausalWanControlnet3DModel: has `num_attention_heads` + `attention_head_dim`
@@ -353,10 +388,21 @@ def _initialize_kv_cache(*, model, batch_size: int, dtype: torch.dtype,
     head_dim = int(head_dim)
 
     local_attn_size = getattr(model, "local_attn_size", -1)
-    sliding_window_num_frames = model.config.arch_config.sliding_window_num_frames
+    sliding_window_num_frames = int(
+        sliding_window_num_frames_override
+        if sliding_window_num_frames_override is not None else
+        getattr(model.config.arch_config, "sliding_window_num_frames", 0))
     if local_attn_size != -1:
         kv_cache_size = local_attn_size * frame_seq_length
     else:
+        # Some checkpoints/configs may set sliding_window_num_frames=0. That would allocate
+        # a zero-length cache and crash on the first KV write. For causal rollouts with
+        # global attention, we need enough cache for the whole latent sequence.
+        if sliding_window_num_frames <= 0:
+            raise ValueError(
+                "Invalid sliding_window_num_frames (<=0) for causal KV cache. "
+                "Pass sliding_window_num_frames_override (e.g. latent_t) or set "
+                "model.config.arch_config.sliding_window_num_frames to a positive value.")
         kv_cache_size = frame_seq_length * sliding_window_num_frames
 
     cache: list[dict] = []
@@ -550,7 +596,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                     batch_size=1,
                                     dtype=dtype,
                                     device=device,
-                                    frame_seq_length=frame_seq_length)
+                                    frame_seq_length=frame_seq_length,
+                                    sliding_window_num_frames_override=latent_t)
     crossattn_cache = _initialize_crossattn_cache(model=transformer,
                                                   batch_size=1,
                                                   max_text_len=transformer.text_len,
@@ -560,7 +607,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                            batch_size=1,
                                            dtype=dtype,
                                            device=device,
-                                           frame_seq_length=frame_seq_length)
+                                           frame_seq_length=frame_seq_length,
+                                           sliding_window_num_frames_override=latent_t)
     crossattn_cache_uncond = _initialize_crossattn_cache(model=transformer,
                                                          batch_size=1,
                                                          max_text_len=transformer.text_len,
@@ -570,7 +618,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                             batch_size=1,
                                             dtype=dtype,
                                             device=device,
-                                            frame_seq_length=frame_seq_length)
+                                            frame_seq_length=frame_seq_length,
+                                            sliding_window_num_frames_override=latent_t)
     control_crossattn_cache = _initialize_crossattn_cache(
         model=controlnet,
         batch_size=1,
@@ -581,7 +630,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                                    batch_size=1,
                                                    dtype=dtype,
                                                    device=device,
-                                                   frame_seq_length=frame_seq_length)
+                                                   frame_seq_length=frame_seq_length,
+                                                   sliding_window_num_frames_override=latent_t)
     control_crossattn_cache_uncond = _initialize_crossattn_cache(
         model=controlnet,
         batch_size=1,
@@ -1275,6 +1325,16 @@ def main() -> None:
                         type=int,
                         default=0,
                         help="Context timestep used for cache update (0 = clean).")
+    parser.add_argument(
+        "--local_attn_size",
+        type=int,
+        default=0,
+        help=(
+            "Override causal self-attention local window size in *latent frames*. "
+            "0 = auto (keep checkpoint default for <=81 frames; use 21 for longer videos). "
+            "Example: 21 means attend to a sliding window of ~21 latent frames."
+        ),
+    )
     warp_group = parser.add_mutually_exclusive_group()
     warp_group.add_argument(
         "--warp_denoising_step",
@@ -1402,6 +1462,22 @@ def main() -> None:
             f"ControlNet load failed for {args.controlnet_dir}. "
             "Ensure the directory contains config.json and *.safetensors."
         )
+
+    # Auto-enable a safe sliding window for long videos when checkpoint config is missing/unstable.
+    # This avoids exploding KV cache memory and also avoids the "kv_cache_size==0" crash when
+    # some exported configs accidentally set sliding_window_num_frames=0.
+    if str(args.attention_mode) == "causal":
+        local_attn_override = int(args.local_attn_size)
+        if local_attn_override == 0 and int(args.num_frames) > 81:
+            local_attn_override = 21
+        if local_attn_override > 0:
+            logger.info(
+                "causal local attention override: local_attn_size=%s latent frames",
+                local_attn_override,
+            )
+            _override_local_attn_size(transformer, local_attn_override)
+            _override_local_attn_size(controlnet, local_attn_override)
+
     if args.init_transformer_safetensors and not args.init_controlnet_safetensors:
         logger.warning(
             "You set --init_transformer_safetensors but did not set --init_controlnet_safetensors. "

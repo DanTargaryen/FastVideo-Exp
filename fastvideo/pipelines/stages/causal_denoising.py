@@ -109,6 +109,9 @@ class CausalDMDDenosingStage(DenoisingStage):
         assert batch.latents is not None, "latents must be provided"
         latents = batch.latents  # [B, C, T, H, W]
         b, c, t, h, w = latents.shape
+        # Cache the current latent length so KV cache init can allocate correctly
+        # when sliding_window_num_frames is unset/0 in an exported model config.
+        self._last_t_lat = int(t)
         prompt_embeds = batch.prompt_embeds
         assert torch.isnan(prompt_embeds[0]).sum() == 0
 
@@ -417,7 +420,19 @@ class CausalDMDDenosingStage(DenoisingStage):
         if self.local_attn_size != -1:
             kv_cache_size = self.local_attn_size * self.frame_seq_length
         else:
-            kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
+            # Some exported checkpoints/configs may set sliding_window_num_frames=0.
+            # That would allocate a zero-length cache and crash on the first KV write.
+            # For causal rollouts with global attention, allocate enough cache for the
+            # full latent sequence length (T_lat) by default.
+            if int(self.sliding_window_num_frames) <= 0:
+                t_lat = getattr(self, "_last_t_lat", None)
+                if t_lat is None or int(t_lat) <= 0:
+                    raise ValueError(
+                        "Invalid sliding_window_num_frames (<=0) and cannot infer T_lat for KV cache allocation."
+                    )
+                kv_cache_size = self.frame_seq_length * int(t_lat)
+            else:
+                kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
