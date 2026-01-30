@@ -74,6 +74,27 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
 
+def _log_causal_attn_overrides(model: torch.nn.Module, *, name: str) -> None:
+    count = 0
+    sample = None
+    for m in model.modules():
+        if m.__class__.__name__ != "CausalWanSelfAttention":
+            continue
+        count += 1
+        if sample is None:
+            sample = {
+                "local_attn_size": getattr(m, "local_attn_size", None),
+                "sink_size": getattr(m, "sink_size", None),
+                "max_attention_size": getattr(m, "max_attention_size", None),
+            }
+    logger.info(
+        "%s causal attn: modules=%s model.local_attn_size=%s sample_layer=%s",
+        name,
+        count,
+        getattr(model, "local_attn_size", None),
+        sample,
+    )
+
 def _override_local_attn_size(model: torch.nn.Module, local_attn_size: int) -> None:
     """
     Force causal self-attention to use a sliding local window (in *latent frames*).
@@ -101,6 +122,25 @@ def _override_local_attn_size(model: torch.nn.Module, local_attn_size: int) -> N
             # Keep logic consistent with module __init__.
             if hasattr(m, "max_attention_size"):
                 m.max_attention_size = int(local_attn_size) * 1560
+        except Exception:
+            continue
+
+
+def _override_sink_size(model: torch.nn.Module, sink_size: int) -> None:
+    """
+    Keep the first `sink_size` latent frames in KV cache fixed (not evicted) during
+    sliding-window causal rollout.
+
+    This maps to `CausalWanSelfAttention.sink_size`, where the eviction logic keeps
+    `sink_tokens = sink_size * frame_seq_length` tokens intact at the beginning of the cache.
+    """
+    if int(sink_size) < 0:
+        return
+    for m in model.modules():
+        if m.__class__.__name__ != "CausalWanSelfAttention":
+            continue
+        try:
+            m.sink_size = int(sink_size)
         except Exception:
             continue
 
@@ -1335,6 +1375,16 @@ def main() -> None:
             "Example: 21 means attend to a sliding window of ~21 latent frames."
         ),
     )
+    parser.add_argument(
+        "--sink_size",
+        type=int,
+        default=0,
+        help=(
+            "KV-cache sink size in *latent frames* (kept fixed and not evicted when using local attention). "
+            "Set 1 to keep the first latent frame (TI2V anchor) permanently visible while sliding. "
+            "NOTE: if you want '21 sliding frames PLUS 1 sink', set --local_attn_size 22 --sink_size 1."
+        ),
+    )
     warp_group = parser.add_mutually_exclusive_group()
     warp_group.add_argument(
         "--warp_denoising_step",
@@ -1477,6 +1527,12 @@ def main() -> None:
             )
             _override_local_attn_size(transformer, local_attn_override)
             _override_local_attn_size(controlnet, local_attn_override)
+        if int(args.sink_size) > 0:
+            logger.info("causal KV-cache sink override: sink_size=%s latent frames", int(args.sink_size))
+            _override_sink_size(transformer, int(args.sink_size))
+            _override_sink_size(controlnet, int(args.sink_size))
+        _log_causal_attn_overrides(transformer, name="transformer")
+        _log_causal_attn_overrides(controlnet, name="controlnet")
 
     if args.init_transformer_safetensors and not args.init_controlnet_safetensors:
         logger.warning(
