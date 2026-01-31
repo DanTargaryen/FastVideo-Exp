@@ -359,9 +359,9 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
             )
 
-        _, p_h, p_w = self.patch_size
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
+        # hidden_states already patchified by PatchEmbed; do not divide again.
+        post_patch_height = height
+        post_patch_width = width
 
         # Rotary embeddings (frame offset = start_frame)
         d = self.hidden_size // self.num_attention_heads

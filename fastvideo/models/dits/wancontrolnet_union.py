@@ -245,9 +245,9 @@ class WanControlnetUnion3DModel(BaseDiT):
         hidden_states = latents_emb
         batch_size, _c, num_frames, height, width = hidden_states.shape
 
-        _, p_h, p_w = self.patch_size
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
+        # hidden_states already patchified by PatchEmbed; do not divide again.
+        post_patch_height = height
+        post_patch_width = width
         frame_seq_len = post_patch_height * post_patch_width
 
         # Normalize timestep
