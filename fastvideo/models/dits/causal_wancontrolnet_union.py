@@ -75,6 +75,13 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         # Union config (fallback to safe defaults)
         self.num_control_type = int(hf_config.get("num_control_type", 2))
         self.union_dim = int(hf_config.get("num_trans_channel", inner_dim))
+        if self.union_dim != inner_dim:
+            logger.warning(
+                "union_dim (%s) != inner_dim (%s); overriding to inner_dim to match checkpoint shapes.",
+                self.union_dim,
+                inner_dim,
+            )
+            self.union_dim = inner_dim
         self.num_trans_head = int(
             hf_config.get("num_trans_head", min(8, config.num_attention_heads)))
         self.num_trans_layer = int(hf_config.get("num_trans_layer", 1))
