@@ -80,6 +80,21 @@ def _is_union_controlnet(model) -> bool:
     return "union" in model.__class__.__name__.lower()
 
 
+def _controlnet_dir_is_union(controlnet_dir: str) -> bool:
+    p = Path(str(controlnet_dir))
+    if "union" in p.name.lower():
+        return True
+    cfg = p / "config.json"
+    if cfg.exists():
+        try:
+            obj = json.loads(cfg.read_text(encoding="utf-8"))
+            cls_name = str(obj.get("_class_name", "")).lower()
+            if "union" in cls_name:
+                return True
+        except Exception:
+            pass
+    return False
+
 def _split_union_control_latent(control_latent: torch.Tensor,
                                 num_channels_latents: int
                                 ) -> tuple[torch.Tensor, torch.Tensor | None,
@@ -1527,14 +1542,19 @@ def main() -> None:
         vae_cpu_offload=False,
         pin_cpu_memory=True,
     )
+    use_union_controlnet = _controlnet_dir_is_union(args.controlnet_dir)
     if args.attention_mode == "bidirectional":
         fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
-        fastvideo_args.override_controlnet_cls_name = "WanControlnet3DModel"
+        fastvideo_args.override_controlnet_cls_name = (
+            "WanControlnetUnion3DModel" if use_union_controlnet else "WanControlnet3DModel"
+        )
     else:
         # Ensure student rollout uses the chunk-wise causal transformer (KV cache),
         # even if the exported config.json says "WanTransformer3DModel".
         fastvideo_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
-        fastvideo_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+        fastvideo_args.override_controlnet_cls_name = (
+            "CausalWanControlnetUnion3DModel" if use_union_controlnet else "CausalWanControlnet3DModel"
+        )
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     fastvideo_args.pipeline_config.warp_denoising_step = bool(
