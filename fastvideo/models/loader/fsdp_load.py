@@ -318,7 +318,17 @@ def load_model_from_full_model_state_dict(
                        unused_keys)
 
     # List of allowed parameter name patterns
-    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress"]  # Can be extended as needed
+    # Note: Union ControlNet introduces new parameters (e.g., feat_to_union, union_transformer).
+    ALLOWED_NEW_PARAM_PATTERNS = [
+        "gate_compress",
+        "union",
+        "feat_to_union",
+        "union_cond_embedding",
+        "union_transformer",
+        "task_embedding",
+        "control_type_proj",
+        "spatial_ch_projs",
+    ]  # Can be extended as needed
     for new_param_name in unused_keys:
         if not any(pattern in new_param_name
                    for pattern in ALLOWED_NEW_PARAM_PATTERNS):
