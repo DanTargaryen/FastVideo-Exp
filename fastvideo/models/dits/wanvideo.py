@@ -642,10 +642,11 @@ class WanTransformer3DModel(CachableDiT):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        p_t, p_h, p_w = self.patch_size
-        post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
+        # Patchify first to get the true post-patch grid, then build RoPE.
+        hidden_states = self.patch_embedding(hidden_states)
+        post_patch_num_frames = hidden_states.shape[2]
+        post_patch_height = hidden_states.shape[3]
+        post_patch_width = hidden_states.shape[4]
 
         # Get rotary embeddings
         d = self.hidden_size // self.num_attention_heads
@@ -660,8 +661,6 @@ class WanTransformer3DModel(CachableDiT):
             rope_theta=10000)
         freqs_cis = (freqs_cos.to(hidden_states.device).float(),
                      freqs_sin.to(hidden_states.device).float())
-
-        hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # Shard with padding support - returns (sharded_tensor, original_seq_len)

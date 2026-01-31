@@ -658,10 +658,13 @@ class CausalWanTransformer3DModel(BaseDiT):
             raise ValueError(
                 f"Unsupported timestep dim {timestep_2d.dim()} for shape {tuple(timestep_2d.shape)}"
             )
-        p_t, p_h, p_w = self.patch_size
-        post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
+        # Patchify first to get true post-patch grid sizes
+        hidden_states = self.patch_embedding(hidden_states)
+        grid_sizes = torch.stack(
+            [torch.tensor(hidden_states[0].shape[1:], dtype=torch.long)])
+        post_patch_num_frames = hidden_states.shape[2]
+        post_patch_height = hidden_states.shape[3]
+        post_patch_width = hidden_states.shape[4]
 
         # Get rotary embeddings
         d = self.hidden_size // self.num_attention_heads
@@ -685,15 +688,11 @@ class CausalWanTransformer3DModel(BaseDiT):
         if self.block_mask is None:
             self.block_mask = self._prepare_blockwise_causal_attn_mask(
                 device=hidden_states.device,
-                num_frames=num_frames,
+                num_frames=post_patch_num_frames,
                 frame_seqlen=post_patch_height * post_patch_width,
                 num_frame_per_block=self.num_frame_per_block,
                 local_attn_size=self.local_attn_size
             )
-
-        hidden_states = self.patch_embedding(hidden_states)
-        grid_sizes = torch.stack(
-            [torch.tensor(hidden_states[0].shape[1:], dtype=torch.long)])
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(1, self.text_len - encoder_hidden_states.size(1), encoder_hidden_states.size(2))], dim=1)
