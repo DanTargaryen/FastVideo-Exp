@@ -61,6 +61,7 @@ from fastvideo.distributed import maybe_init_distributed_environment_and_model_p
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
+from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -73,6 +74,45 @@ from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
+
+
+def _is_union_controlnet(model) -> bool:
+    return "union" in model.__class__.__name__.lower()
+
+
+def _split_union_control_latent(control_latent: torch.Tensor,
+                                num_channels_latents: int
+                                ) -> tuple[torch.Tensor, torch.Tensor | None,
+                                           torch.Tensor, torch.Tensor]:
+    c = int(num_channels_latents)
+    if control_latent.shape[1] == 3 * c:
+        depth = control_latent[:, :c]
+        masked = control_latent[:, c:2 * c]
+        mask = control_latent[:, 2 * c:3 * c]
+        normal = None
+        return depth, normal, masked, mask
+    if control_latent.shape[1] == 4 * c:
+        depth = control_latent[:, :c]
+        normal = control_latent[:, c:2 * c]
+        masked = control_latent[:, 2 * c:3 * c]
+        mask = control_latent[:, 3 * c:4 * c]
+        return depth, normal, masked, mask
+    raise ValueError(
+        f"Union control_latent channel mismatch: got {control_latent.shape[1]}, "
+        f"expected 3*C or 4*C (C={c}).")
+
+
+def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
+                             num_channels_latents: int) -> dict:
+    if not _is_union_controlnet(controlnet):
+        return {"controlnet_states": control_latent}
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent, num_channels_latents)
+    return {
+        "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
+        "mask": mask,
+        "masked_latent": masked,
+    }
 
 def _log_causal_attn_overrides(model: torch.nn.Module, *, name: str) -> None:
     count = 0
@@ -700,6 +740,9 @@ def _causal_dmd_rollout_ti2v_controlnet(
         # Timesteps for this chunk.
         t_list = t_list_full
 
+        num_channels_latents = getattr(transformer, "num_channels_latents",
+                                       control_chunk.shape[1] // 3)
+
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
@@ -740,7 +783,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds_list,
                         timestep=timestep,
-                        controlnet_states=control_chunk,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
                         kv_cache=control_kv_cache,
                         crossattn_cache=control_crossattn_cache,
                         current_start=start_index * frame_seq_length,
@@ -767,7 +811,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                             hidden_states=latent_model_input,
                             encoder_hidden_states=negative_prompt_embeds_list,
                             timestep=timestep,
-                            controlnet_states=control_chunk,
+                            **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                       num_channels_latents),
                             kv_cache=control_kv_cache_uncond,
                             crossattn_cache=control_crossattn_cache_uncond,
                             current_start=start_index * frame_seq_length,
@@ -920,7 +965,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     hidden_states=context_bcfhw,
                     encoder_hidden_states=prompt_embeds_list,
                     timestep=context_timestep,
-                    controlnet_states=control_chunk,
+                    **_build_controlnet_kwargs(controlnet, control_chunk,
+                                               num_channels_latents),
                     kv_cache=control_kv_cache,
                     crossattn_cache=control_crossattn_cache,
                     current_start=start_index * frame_seq_length,
@@ -945,7 +991,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         hidden_states=context_bcfhw,
                         encoder_hidden_states=negative_prompt_embeds_list,
                         timestep=context_timestep,
-                        controlnet_states=control_chunk,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
                         kv_cache=control_kv_cache_uncond,
                         crossattn_cache=control_crossattn_cache_uncond,
                         current_start=start_index * frame_seq_length,
@@ -1066,6 +1113,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
         return temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
+    num_channels_latents = getattr(transformer, "num_channels_latents",
+                                   control_latent_bcfhw.shape[1] // 3)
+
     for step_i, t_cur in enumerate(timesteps):
         if float(guidance_scale) != 1.0 and negative_prompt_embeds_list is None:
             raise ValueError(
@@ -1083,7 +1133,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 hidden_states=latent_model_input,
                 encoder_hidden_states=prompt_embeds_list,
                 timestep=timestep,
-                controlnet_states=control_latent_bcfhw,
+                **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                           num_channels_latents),
             )
             if isinstance(control_res, (list, tuple)):
                 control_res = [x.to(dtype=latents.dtype) for x in control_res]

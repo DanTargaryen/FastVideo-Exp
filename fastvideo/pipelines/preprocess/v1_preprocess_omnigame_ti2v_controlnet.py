@@ -2,7 +2,7 @@
 """
 Preprocess OmniWorld-Game (pickle manifest) into FastVideo parquet for:
   - TI2V (first-frame latent)
-  - ControlNet (control latent = cat(depth, warped_masked_rgb, warped_mask) in VAE latent space)
+  - ControlNet (control latent = cat(depth, [normal], warped_masked_rgb, warped_mask) in VAE latent space)
 
 Inputs:
   - `--in_pickle`: a list[dict] manifest (same structure as Diff-Factory phase1 recorder)
@@ -17,8 +17,9 @@ Output:
   - Parquet dataset directory compatible with `pyarrow_schema_ti2v_controlnet`.
 
 Notes:
-  - If Wan VAE latent channel size is `C_lat` (aka z_dim), then each of (depth/masked_rgb/mask)
-    encodes to `C_lat` channels, and the concatenated control latent has `3*C_lat` channels.
+  - If Wan VAE latent channel size is `C_lat` (aka z_dim), then each of (depth/normal/masked_rgb/mask)
+    encodes to `C_lat` channels. The concatenated control latent has `4*C_lat` channels
+    when normal is provided (otherwise `3*C_lat`).
 """
 
 from __future__ import annotations
@@ -220,6 +221,44 @@ def _load_depth_frames_from_folder(control_dir: str, frame_indices: list[int],
     return torch.stack(frames, dim=0)  # TCHW
 
 
+def _load_normal_frames_from_folder(normal_dir: str, frame_indices: list[int],
+                                    height: int, width: int,
+                                    normal_format: str = "opencv") -> torch.Tensor:
+    """
+    Mirrors Diff-Factory `process_normal` in run_wan_controlnet_union.py.
+    Returns (T,3,H,W) with values in [-1,1].
+    """
+    folder = _maybe_expand(normal_dir)
+    normals: list[torch.Tensor] = []
+    target_ratio = float(width) / float(height)
+    for idx in frame_indices:
+        fname = os.path.join(folder, f"{int(idx):06d}.png")
+        normal = imageio.imread(fname)
+        if normal.ndim == 2:
+            raise ValueError(f"Normal map must be RGB: {fname}")
+        normal = normal[..., :3].astype(np.float32)
+        h0, w0, _ = normal.shape
+        current_ratio = float(w0) / float(h0)
+        if current_ratio > target_ratio:
+            new_w = int(h0 * target_ratio)
+            left = max(0, (w0 - new_w) // 2)
+            normal = normal[:, left:left + new_w]
+        else:
+            new_h = int(w0 / target_ratio)
+            top = max(0, (h0 - new_h) // 2)
+            normal = normal[top:top + new_h, :]
+        normal = cv2.resize(normal, (int(width), int(height)),
+                            interpolation=cv2.INTER_LINEAR)
+        if normal.max() > 1.5:
+            normal = normal / 127.5 - 1.0
+        if normal_format == "opencv":
+            normal[..., 1] *= -1
+            normal[..., 2] *= -1
+        t = torch.from_numpy(normal).permute(2, 0, 1).float()
+        normals.append(t)
+    return torch.stack(normals, dim=0)
+
+
 def _to_vae_input(video_tchw: torch.Tensor, *, normalize: bool) -> torch.Tensor:
     # (T,3,H,W) -> (1,3,T,H,W); normalize controls [0,1] -> [-1,1] mapping.
     x = video_tchw.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
@@ -319,6 +358,16 @@ def parse_args() -> argparse.Namespace:
                    type=str,
                    default="",
                    help="Mask root dir when not using warp_out (fallback if pickle has no mask_path).")
+    p.add_argument("--normal_root",
+                   type=str,
+                   default="",
+                   help="Normal root dir (optional). If set or if pickle has normal_path, "
+                        "normal maps will be encoded and concatenated into control_latent.")
+    p.add_argument("--normal_format",
+                   type=str,
+                   default="opencv",
+                   choices=["opencv", "opengl"],
+                   help="Normal map format. 'opencv' will flip Y/Z to OpenGL.")
     p.add_argument("--mask_threshold",
                    type=float,
                    default=0.5,
@@ -506,6 +555,24 @@ def main(args: argparse.Namespace) -> None:
         depth_tchw = _load_depth_frames_from_folder(control_dir, frame_indices,
                                                     args.max_height,
                                                     args.max_width)  # T,3,H,W
+        normal_dir = str(s.get("normal_path", "") or s.get("normal_dir", ""))
+        if not normal_dir and args.normal_root:
+            normal_dir = str(args.normal_root)
+        normal_tchw = None
+        if normal_dir:
+            normal_dir = _maybe_expand(normal_dir)
+            if os.path.isdir(normal_dir) and not os.path.exists(
+                    os.path.join(normal_dir, f"{int(frame_indices[0]):06d}.png")):
+                candidate = os.path.join(normal_dir, scene_name)
+                if os.path.isdir(candidate):
+                    normal_dir = candidate
+            normal_tchw = _load_normal_frames_from_folder(
+                normal_dir,
+                frame_indices,
+                args.max_height,
+                args.max_width,
+                normal_format=str(args.normal_format),
+            )
 
         if use_warp_out:
             assert warp_root is not None
@@ -560,28 +627,48 @@ def main(args: argparse.Namespace) -> None:
                                   dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
 
-        # Encode 3 sequences in a single batched call: (3,3,T,H,W)
-        # Match Diff-Factory: depth/mask in [0,1], masked_rgb mapped to [-1,1].
-        video_3 = torch.cat([
-            _to_vae_input(depth_tchw, normalize=False),
-            _to_vae_input(masked_rgb_tchw, normalize=True),
-            _to_vae_input(mask_tchw, normalize=False),
-        ],
-                            dim=0).to(device=device, dtype=torch.float32)
-        # Diff-Factory pipeline uses deterministic argmax for control latents.
-        lat_3 = _encode_video_latents(vae, video_3,
-                                      sample_mode="mode")  # 3,16,T_lat,h,w
-        lat_3 = lat_3.to("cpu", dtype=torch.float32)
-
-        depth_lat = lat_3[0]  # 16,T_lat,h,w
-        masked_lat = lat_3[1]
-        mask_lat = lat_3[2]
+        # Encode 3 or 4 sequences in a single batched call: (N,3,T,H,W)
+        # Match Diff-Factory: depth/mask in [0,1], masked_rgb in [-1,1], normal already in [-1,1].
+        if normal_tchw is not None:
+            video_n = torch.cat([
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(normal_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask_tchw, normalize=False),
+            ],
+                                dim=0).to(device=device, dtype=torch.float32)
+            lat_n = _encode_video_latents(vae, video_n,
+                                          sample_mode="mode")  # 4,16,T_lat,h,w
+            lat_n = lat_n.to("cpu", dtype=torch.float32)
+            depth_lat = lat_n[0]
+            normal_lat = lat_n[1]
+            masked_lat = lat_n[2]
+            mask_lat = lat_n[3]
+        else:
+            video_n = torch.cat([
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask_tchw, normalize=False),
+            ],
+                                dim=0).to(device=device, dtype=torch.float32)
+            lat_n = _encode_video_latents(vae, video_n,
+                                          sample_mode="mode")  # 3,16,T_lat,h,w
+            lat_n = lat_n.to("cpu", dtype=torch.float32)
+            depth_lat = lat_n[0]
+            masked_lat = lat_n[1]
+            mask_lat = lat_n[2]
         if latent_repeat != 1:
             depth_lat = depth_lat.repeat(latent_repeat, 1, 1, 1)
+            if normal_tchw is not None:
+                normal_lat = normal_lat.repeat(latent_repeat, 1, 1, 1)
             masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
             mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
-        control_lat = torch.cat([depth_lat, masked_lat, mask_lat],
-                                dim=0)  # 48,T_lat,h,w
+        if normal_tchw is not None:
+            control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat],
+                                    dim=0)  # 64,T_lat,h,w
+        else:
+            control_lat = torch.cat([depth_lat, masked_lat, mask_lat],
+                                    dim=0)  # 48,T_lat,h,w
         control_lat_np = control_lat.numpy()
 
         # Optional: no GT video latents for self-forcing (simulate_generator_forward=True)

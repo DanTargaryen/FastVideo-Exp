@@ -19,9 +19,49 @@ from fastvideo.training.self_forcing_distillation_pipeline import (
 from fastvideo.training.activation_checkpoint import apply_activation_checkpointing
 from fastvideo.training.training_utils import get_scheduler
 from fastvideo.utils import is_vsa_available
+from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
 
 vsa_available = is_vsa_available()
 logger = init_logger(__name__)
+
+
+def _is_union_controlnet(model) -> bool:
+    return "union" in model.__class__.__name__.lower()
+
+
+def _split_union_control_latent(control_latent: torch.Tensor,
+                                num_channels_latents: int
+                                ) -> tuple[torch.Tensor, torch.Tensor | None,
+                                           torch.Tensor, torch.Tensor]:
+    c = int(num_channels_latents)
+    if control_latent.shape[1] == 3 * c:
+        depth = control_latent[:, :c]
+        masked = control_latent[:, c:2 * c]
+        mask = control_latent[:, 2 * c:3 * c]
+        normal = None
+        return depth, normal, masked, mask
+    if control_latent.shape[1] == 4 * c:
+        depth = control_latent[:, :c]
+        normal = control_latent[:, c:2 * c]
+        masked = control_latent[:, 2 * c:3 * c]
+        mask = control_latent[:, 3 * c:4 * c]
+        return depth, normal, masked, mask
+    raise ValueError(
+        f"Union control_latent channel mismatch: got {control_latent.shape[1]}, "
+        f"expected 3*C or 4*C (C={c}).")
+
+
+def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
+                             num_channels_latents: int) -> dict:
+    if not _is_union_controlnet(controlnet):
+        return {"controlnet_states": control_latent}
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent, num_channels_latents)
+    return {
+        "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
+        "mask": mask,
+        "masked_latent": masked,
+    }
 
 
 class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeline):
@@ -228,6 +268,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             if hidden_states.shape[2] >= 1:
                 hidden_states = torch.cat([img, hidden_states[:, :, 1:]], dim=2)
 
+        num_channels_latents = getattr(model, "num_channels_latents",
+                                       control_chunk.shape[1] // 3)
         control_res = self.controlnet(
             hidden_states=hidden_states,
             encoder_hidden_states=training_batch_temp.input_kwargs[
@@ -235,7 +277,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             timestep=training_batch_temp.input_kwargs["timestep"],
             encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
                 "encoder_hidden_states_image"),
-            controlnet_states=control_chunk,
+            **_build_controlnet_kwargs(self.controlnet, control_chunk,
+                                       num_channels_latents),
             kv_cache=self.controlnet_kv_cache1,
             crossattn_cache=self.controlnet_crossattn_cache,
             current_start=current_start_frame * self.frame_seq_length,
@@ -275,13 +318,16 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                                        control_latent: torch.Tensor | None):
         if controlnet is None or control_latent is None:
             return transformer(**input_kwargs)
+        num_channels_latents = getattr(transformer, "num_channels_latents",
+                                       control_latent.shape[1] // 3)
         control_res = controlnet(
             hidden_states=input_kwargs["hidden_states"],
             encoder_hidden_states=input_kwargs["encoder_hidden_states"],
             timestep=input_kwargs["timestep"],
             encoder_hidden_states_image=input_kwargs.get(
                 "encoder_hidden_states_image"),
-            controlnet_states=control_latent,
+            **_build_controlnet_kwargs(controlnet, control_latent,
+                                       num_channels_latents),
         )
         return transformer(
             **input_kwargs, block_controlnet_hidden_states=control_res)

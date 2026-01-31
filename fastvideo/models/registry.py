@@ -37,6 +37,8 @@ _TEXT_TO_VIDEO_DIT_MODELS = {
     "CosmosTransformer3DModel": ("dits", "cosmos", "CosmosTransformer3DModel"),
     "LongCatVideoTransformer3DModel": ("dits", "longcat_video_dit", "LongCatVideoTransformer3DModel"),  # Wrapper (Phase 1)
     "LongCatTransformer3DModel": ("dits", "longcat", "LongCatTransformer3DModel"),  # Native (Phase 2)
+    "WanControlnetUnion": ("dits", "causal_wancontrolnet_union", "CausalWanControlnetUnion3DModel"),
+    "WanControlnetUnion3DModel": ("dits", "wancontrolnet_union", "WanControlnetUnion3DModel"),
 }
 
 _IMAGE_TO_VIDEO_DIT_MODELS = {

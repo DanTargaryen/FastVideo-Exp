@@ -22,8 +22,48 @@ from fastvideo.training.activation_checkpoint import (
 from fastvideo.training.training_pipeline import TrainingPipeline
 from fastvideo.training.training_utils import (
     clip_grad_norm_while_handling_failing_dtensor_cases, get_scheduler)
+from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
 
 logger = init_logger(__name__)
+
+
+def _is_union_controlnet(model) -> bool:
+    return "union" in model.__class__.__name__.lower()
+
+
+def _split_union_control_latent(control_latent: torch.Tensor,
+                                num_channels_latents: int
+                                ) -> tuple[torch.Tensor, torch.Tensor | None,
+                                           torch.Tensor, torch.Tensor]:
+    c = int(num_channels_latents)
+    if control_latent.shape[1] == 3 * c:
+        depth = control_latent[:, :c]
+        masked = control_latent[:, c:2 * c]
+        mask = control_latent[:, 2 * c:3 * c]
+        normal = None
+        return depth, normal, masked, mask
+    if control_latent.shape[1] == 4 * c:
+        depth = control_latent[:, :c]
+        normal = control_latent[:, c:2 * c]
+        masked = control_latent[:, 2 * c:3 * c]
+        mask = control_latent[:, 3 * c:4 * c]
+        return depth, normal, masked, mask
+    raise ValueError(
+        f"Union control_latent channel mismatch: got {control_latent.shape[1]}, "
+        f"expected 3*C or 4*C (C={c}).")
+
+
+def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
+                             num_channels_latents: int) -> dict:
+    if not _is_union_controlnet(controlnet):
+        return {"controlnet_states": control_latent}
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent, num_channels_latents)
+    return {
+        "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
+        "mask": mask,
+        "masked_latent": masked,
+    }
 
 
 class ODEInitControlnetTrainingPipeline(TrainingPipeline):
@@ -307,11 +347,18 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
         with set_forward_context(current_timestep=int(timestep[0, 0].item()),
                                  attn_metadata=None,
                                  forward_batch=batch):
+            num_channels_latents = getattr(self.transformer,
+                                           "num_channels_latents",
+                                           control_latent.shape[1] // 3)
             control_res = self.controlnet(
                 hidden_states=latent_model_input.to(dtype=model_dtype),
                 encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
                 timestep=timestep.to(device, dtype=model_dtype),
-                controlnet_states=control_latent.to(dtype=model_dtype),
+                **_build_controlnet_kwargs(
+                    self.controlnet,
+                    control_latent.to(dtype=model_dtype),
+                    num_channels_latents,
+                ),
             )
             pred_flow = self.transformer(
                 latent_model_input.to(dtype=model_dtype),
