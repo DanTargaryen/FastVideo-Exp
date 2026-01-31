@@ -642,6 +642,7 @@ class WanTransformer3DModel(CachableDiT):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
         # Patchify first to get the true post-patch grid, then build RoPE.
         hidden_states = self.patch_embedding(hidden_states)
         post_patch_num_frames = hidden_states.shape[2]
