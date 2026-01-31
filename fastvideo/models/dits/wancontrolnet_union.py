@@ -267,12 +267,18 @@ class WanControlnetUnion3DModel(BaseDiT):
                     batch_size, num_frames)
             elif timestep_2d.numel() == batch_size * num_frames:
                 timestep_2d = timestep_2d.view(batch_size, num_frames)
-            elif timestep_2d.numel(
-            ) == batch_size * num_frames * frame_seq_len:
-                timestep_2d = timestep_2d.view(batch_size,
-                                               num_frames * frame_seq_len)
             elif batch_size == 1 and timestep_2d.numel() == num_frames:
                 timestep_2d = timestep_2d.view(1, num_frames)
+            elif timestep_2d.numel() % max(1, num_frames) == 0:
+                # Accept flattened per-patch timesteps: [B, num_frames*frame_seq_len]
+                if timestep_2d.numel() % batch_size == 0:
+                    timestep_2d = timestep_2d.view(batch_size,
+                                                   timestep_2d.numel() //
+                                                   batch_size)
+                else:
+                    raise ValueError(
+                        f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                    )
             else:
                 raise ValueError(
                     f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
@@ -282,8 +288,9 @@ class WanControlnetUnion3DModel(BaseDiT):
                 timestep_2d = timestep_2d.expand(batch_size, num_frames)
             elif timestep_2d.shape == (batch_size, num_frames):
                 pass
-            elif timestep_2d.shape == (batch_size,
-                                       num_frames * frame_seq_len):
+            elif timestep_2d.shape[0] == batch_size and timestep_2d.shape[
+                    1] % max(1, num_frames) == 0:
+                # Accept [B, num_frames*frame_seq_len] without requiring frame_seq_len here.
                 pass
             else:
                 raise ValueError(

@@ -329,6 +329,15 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 timestep_2d = timestep_2d.view(batch_size, num_frames)
             elif batch_size == 1 and timestep_2d.numel() == num_frames:
                 timestep_2d = timestep_2d.view(1, num_frames)
+            elif timestep_2d.numel() % max(1, num_frames) == 0:
+                if timestep_2d.numel() % batch_size == 0:
+                    timestep_2d = timestep_2d.view(batch_size,
+                                                   timestep_2d.numel() //
+                                                   batch_size)
+                else:
+                    raise ValueError(
+                        f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                    )
             else:
                 raise ValueError(
                     f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
@@ -336,7 +345,12 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         elif timestep_2d.dim() == 2:
             if timestep_2d.shape == (batch_size, 1):
                 timestep_2d = timestep_2d.expand(batch_size, num_frames)
-            elif timestep_2d.shape != (batch_size, num_frames):
+            elif timestep_2d.shape == (batch_size, num_frames):
+                pass
+            elif timestep_2d.shape[0] == batch_size and timestep_2d.shape[
+                    1] % max(1, num_frames) == 0:
+                pass
+            else:
                 raise ValueError(
                     f"Unsupported timestep shape {tuple(timestep_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
                 )
