@@ -430,11 +430,11 @@ class TransformerLoader(ComponentLoader):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_config(model=model_path)
         hf_config = deepcopy(config)
-        cls_name = config.pop("_class_name")
+        cls_name = config.pop("_class_name", None)
         if cls_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported.")
+            # Some checkpoints provide a transformers-style config.json without _class_name.
+            # Fall back to overrides or path heuristics.
+            cls_name = None
 
         logger.info("transformer cls_name: %s", cls_name)
         if fastvideo_args.override_transformer_cls_name is not None:
@@ -527,6 +527,14 @@ class ControlNetLoader(ComponentLoader):
         if fastvideo_args.override_controlnet_cls_name is not None:
             cls_name = fastvideo_args.override_controlnet_cls_name
             logger.info("Overriding controlnet cls_name to %s", cls_name)
+        if cls_name is None or cls_name == "TransformersModel":
+            # Heuristic fallback when _class_name is missing/invalid.
+            name_hint = str(model_path).lower()
+            if "union" in name_hint:
+                cls_name = "WanControlnetUnion3DModel"
+            else:
+                cls_name = "WanControlnet3DModel"
+            logger.info("Fallback controlnet cls_name to %s", cls_name)
         fastvideo_args.model_paths["controlnet"] = model_path
 
         # Important: do NOT mutate pipeline_config.dit_config in-place (ControlNet arch differs).
