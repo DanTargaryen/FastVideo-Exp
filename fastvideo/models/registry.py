@@ -37,8 +37,10 @@ _TEXT_TO_VIDEO_DIT_MODELS = {
     "CosmosTransformer3DModel": ("dits", "cosmos", "CosmosTransformer3DModel"),
     "LongCatVideoTransformer3DModel": ("dits", "longcat_video_dit", "LongCatVideoTransformer3DModel"),  # Wrapper (Phase 1)
     "LongCatTransformer3DModel": ("dits", "longcat", "LongCatTransformer3DModel"),  # Native (Phase 2)
-    "WanControlnetUnion": ("dits", "causal_wancontrolnet_union", "CausalWanControlnetUnion3DModel"),
+    "WanControlnetUnion": ("dits", "wancontrolnet_union", "WanControlnetUnion3DModel"),
     "WanControlnetUnion3DModel": ("dits", "wancontrolnet_union", "WanControlnetUnion3DModel"),
+    "CausalWanControlnetUnion3DModel":
+        ("dits", "causal_wancontrolnet_union", "CausalWanControlnetUnion3DModel"),
 }
 
 _IMAGE_TO_VIDEO_DIT_MODELS = {
@@ -47,6 +49,8 @@ _IMAGE_TO_VIDEO_DIT_MODELS = {
     "CausalWanTransformer3DModel": ("dits", "causal_wanvideo", "CausalWanTransformer3DModel"),
     "MatrixGameWanModel": ("dits", "matrix_game", "MatrixGameWanModel"),
     "CausalMatrixGameWanModel": ("dits", "matrix_game", "CausalMatrixGameWanModel"),
+    "CausalWanControlnetUnion3DModel":
+        ("dits", "causal_wancontrolnet_union", "CausalWanControlnetUnion3DModel"),
 }
 
 _TEXT_ENCODER_MODELS = {
