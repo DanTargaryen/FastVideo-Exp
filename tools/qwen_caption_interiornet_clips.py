@@ -312,37 +312,54 @@ def main() -> None:
                 if not mask_dir.is_dir():
                     print(f"[WARN] Missing mask dir: {mask_dir}")
                     continue
-                local_indices = []
+                local_indices_all = []
                 for p in _sorted_images(mask_dir):
                     stem = p.stem
                     if stem.isdigit():
-                        local_indices.append(int(stem))
-                if not local_indices:
+                        local_indices_all.append(int(stem))
+                if not local_indices_all:
                     print(f"[WARN] No mask frames in: {mask_dir}")
                     continue
             else:
                 # Uniform sample over 81-frame clip local indices [0..80]
                 n = int(args.sample_frames)
                 if n <= 0:
-                    local_indices = [0, 40, 80]
+                    local_indices_all = [0, 40, 80]
                 else:
-                    local_indices = []
+                    local_indices_all = []
                     if n == 1:
-                        local_indices = [0]
+                        local_indices_all = [0]
                     else:
                         for k in range(n):
                             t = k * 80 / (n - 1)
-                            local_indices.append(int(round(t)))
+                            local_indices_all.append(int(round(t)))
                     # de-dup
-                    local_indices = sorted(set(local_indices))
+                    local_indices_all = sorted(set(local_indices_all))
 
             # Compute global range for naming/debugging.
             # Mapping follows UniDataset InteriorNet loader convention:
             # global_idx = window_start + clip_start + local_idx
-            local_start = min(local_indices)
-            local_end = max(local_indices)
+            local_start = min(local_indices_all)
+            local_end = max(local_indices_all)
             global_start = window_start + clip_local_start + local_start
             global_end = window_start + clip_local_start + local_end
+
+            # Choose which local indices to actually caption with.
+            # If --use_mask_frame_indices is set and mask has 81 frames, you likely don't want to feed all frames.
+            # Reuse --sample_frames as "how many frames to feed" in both modes.
+            local_indices_used = local_indices_all
+            if args.use_mask_frame_indices:
+                n = int(args.sample_frames)
+                if n > 0 and n < len(local_indices_all):
+                    if n == 1:
+                        local_indices_used = [local_indices_all[0]]
+                    else:
+                        local_indices_used = []
+                        last = len(local_indices_all) - 1
+                        for k in range(n):
+                            pos = k * last / (n - 1)
+                            local_indices_used.append(local_indices_all[int(round(pos))])
+                        local_indices_used = sorted(set(local_indices_used))
 
             out_name_fields = {
                 "global_start": global_start,
@@ -373,19 +390,19 @@ def main() -> None:
                     print(f"[WARN] No images in {src_dir}")
                     continue
                 picked = []
-                for li in local_indices:
+                for li in local_indices_used:
                     if li < 0:
                         continue
                     if li >= len(files):
                         continue
                     picked.append(str(files[li]))
                 if not picked:
-                    print(f"[WARN] No picked frames in {src_dir} for indices={local_indices}")
+                    print(f"[WARN] No picked frames in {src_dir} for indices={local_indices_used}")
                     continue
                 out_path = clip_dir / out_name
             else:
                 clip_global_start = window_start + clip_local_start
-                global_indices = [clip_global_start + li for li in local_indices]
+                global_indices = [clip_global_start + li for li in local_indices_used]
                 if not cam_files:
                     print(f"[WARN] No cam files for {scene_key}; skip clip {clip_dir}")
                     continue
