@@ -310,6 +310,8 @@ def main() -> None:
         default="",
         help="Optional street split to search under data_root/small_city/street (e.g. train_dense, train_dense_half, test).",
     )
+    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
+    parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
     parser.add_argument(
         "--use_mask_frame_indices",
         action="store_true",
@@ -351,6 +353,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if int(args.world_size) <= 0:
+        raise ValueError("--world_size must be >= 1")
+    if int(args.rank) < 0 or int(args.rank) >= int(args.world_size):
+        raise ValueError(f"--rank must be in [0, {int(args.world_size) - 1}]")
 
     mask_root = Path(args.mask_root)
     data_root = Path(args.data_root) if args.data_root else Path()
@@ -393,7 +399,11 @@ def main() -> None:
                 print(f"[WARN] No rgb frames found in {rgb_base_dir}; skip {street_dir}")
                 continue
 
+        clip_iter_index = -1
         for window_start, window_end, clip_start, clip_dir in _iter_clip_dirs(scene_dir):
+            clip_iter_index += 1
+            if (clip_iter_index % int(args.world_size)) != int(args.rank):
+                continue
             # Decide clip-local indices.
             if args.use_mask_frame_indices:
                 mask_dir = clip_dir / "mask"
