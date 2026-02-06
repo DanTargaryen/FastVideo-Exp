@@ -251,6 +251,20 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
     parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if the output caption file already exists.")
+    parser.add_argument(
+        "--window_len",
+        type=int,
+        default=243,
+        help="Expected number of RGB frames inside each window directory named '<start>_<end>'.",
+    )
+    parser.add_argument(
+        "--strict_window_len",
+        action="store_true",
+        help=(
+            "If set, require each window directory to have exactly --window_len frames "
+            "(i.e., end-start+1 == window_len). Clips that exceed the window end are skipped."
+        ),
+    )
     parser.add_argument("--model", type=str, required=True, help="Local path or HF id for Qwen2.5-VL Instruct.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32", "auto"])
     parser.add_argument("--device_map", type=str, default="auto")
@@ -311,9 +325,18 @@ def main() -> None:
             # parse window start from parent dir name "<start>_<end>"
             window_dir = clip_dir.parent
             try:
-                window_start = int(window_dir.name.split("_", 1)[0])
+                window_start_str, window_end_str = window_dir.name.split("_", 1)
+                window_start = int(window_start_str)
+                window_end = int(window_end_str)
             except Exception:
                 print(f"[WARN] Skip invalid window dir: {window_dir}")
+                continue
+            window_len = int(window_end) - int(window_start) + 1
+            if args.strict_window_len and window_len != int(args.window_len):
+                print(
+                    f"[WARN] Skip window (len mismatch): {window_dir} "
+                    f"len={window_len} expected={int(args.window_len)}"
+                )
                 continue
             try:
                 clip_local_start = int(clip_dir.name.split("_")[-1])
@@ -357,6 +380,15 @@ def main() -> None:
             local_end = max(local_indices_all)
             global_start = window_start + clip_local_start + local_start
             global_end = window_start + clip_local_start + local_end
+
+            if args.strict_window_len:
+                strict_window_end = window_start + int(args.window_len) - 1
+                if global_end > strict_window_end:
+                    print(
+                        f"[WARN] Skip clip (exceeds window end): {clip_dir} "
+                        f"global_end={global_end} window_end={strict_window_end}"
+                    )
+                    continue
 
             # Choose which local indices to actually caption with.
             # If --use_mask_frame_indices is set and mask has 81 frames, you likely don't want to feed all frames.
