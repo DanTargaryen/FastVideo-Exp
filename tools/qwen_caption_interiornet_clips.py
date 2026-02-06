@@ -245,6 +245,9 @@ def main() -> None:
         action="store_true",
         help="Caption using clip_dir/masked_rgb images instead of original cam0/data frames (fallback for webp decode).",
     )
+    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
+    parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
+    parser.add_argument("--skip_existing", action="store_true", help="Skip if the output caption file already exists.")
     parser.add_argument("--model", type=str, required=True, help="Local path or HF id for Qwen2.5-VL Instruct.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32", "auto"])
     parser.add_argument("--device_map", type=str, default="auto")
@@ -263,6 +266,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if int(args.world_size) <= 0:
+        raise ValueError("--world_size must be >= 1")
+    if int(args.rank) < 0 or int(args.rank) >= int(args.world_size):
+        raise ValueError(f"--rank must be in [0, {int(args.world_size) - 1}]")
 
     mask_root = Path(args.mask_root)
     data_root = Path(args.data_root)
@@ -293,7 +300,11 @@ def main() -> None:
 
         cam_files = _sorted_images(cam_dir) if cam_dir.is_dir() else []
 
+        clip_iter_index = -1
         for clip_dir in _iter_clip_dirs(scene_dir):
+            clip_iter_index += 1
+            if (clip_iter_index % int(args.world_size)) != int(args.rank):
+                continue
             # parse window start from parent dir name "<start>_<end>"
             window_dir = clip_dir.parent
             try:
@@ -415,6 +426,10 @@ def main() -> None:
                     print(f"[WARN] No picked frames for {clip_dir} global_indices={global_indices}")
                     continue
                 out_path = clip_dir / out_name
+
+            if args.skip_existing and out_path.is_file():
+                print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
+                continue
 
             try:
                 obj = _caption_from_image_paths(
