@@ -90,7 +90,7 @@ flow_shift: 5
 # ---- Checkpointing / logs ----
 output_dir: /vePFS-buaa/linming/workspace/worldrender/phase2_ckpt/wan_controlnet_self_forcing_phase2
 checkpoints_total_limit: 2
-training_state_checkpointing_steps: 200
+training_state_checkpointing_steps: 1000
 # Additionally save consolidated (single-file) generator inference checkpoints every N steps:
 # - `generator_inference_transformer/` (student transformer)
 # - `generator_inference_controlnet/` (student controlnet)
