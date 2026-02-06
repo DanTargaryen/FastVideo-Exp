@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+def _is_int_str(s: str) -> bool:
+    return bool(s) and s.isdigit()
+
+
 def _extract_first_json(text: str) -> dict[str, Any]:
     text = text.strip()
     if not text:
@@ -212,6 +216,60 @@ def _iter_clip_dirs(mask_scene_dir: Path) -> Iterable[tuple[int, int, int, Path]
             yield window_start, window_end, clip_start, clip_dir
 
 
+def _build_rgb_index(rgb_base_dir: Path) -> tuple[list[int], list[Path], set[int]]:
+    # MatrixCity frames are named like "0000.png" (but may exceed 4 digits). Use integer stem sorting.
+    ids: list[int] = []
+    paths: list[Path] = []
+    for p in _sorted_images(rgb_base_dir):
+        if _is_int_str(p.stem):
+            ids.append(int(p.stem))
+            paths.append(p)
+    if not ids:
+        return [], [], set()
+    order = sorted(range(len(ids)), key=lambda i: ids[i])
+    ids_sorted = [ids[i] for i in order]
+    paths_sorted = [paths[i] for i in order]
+    return ids_sorted, paths_sorted, set(ids_sorted)
+
+
+def _slice_window_files(
+    *,
+    window_start: int,
+    window_end: int,
+    clip_dir: Path,
+    rgb_ids: list[int],
+    rgb_paths: list[Path],
+    rgb_id_set: set[int],
+) -> tuple[list[Path], list[int], str]:
+    """
+    Returns (window_files, window_ids, mode).
+
+    mode:
+      - "id_range": window_start/window_end are interpreted as actual frame ids (stems).
+      - "index_range": window_start/window_end are interpreted as 0-based indices into rgb_paths.
+    """
+    if not rgb_ids or not rgb_paths:
+        return [], [], "empty"
+
+    # Prefer id-range if both ends exist as real ids.
+    if window_start in rgb_id_set and window_end in rgb_id_set:
+        import bisect
+
+        i0 = bisect.bisect_left(rgb_ids, window_start)
+        i1 = bisect.bisect_right(rgb_ids, window_end)
+        return rgb_paths[i0:i1], rgb_ids[i0:i1], "id_range"
+
+    # Otherwise, treat as indices into the sorted list if plausible.
+    if 0 <= window_start <= window_end < len(rgb_paths):
+        return rgb_paths[window_start : window_end + 1], rgb_ids[window_start : window_end + 1], "index_range"
+
+    print(
+        f"[WARN] Cannot interpret window dir as id-range or index-range: {window_start}_{window_end} for {clip_dir}. "
+        f"rgb_ids_min={rgb_ids[0]} rgb_ids_max={rgb_ids[-1]} rgb_len={len(rgb_paths)}"
+    )
+    return [], [], "unsupported"
+
+
 def _find_scene_root(data_root: Path, street_dir: str, street_split: str | None) -> Path | None:
     # MatrixCity split files contain paths like:
     # small_city/street/train_dense_half/small_city_road_down_dense
@@ -317,6 +375,9 @@ def main() -> None:
     for scene_dir in street_dirs:
         street_dir = scene_dir.name
         rgb_base_dir: Path | None = None
+        rgb_ids: list[int] = []
+        rgb_paths: list[Path] = []
+        rgb_id_set: set[int] = set()
         if not args.use_masked_rgb:
             scene_root = _find_scene_root(data_root, street_dir, str(args.street_split).strip() or None)
             if scene_root is None:
@@ -326,6 +387,10 @@ def main() -> None:
             rgb_base_dir = scene_root / street_dir
             if not rgb_base_dir.is_dir():
                 print(f"[WARN] Missing rgb dir for {street_dir}: {rgb_base_dir}; skip")
+                continue
+            rgb_ids, rgb_paths, rgb_id_set = _build_rgb_index(rgb_base_dir)
+            if not rgb_ids:
+                print(f"[WARN] No rgb frames found in {rgb_base_dir}; skip {street_dir}")
                 continue
 
         for window_start, window_end, clip_start, clip_dir in _iter_clip_dirs(scene_dir):
@@ -392,29 +457,14 @@ def main() -> None:
                 frame_end = window_start + clip_start + local_end
             else:
                 assert rgb_base_dir is not None
-                # Build the window file list by direct id->path formatting.
-                # This avoids scanning huge directories for every clip.
-                # Assumption (matches UniDataset mask naming): window_start/window_end are numeric frame ids, and
-                # frames are dense within the window.
-                window_files: list[Path] = []
-                missing = 0
-                for fid in range(window_start, window_end + 1):
-                    p = rgb_base_dir / f"{fid:04d}.png"
-                    if p.is_file():
-                        window_files.append(p)
-                    else:
-                        missing += 1
-
-                # Fallback: if too many files are missing, do a directory scan within range.
-                if not window_files or missing > max(10, (window_end - window_start + 1) // 10):
-                    window_files = []
-                    for p in _sorted_images(rgb_base_dir):
-                        if not p.stem.isdigit():
-                            continue
-                        sid = int(p.stem)
-                        if window_start <= sid <= window_end:
-                            window_files.append(p)
-                    window_files = sorted(window_files, key=lambda p: int(p.stem))
+                window_files, window_ids, mode = _slice_window_files(
+                    window_start=window_start,
+                    window_end=window_end,
+                    clip_dir=clip_dir,
+                    rgb_ids=rgb_ids,
+                    rgb_paths=rgb_paths,
+                    rgb_id_set=rgb_id_set,
+                )
                 if not window_files:
                     print(f"[WARN] No rgb files in {rgb_base_dir} within [{window_start},{window_end}] for {clip_dir}")
                     continue
@@ -431,8 +481,12 @@ def main() -> None:
                 # Name by actual frame ids (stems) at clip start/end if possible.
                 si = clip_start + local_start
                 ei = clip_start + local_end
-                frame_start = int(window_files[si].stem) if 0 <= si < len(window_files) else window_start
-                frame_end = int(window_files[ei].stem) if 0 <= ei < len(window_files) else window_end
+                if window_ids and 0 <= si < len(window_ids) and 0 <= ei < len(window_ids):
+                    frame_start = int(window_ids[si])
+                    frame_end = int(window_ids[ei])
+                else:
+                    frame_start = int(window_files[si].stem) if 0 <= si < len(window_files) and _is_int_str(window_files[si].stem) else window_start
+                    frame_end = int(window_files[ei].stem) if 0 <= ei < len(window_files) and _is_int_str(window_files[ei].stem) else window_end
 
             out_name_fields = {
                 "window_start": window_start,
