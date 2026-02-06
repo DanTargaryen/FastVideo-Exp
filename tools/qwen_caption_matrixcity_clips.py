@@ -212,11 +212,19 @@ def _iter_clip_dirs(mask_scene_dir: Path) -> Iterable[tuple[int, int, int, Path]
             yield window_start, window_end, clip_start, clip_dir
 
 
-def _find_scene_root(data_root: Path, street_dir: str) -> Path | None:
+def _find_scene_root(data_root: Path, street_dir: str, street_split: str | None) -> Path | None:
     # MatrixCity split files contain paths like:
     # small_city/street/train_dense_half/small_city_road_down_dense
-    candidates = []
-    for p in (data_root / "small_city" / "street").glob(f"*/{street_dir}"):
+    candidates: list[Path] = []
+    street_base = data_root / "small_city" / "street"
+    if street_split:
+        for p in street_base.glob(f"{street_split}/{street_dir}"):
+            if (p / "transforms.json").is_file():
+                candidates.append(p)
+    else:
+        for p in street_base.glob(f"*/{street_dir}"):
+            if (p / "transforms.json").is_file():
+                candidates.append(p)
         if (p / "transforms.json").is_file():
             candidates.append(p)
     for p in (data_root / "small_city" / "aerial").glob(f"*/{street_dir}"):
@@ -238,6 +246,12 @@ def main() -> None:
     parser.add_argument("--mask_root", type=str, required=True, help="MASK_MATRIXCITY root.")
     parser.add_argument("--data_root", type=str, default="", help="MatrixCity root (needed unless --use_masked_rgb).")
     parser.add_argument("--street_dir", type=str, default="", help="Optional single street_dir (e.g. small_city_road_down_dense).")
+    parser.add_argument(
+        "--street_split",
+        type=str,
+        default="",
+        help="Optional street split to search under data_root/small_city/street (e.g. train_dense, train_dense_half, test).",
+    )
     parser.add_argument(
         "--use_mask_frame_indices",
         action="store_true",
@@ -304,7 +318,7 @@ def main() -> None:
         street_dir = scene_dir.name
         rgb_base_dir: Path | None = None
         if not args.use_masked_rgb:
-            scene_root = _find_scene_root(data_root, street_dir)
+            scene_root = _find_scene_root(data_root, street_dir, str(args.street_split).strip() or None)
             if scene_root is None:
                 print(f"[WARN] Cannot find MatrixCity scene root for {street_dir} under {data_root}; skip")
                 continue
@@ -378,16 +392,29 @@ def main() -> None:
                 frame_end = window_start + clip_start + local_end
             else:
                 assert rgb_base_dir is not None
-                # Build the window file list from stems in [window_start..window_end].
-                # This matches how mask windows are named in mask generation (min_id/max_id in clip).
-                window_files = []
-                for p in _sorted_images(rgb_base_dir):
-                    if not p.stem.isdigit():
-                        continue
-                    sid = int(p.stem)
-                    if window_start <= sid <= window_end:
+                # Build the window file list by direct id->path formatting.
+                # This avoids scanning huge directories for every clip.
+                # Assumption (matches UniDataset mask naming): window_start/window_end are numeric frame ids, and
+                # frames are dense within the window.
+                window_files: list[Path] = []
+                missing = 0
+                for fid in range(window_start, window_end + 1):
+                    p = rgb_base_dir / f"{fid:04d}.png"
+                    if p.is_file():
                         window_files.append(p)
-                window_files = sorted(window_files, key=lambda p: int(p.stem))
+                    else:
+                        missing += 1
+
+                # Fallback: if too many files are missing, do a directory scan within range.
+                if not window_files or missing > max(10, (window_end - window_start + 1) // 10):
+                    window_files = []
+                    for p in _sorted_images(rgb_base_dir):
+                        if not p.stem.isdigit():
+                            continue
+                        sid = int(p.stem)
+                        if window_start <= sid <= window_end:
+                            window_files.append(p)
+                    window_files = sorted(window_files, key=lambda p: int(p.stem))
                 if not window_files:
                     print(f"[WARN] No rgb files in {rgb_base_dir} within [{window_start},{window_end}] for {clip_dir}")
                     continue
@@ -441,4 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
