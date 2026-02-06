@@ -16,18 +16,21 @@ def _extract_first_json(text: str) -> dict[str, Any]:
         raise ValueError("Empty model output")
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
+    dec = json.JSONDecoder()
     try:
-        obj = json.loads(text)
+        obj, _ = dec.raw_decode(text)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
     start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        obj = json.loads(text[start : end + 1])
-        if isinstance(obj, dict):
-            return obj
+    if start >= 0:
+        try:
+            obj, _ = dec.raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
     raise ValueError("Failed to parse JSON from model output")
 
 

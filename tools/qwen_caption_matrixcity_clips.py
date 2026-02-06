@@ -20,18 +20,21 @@ def _extract_first_json(text: str) -> dict[str, Any]:
         raise ValueError("Empty model output")
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
+    dec = json.JSONDecoder()
     try:
-        obj = json.loads(text)
+        obj, _ = dec.raw_decode(text)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
     start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        obj = json.loads(text[start : end + 1])
-        if isinstance(obj, dict):
-            return obj
+    if start >= 0:
+        try:
+            obj, _ = dec.raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
     raise ValueError("Failed to parse JSON from model output")
 
 
@@ -312,6 +315,8 @@ def main() -> None:
     )
     parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
     parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
+    parser.add_argument("--window_len", type=int, default=243, help="Expected window length for padding (MatrixCity commonly uses 243).")
+    parser.add_argument("--skip_existing", action="store_true", help="Skip if the output caption file already exists.")
     parser.add_argument(
         "--use_mask_frame_indices",
         action="store_true",
@@ -479,6 +484,16 @@ def main() -> None:
                     print(f"[WARN] No rgb files in {rgb_base_dir} within [{window_start},{window_end}] for {clip_dir}")
                     continue
 
+                # Some mask windows are padded (e.g., last frame repeated), so "<start>_<end>" can be a short id/index range
+                # while clip_start still assumes a larger fixed window length. Pad window_files to cover requested indices.
+                needed_len = int(clip_start) + int(local_end) + 1
+                target_len = max(int(args.window_len), needed_len)
+                if len(window_files) < target_len:
+                    pad_n = target_len - len(window_files)
+                    window_files = window_files + [window_files[-1]] * pad_n
+                    if window_ids:
+                        window_ids = window_ids + [window_ids[-1]] * pad_n
+
                 picked_paths = []
                 for wi in window_indices:
                     if wi < 0 or wi >= len(window_files):
@@ -511,6 +526,9 @@ def main() -> None:
             if "{" in out_name and "}" in out_name:
                 out_name = out_name.format(**out_name_fields)
             out_path = clip_dir / out_name
+            if args.skip_existing and out_path.is_file():
+                print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
+                continue
 
             try:
                 obj = _caption_from_image_paths(
