@@ -306,6 +306,12 @@ def main() -> None:
     )
     parser.add_argument("--mask_root", type=str, required=True, help="MASK_MATRIXCITY root.")
     parser.add_argument("--data_root", type=str, default="", help="MatrixCity root (needed unless --use_masked_rgb).")
+    parser.add_argument(
+        "--rgb_root",
+        type=str,
+        default="",
+        help="Alias of --data_root (MatrixCity root). Kept for compatibility with other tools.",
+    )
     parser.add_argument("--street_dir", type=str, default="", help="Optional single street_dir (e.g. small_city_road_down_dense).")
     parser.add_argument(
         "--street_split",
@@ -313,7 +319,7 @@ def main() -> None:
         default="",
         help="Optional street split to search under data_root/small_city/street (e.g. train_dense, train_dense_half, test).",
     )
-    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
+    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx mod world_size) == rank.")
     parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
     parser.add_argument("--window_len", type=int, default=243, help="Expected window length for padding (MatrixCity commonly uses 243).")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if the output caption file already exists.")
@@ -338,6 +344,16 @@ def main() -> None:
         "--use_masked_rgb",
         action="store_true",
         help="Caption using clip_dir/masked_rgb images instead of original MatrixCity frames.",
+    )
+    parser.add_argument(
+        "--clip_list",
+        type=str,
+        default="",
+        help=(
+            "Optional text file containing one clip path per line (a directory named clip_start_XXX, "
+            "or a file inside it). When set, only listed clips will be captioned. "
+            "Relative paths are resolved under --mask_root."
+        ),
     )
     parser.add_argument("--model", type=str, required=True, help="Local path or HF id for Qwen2.5-VL Instruct.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32", "auto"])
@@ -364,10 +380,11 @@ def main() -> None:
         raise ValueError(f"--rank must be in [0, {int(args.world_size) - 1}]")
 
     mask_root = Path(args.mask_root)
-    data_root = Path(args.data_root) if args.data_root else Path()
+    data_root_str = str(args.data_root).strip() or str(args.rgb_root).strip()
+    data_root = Path(data_root_str) if data_root_str else Path()
     if not mask_root.is_dir():
         raise FileNotFoundError(f"mask_root not found: {mask_root}")
-    if not args.use_masked_rgb and (not args.data_root or not data_root.is_dir()):
+    if not args.use_masked_rgb and (not data_root_str or not data_root.is_dir()):
         raise FileNotFoundError("data_root is required unless --use_masked_rgb is set")
 
     model, processor = _load_qwen(
@@ -377,6 +394,232 @@ def main() -> None:
         attn_impl=str(args.attn_impl).strip() or None,
     )
 
+    def _resolve_clip_dir_from_path(path: Path) -> Path | None:
+        if path.is_dir() and path.name.startswith("clip_start_"):
+            return path
+        for parent in path.parents:
+            if parent.name.startswith("clip_start_"):
+                return parent
+        return None
+
+    def _read_clip_list(clip_list_path: str) -> list[Path]:
+        p = Path(os.path.expanduser(os.path.expandvars(clip_list_path)))
+        if not p.is_file():
+            raise FileNotFoundError(f"--clip_list not found: {p}")
+        clips: list[Path] = []
+        seen: set[str] = set()
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            candidate = Path(os.path.expanduser(os.path.expandvars(line)))
+            if not candidate.is_absolute():
+                candidate = mask_root / candidate
+            clip_dir = _resolve_clip_dir_from_path(candidate)
+            if clip_dir is None:
+                print(f"[WARN] Invalid clip path in list (no clip_start_* found): {line}")
+                continue
+            if not clip_dir.is_dir():
+                print(f"[WARN] Clip dir not found: {clip_dir}")
+                continue
+            key = str(clip_dir)
+            if key in seen:
+                continue
+            seen.add(key)
+            clips.append(clip_dir)
+        return clips
+
+    # Cache per street_dir to avoid repeated scanning.
+    rgb_cache: dict[str, tuple[Path | None, list[int], list[Path], set[int]]] = {}
+
+    def _get_rgb_index(street_dir: str) -> tuple[Path | None, list[int], list[Path], set[int]]:
+        cached = rgb_cache.get(street_dir)
+        if cached is not None:
+            return cached
+        if args.use_masked_rgb:
+            rgb_cache[street_dir] = (None, [], [], set())
+            return rgb_cache[street_dir]
+        scene_root = _find_scene_root(data_root, street_dir, str(args.street_split).strip() or None)
+        if scene_root is None:
+            print(f"[WARN] Cannot find MatrixCity scene root for {street_dir} under {data_root}; skip")
+            rgb_cache[street_dir] = (None, [], [], set())
+            return rgb_cache[street_dir]
+        rgb_base_dir = scene_root / street_dir
+        if not rgb_base_dir.is_dir():
+            print(f"[WARN] Missing rgb dir for {street_dir}: {rgb_base_dir}; skip")
+            rgb_cache[street_dir] = (rgb_base_dir, [], [], set())
+            return rgb_cache[street_dir]
+        rgb_ids, rgb_paths, rgb_id_set = _build_rgb_index(rgb_base_dir)
+        rgb_cache[street_dir] = (rgb_base_dir, rgb_ids, rgb_paths, rgb_id_set)
+        return rgb_cache[street_dir]
+
+    def _process_clip(street_dir: str, window_start: int, window_end: int, clip_start: int, clip_dir: Path) -> None:
+        # Decide clip-local indices.
+        if args.use_mask_frame_indices:
+            mask_dir = clip_dir / "mask"
+            if not mask_dir.is_dir():
+                print(f"[WARN] Missing mask dir: {mask_dir}")
+                return
+            local_indices_all: list[int] = []
+            for p in _sorted_images(mask_dir):
+                if p.stem.isdigit():
+                    local_indices_all.append(int(p.stem))
+            if not local_indices_all:
+                print(f"[WARN] No mask frames in: {mask_dir}")
+                return
+            local_indices_all = sorted(set(local_indices_all))
+        else:
+            n_total = int(args.clip_length)
+            local_indices_all = list(range(max(n_total, 1)))
+
+        local_start = min(local_indices_all)
+        local_end = max(local_indices_all)
+
+        # Choose which indices to feed to Qwen (uniform on the local_indices_all list positions).
+        n = int(args.sample_frames)
+        if n <= 0 or n >= len(local_indices_all):
+            local_indices_used = local_indices_all
+        elif n == 1:
+            local_indices_used = [local_indices_all[0]]
+        else:
+            last = len(local_indices_all) - 1
+            picked: list[int] = []
+            for k in range(n):
+                pos = k * last / (n - 1)
+                picked.append(local_indices_all[int(round(pos))])
+            local_indices_used = sorted(set(picked))
+
+        # Map clip-local idx -> window idx: (clip_start + idx)
+        window_indices = [clip_start + li for li in local_indices_used]
+
+        if args.use_masked_rgb:
+            src_dir = clip_dir / "masked_rgb"
+            if not src_dir.is_dir():
+                print(f"[WARN] Missing masked_rgb dir: {src_dir}")
+                return
+            files = _sorted_images(src_dir)
+            if not files:
+                print(f"[WARN] No images in {src_dir}")
+                return
+            picked_paths: list[str] = []
+            for wi in window_indices:
+                li = wi - clip_start
+                if li < 0 or li >= len(files):
+                    continue
+                picked_paths.append(str(files[li]))
+            if not picked_paths:
+                print(f"[WARN] No picked frames in {src_dir} for window_indices={window_indices}")
+                return
+
+            frame_start = window_start + clip_start + local_start
+            frame_end = window_start + clip_start + local_end
+        else:
+            rgb_base_dir, rgb_ids, rgb_paths, rgb_id_set = _get_rgb_index(street_dir)
+            if not rgb_ids or not rgb_paths or not rgb_id_set:
+                print(f"[WARN] No rgb index for {street_dir}; skip clip {clip_dir}")
+                return
+
+            window_files, window_ids, _ = _slice_window_files(
+                window_start=window_start,
+                window_end=window_end,
+                clip_dir=clip_dir,
+                rgb_ids=rgb_ids,
+                rgb_paths=rgb_paths,
+                rgb_id_set=rgb_id_set,
+            )
+            if not window_files:
+                print(f"[WARN] No rgb files in {rgb_base_dir} within [{window_start},{window_end}] for {clip_dir}")
+                return
+
+            needed_len = int(clip_start) + int(local_end) + 1
+            target_len = max(int(args.window_len), needed_len)
+            if len(window_files) < target_len:
+                pad_n = target_len - len(window_files)
+                window_files = window_files + [window_files[-1]] * pad_n
+                if window_ids:
+                    window_ids = window_ids + [window_ids[-1]] * pad_n
+
+            picked_paths = []
+            for wi in window_indices:
+                if wi < 0 or wi >= len(window_files):
+                    continue
+                picked_paths.append(str(window_files[wi]))
+            if not picked_paths:
+                print(f"[WARN] No picked rgb frames for {clip_dir} window_indices={window_indices}")
+                return
+
+            si = clip_start + local_start
+            ei = clip_start + local_end
+            if window_ids and 0 <= si < len(window_ids) and 0 <= ei < len(window_ids):
+                frame_start = int(window_ids[si])
+                frame_end = int(window_ids[ei])
+            else:
+                frame_start = int(window_files[si].stem) if 0 <= si < len(window_files) and _is_int_str(window_files[si].stem) else window_start
+                frame_end = int(window_files[ei].stem) if 0 <= ei < len(window_files) and _is_int_str(window_files[ei].stem) else window_end
+
+        out_name_fields = {
+            "window_start": window_start,
+            "window_end": window_end,
+            "clip_start": clip_start,
+            "local_start": local_start,
+            "local_end": local_end,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+        }
+        out_name = str(args.out_name)
+        if "{" in out_name and "}" in out_name:
+            out_name = out_name.format(**out_name_fields)
+        out_path = clip_dir / out_name
+        if args.skip_existing and out_path.is_file():
+            print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
+            return
+
+        try:
+            obj = _caption_from_image_paths(
+                model=model,
+                processor=processor,
+                image_paths=picked_paths,
+                max_new_tokens=int(args.max_new_tokens),
+                temperature=float(args.temperature),
+                top_p=float(args.top_p),
+            )
+        except Exception as e:
+            print(f"[ERROR] caption failed for {clip_dir}: {e}")
+            return
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+        print(f"[OK] {clip_dir} -> {out_path}")
+
+    clip_list = str(args.clip_list).strip()
+    if clip_list:
+        clips_all = _read_clip_list(clip_list)
+        if args.street_dir:
+            clips_all = [c for c in clips_all if c.parent.parent.name == str(args.street_dir)]
+        clips = [p for i, p in enumerate(clips_all) if (i % int(args.world_size)) == int(args.rank)]
+        print(
+            f"[INFO] clip_list mode: total_clips={len(clips_all)} "
+            f"rank={int(args.rank)}/{int(args.world_size)} assigned={len(clips)}"
+        )
+        for clip_dir in clips:
+            window_dir = clip_dir.parent
+            scene_dir = window_dir.parent
+            street_dir = scene_dir.name
+            try:
+                window_start_str, window_end_str = window_dir.name.split("_", 1)
+                window_start = int(window_start_str)
+                window_end = int(window_end_str)
+            except Exception:
+                print(f"[WARN] Skip invalid window dir: {window_dir}")
+                continue
+            try:
+                clip_start = int(clip_dir.name.split("_")[-1])
+            except Exception:
+                print(f"[WARN] Skip invalid clip dir: {clip_dir}")
+                continue
+            _process_clip(street_dir, window_start, window_end, clip_start, clip_dir)
+        return
+
     street_dirs: list[Path]
     if args.street_dir:
         street_dirs = [mask_root / args.street_dir]
@@ -385,167 +628,12 @@ def main() -> None:
 
     for scene_dir in street_dirs:
         street_dir = scene_dir.name
-        rgb_base_dir: Path | None = None
-        rgb_ids: list[int] = []
-        rgb_paths: list[Path] = []
-        rgb_id_set: set[int] = set()
-        if not args.use_masked_rgb:
-            scene_root = _find_scene_root(data_root, street_dir, str(args.street_split).strip() or None)
-            if scene_root is None:
-                print(f"[WARN] Cannot find MatrixCity scene root for {street_dir} under {data_root}; skip")
-                continue
-            # RGB frames live under "<scene_root>/<street_dir>/*.png"
-            rgb_base_dir = scene_root / street_dir
-            if not rgb_base_dir.is_dir():
-                print(f"[WARN] Missing rgb dir for {street_dir}: {rgb_base_dir}; skip")
-                continue
-            rgb_ids, rgb_paths, rgb_id_set = _build_rgb_index(rgb_base_dir)
-            if not rgb_ids:
-                print(f"[WARN] No rgb frames found in {rgb_base_dir}; skip {street_dir}")
-                continue
-
         clip_iter_index = -1
         for window_start, window_end, clip_start, clip_dir in _iter_clip_dirs(scene_dir):
             clip_iter_index += 1
             if (clip_iter_index % int(args.world_size)) != int(args.rank):
                 continue
-            # Decide clip-local indices.
-            if args.use_mask_frame_indices:
-                mask_dir = clip_dir / "mask"
-                if not mask_dir.is_dir():
-                    print(f"[WARN] Missing mask dir: {mask_dir}")
-                    continue
-                local_indices_all = []
-                for p in _sorted_images(mask_dir):
-                    if p.stem.isdigit():
-                        local_indices_all.append(int(p.stem))
-                if not local_indices_all:
-                    print(f"[WARN] No mask frames in: {mask_dir}")
-                    continue
-                local_indices_all = sorted(set(local_indices_all))
-            else:
-                n_total = int(args.clip_length)
-                local_indices_all = list(range(max(n_total, 1)))
-
-            local_start = min(local_indices_all)
-            local_end = max(local_indices_all)
-
-            # Choose which indices to feed to Qwen (uniform on the local_indices_all list positions).
-            n = int(args.sample_frames)
-            if n <= 0 or n >= len(local_indices_all):
-                local_indices_used = local_indices_all
-            elif n == 1:
-                local_indices_used = [local_indices_all[0]]
-            else:
-                last = len(local_indices_all) - 1
-                picked = []
-                for k in range(n):
-                    pos = k * last / (n - 1)
-                    picked.append(local_indices_all[int(round(pos))])
-                local_indices_used = sorted(set(picked))
-
-            # Map clip-local idx -> window idx: (clip_start + idx)
-            window_indices = [clip_start + li for li in local_indices_used]
-
-            if args.use_masked_rgb:
-                src_dir = clip_dir / "masked_rgb"
-                if not src_dir.is_dir():
-                    print(f"[WARN] Missing masked_rgb dir: {src_dir}")
-                    continue
-                files = _sorted_images(src_dir)
-                if not files:
-                    print(f"[WARN] No images in {src_dir}")
-                    continue
-                picked_paths = []
-                for wi in window_indices:
-                    # clip-local images should be indexed by local idx, not window idx; here we assume masked_rgb is 0..(clip_length-1)
-                    li = wi - clip_start
-                    if li < 0 or li >= len(files):
-                        continue
-                    picked_paths.append(str(files[li]))
-                if not picked_paths:
-                    print(f"[WARN] No picked frames in {src_dir} for window_indices={window_indices}")
-                    continue
-
-                # best-effort numeric range for naming: use mask window + clip_start + local indices
-                frame_start = window_start + clip_start + local_start
-                frame_end = window_start + clip_start + local_end
-            else:
-                assert rgb_base_dir is not None
-                window_files, window_ids, mode = _slice_window_files(
-                    window_start=window_start,
-                    window_end=window_end,
-                    clip_dir=clip_dir,
-                    rgb_ids=rgb_ids,
-                    rgb_paths=rgb_paths,
-                    rgb_id_set=rgb_id_set,
-                )
-                if not window_files:
-                    print(f"[WARN] No rgb files in {rgb_base_dir} within [{window_start},{window_end}] for {clip_dir}")
-                    continue
-
-                # Some mask windows are padded (e.g., last frame repeated), so "<start>_<end>" can be a short id/index range
-                # while clip_start still assumes a larger fixed window length. Pad window_files to cover requested indices.
-                needed_len = int(clip_start) + int(local_end) + 1
-                target_len = max(int(args.window_len), needed_len)
-                if len(window_files) < target_len:
-                    pad_n = target_len - len(window_files)
-                    window_files = window_files + [window_files[-1]] * pad_n
-                    if window_ids:
-                        window_ids = window_ids + [window_ids[-1]] * pad_n
-
-                picked_paths = []
-                for wi in window_indices:
-                    if wi < 0 or wi >= len(window_files):
-                        continue
-                    picked_paths.append(str(window_files[wi]))
-                if not picked_paths:
-                    print(f"[WARN] No picked rgb frames for {clip_dir} window_indices={window_indices}")
-                    continue
-
-                # Name by actual frame ids (stems) at clip start/end if possible.
-                si = clip_start + local_start
-                ei = clip_start + local_end
-                if window_ids and 0 <= si < len(window_ids) and 0 <= ei < len(window_ids):
-                    frame_start = int(window_ids[si])
-                    frame_end = int(window_ids[ei])
-                else:
-                    frame_start = int(window_files[si].stem) if 0 <= si < len(window_files) and _is_int_str(window_files[si].stem) else window_start
-                    frame_end = int(window_files[ei].stem) if 0 <= ei < len(window_files) and _is_int_str(window_files[ei].stem) else window_end
-
-            out_name_fields = {
-                "window_start": window_start,
-                "window_end": window_end,
-                "clip_start": clip_start,
-                "local_start": local_start,
-                "local_end": local_end,
-                "frame_start": frame_start,
-                "frame_end": frame_end,
-            }
-            out_name = str(args.out_name)
-            if "{" in out_name and "}" in out_name:
-                out_name = out_name.format(**out_name_fields)
-            out_path = clip_dir / out_name
-            if args.skip_existing and out_path.is_file():
-                print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
-                continue
-
-            try:
-                obj = _caption_from_image_paths(
-                    model=model,
-                    processor=processor,
-                    image_paths=picked_paths,
-                    max_new_tokens=int(args.max_new_tokens),
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                )
-            except Exception as e:
-                print(f"[ERROR] caption failed for {clip_dir}: {e}")
-                continue
-
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
-            print(f"[OK] {clip_dir} -> {out_path}")
+            _process_clip(street_dir, window_start, window_end, clip_start, clip_dir)
 
 
 if __name__ == "__main__":

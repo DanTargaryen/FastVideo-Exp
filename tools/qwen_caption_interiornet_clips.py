@@ -302,7 +302,7 @@ def main() -> None:
         action="store_true",
         help="Caption using clip_dir/masked_rgb images instead of original cam0/data frames (fallback for webp decode).",
     )
-    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx % world_size) == rank.")
+    parser.add_argument("--rank", type=int, default=0, help="Shard rank (0-based). Only process clips where (idx mod world_size) == rank.")
     parser.add_argument("--world_size", type=int, default=1, help="Number of shards for clip-level parallelism.")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if the output caption file already exists.")
     parser.add_argument(
