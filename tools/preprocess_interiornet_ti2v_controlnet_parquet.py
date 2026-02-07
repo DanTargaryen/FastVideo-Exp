@@ -45,6 +45,9 @@ from tqdm import tqdm
 from fastvideo import PipelineConfig
 from fastvideo.dataset.dataloader.parquet_io import ParquetDatasetWriter, records_to_table
 from fastvideo.dataset.dataloader.schema import pyarrow_schema_ti2v_controlnet
+from fastvideo.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+)
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
@@ -344,6 +347,17 @@ def main() -> None:
         # Under CUDA_VISIBLE_DEVICES, the selected GPU is exposed as local index 0.
         device = torch.device("cuda:0")
         torch.cuda.set_device(0)
+
+        # Some FastVideo layers (e.g., vocab-parallel embedding) expect TP/SP groups
+        # to be initialized even in single-process mode.
+        # Use a unique tcp:// port per shard to avoid collisions when users launch
+        # multiple independent processes (one per GPU) without torchrun.
+        dist_port = 29500 + int(args.rank)
+        maybe_init_distributed_environment_and_model_parallel(
+            tp_size=1,
+            sp_size=1,
+            distributed_init_method=f"tcp://127.0.0.1:{dist_port}",
+        )
     else:
         device = torch.device("cpu")
 
