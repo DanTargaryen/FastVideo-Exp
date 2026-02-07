@@ -218,6 +218,50 @@ def _sorted_images(dir_path: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.name)
 
 
+def _resolve_clip_dir_from_path(path: Path) -> Path | None:
+    """
+    Accept a path that points to:
+      - a clip directory: .../clip_start_XXX
+      - a file inside a clip directory
+    and return the clip directory path.
+    """
+    if path.is_dir() and path.name.startswith("clip_start_"):
+        return path
+    for parent in path.parents:
+        if parent.name.startswith("clip_start_"):
+            return parent
+    return None
+
+
+def _read_clip_list(clip_list_path: str, mask_root: Path) -> list[Path]:
+    p = Path(os.path.expanduser(os.path.expandvars(clip_list_path)))
+    if not p.is_file():
+        raise FileNotFoundError(f"--clip_list not found: {p}")
+
+    clips: list[Path] = []
+    seen: set[str] = set()
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        candidate = Path(os.path.expanduser(os.path.expandvars(line)))
+        if not candidate.is_absolute():
+            candidate = mask_root / candidate
+        clip_dir = _resolve_clip_dir_from_path(candidate)
+        if clip_dir is None:
+            print(f"[WARN] Invalid clip path in list (no clip_start_* found): {line}")
+            continue
+        if not clip_dir.is_dir():
+            print(f"[WARN] Clip dir not found: {clip_dir}")
+            continue
+        key = str(clip_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        clips.append(clip_dir)
+    return clips
+
+
 def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -231,6 +275,16 @@ def main() -> None:
         type=str,
         default="",
         help="Optional scene key like 'HD1_3FO4JXIK2PXE_original_1_1'. If empty, process all scenes under mask_root.",
+    )
+    parser.add_argument(
+        "--clip_list",
+        type=str,
+        default="",
+        help=(
+            "Optional text file containing one clip path per line (a directory named clip_start_XXX, "
+            "or a file inside it). When set, only listed clips will be captioned. "
+            "Relative paths are resolved under --mask_root."
+        ),
     )
     parser.add_argument(
         "--use_mask_frame_indices",
@@ -302,6 +356,196 @@ def main() -> None:
         attn_impl=str(args.attn_impl).strip() or None,
     )
 
+    cam_cache: dict[str, list[Path]] = {}
+
+    def _get_cam_files_for_scene(scene_key: str) -> list[Path]:
+        cached = cam_cache.get(scene_key)
+        if cached is not None:
+            return cached
+        hd, scene_id, sequence_id = _parse_scene_key(scene_key)
+        cam_dir = data_root / hd / scene_id / sequence_id / "cam0" / "data"
+        if not cam_dir.is_dir() and not args.use_masked_rgb:
+            print(f"[WARN] Missing cam dir for {scene_key}: {cam_dir}. Use --use_masked_rgb to caption from masked_rgb.")
+        cam_files = _sorted_images(cam_dir) if cam_dir.is_dir() else []
+        cam_cache[scene_key] = cam_files
+        return cam_files
+
+    def _process_clip_dir(clip_dir: Path) -> None:
+        # parse window start from parent dir name "<start>_<end>"
+        window_dir = clip_dir.parent
+        scene_dir = window_dir.parent
+        scene_key = scene_dir.name
+        cam_files = _get_cam_files_for_scene(scene_key)
+
+        try:
+            window_start_str, window_end_str = window_dir.name.split("_", 1)
+            window_start = int(window_start_str)
+            window_end = int(window_end_str)
+        except Exception:
+            print(f"[WARN] Skip invalid window dir: {window_dir}")
+            return
+        window_len = int(window_end) - int(window_start) + 1
+        if args.strict_window_len and window_len != int(args.window_len):
+            print(
+                f"[WARN] Skip window (len mismatch): {window_dir} "
+                f"len={window_len} expected={int(args.window_len)}"
+            )
+            return
+        try:
+            clip_local_start = int(clip_dir.name.split("_")[-1])
+        except Exception:
+            print(f"[WARN] Skip invalid clip dir: {clip_dir}")
+            return
+
+        if args.use_mask_frame_indices:
+            mask_dir = clip_dir / "mask"
+            if not mask_dir.is_dir():
+                print(f"[WARN] Missing mask dir: {mask_dir}")
+                return
+            local_indices_all = []
+            for p in _sorted_images(mask_dir):
+                stem = p.stem
+                if stem.isdigit():
+                    local_indices_all.append(int(stem))
+            if not local_indices_all:
+                print(f"[WARN] No mask frames in: {mask_dir}")
+                return
+        else:
+            # Uniform sample over 81-frame clip local indices [0..80]
+            n = int(args.sample_frames)
+            if n <= 0:
+                local_indices_all = [0, 40, 80]
+            else:
+                local_indices_all = []
+                if n == 1:
+                    local_indices_all = [0]
+                else:
+                    for k in range(n):
+                        t = k * 80 / (n - 1)
+                        local_indices_all.append(int(round(t)))
+                # de-dup
+                local_indices_all = sorted(set(local_indices_all))
+
+        # Compute global range for naming/debugging.
+        local_start = min(local_indices_all)
+        local_end = max(local_indices_all)
+        global_start = window_start + clip_local_start + local_start
+        global_end = window_start + clip_local_start + local_end
+
+        if args.strict_window_len:
+            strict_window_end = window_start + int(args.window_len) - 1
+            if global_end > strict_window_end:
+                print(
+                    f"[WARN] Skip clip (exceeds window end): {clip_dir} "
+                    f"global_end={global_end} window_end={strict_window_end}"
+                )
+                return
+
+        # Choose which local indices to actually caption with.
+        local_indices_used = local_indices_all
+        if args.use_mask_frame_indices:
+            n = int(args.sample_frames)
+            if n > 0 and n < len(local_indices_all):
+                if n == 1:
+                    local_indices_used = [local_indices_all[0]]
+                else:
+                    local_indices_used = []
+                    last = len(local_indices_all) - 1
+                    for k in range(n):
+                        pos = k * last / (n - 1)
+                        local_indices_used.append(local_indices_all[int(round(pos))])
+                    local_indices_used = sorted(set(local_indices_used))
+
+        out_name_fields = {
+            "global_start": global_start,
+            "global_end": global_end,
+            "local_start": local_start,
+            "local_end": local_end,
+            "window_start": window_start,
+            "clip_start": clip_local_start,
+        }
+
+        out_name = args.out_name
+        if "{" in out_name and "}" in out_name:
+            try:
+                out_name = out_name.format(**out_name_fields)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to format --out_name template: {args.out_name!r} with {out_name_fields}"
+                ) from e
+
+        if args.use_masked_rgb:
+            src_dir = clip_dir / "masked_rgb"
+            if not src_dir.is_dir():
+                print(f"[WARN] Missing masked_rgb dir: {src_dir}")
+                return
+            # Use file list directly; if local_indices exceed, just clamp.
+            files = _sorted_images(src_dir)
+            if not files:
+                print(f"[WARN] No images in {src_dir}")
+                return
+            picked = []
+            for li in local_indices_used:
+                if li < 0:
+                    continue
+                if li >= len(files):
+                    continue
+                picked.append(str(files[li]))
+            if not picked:
+                print(f"[WARN] No picked frames in {src_dir} for indices={local_indices_used}")
+                return
+            out_path = clip_dir / out_name
+        else:
+            clip_global_start = window_start + clip_local_start
+            global_indices = [clip_global_start + li for li in local_indices_used]
+            if not cam_files:
+                print(f"[WARN] No cam files for {scene_key}; skip clip {clip_dir}")
+                return
+            picked = []
+            for gi in global_indices:
+                if gi < 0 or gi >= len(cam_files):
+                    continue
+                picked.append(str(cam_files[gi]))
+            if not picked:
+                print(f"[WARN] No picked frames for {clip_dir} global_indices={global_indices}")
+                return
+            out_path = clip_dir / out_name
+
+        if args.skip_existing and out_path.is_file():
+            print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
+            return
+
+        try:
+            obj = _caption_from_image_paths(
+                model=model,
+                processor=processor,
+                image_paths=picked,
+                max_new_tokens=int(args.max_new_tokens),
+                temperature=float(args.temperature),
+                top_p=float(args.top_p),
+            )
+        except Exception as e:
+            print(f"[ERROR] caption failed for {clip_dir}: {e}")
+            return
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+        print(f"[OK] {clip_dir} -> {out_path}")
+
+    clip_list = str(args.clip_list).strip()
+    if clip_list:
+        clips_all = _read_clip_list(clip_list, mask_root=mask_root)
+        if args.scene_key:
+            clips_all = [c for c in clips_all if (c.parent.parent.name == str(args.scene_key))]
+        clips = [p for i, p in enumerate(clips_all) if (i % int(args.world_size)) == int(args.rank)]
+        print(
+            f"[INFO] clip_list mode: total_clips={len(clips_all)} "
+            f"rank={int(args.rank)}/{int(args.world_size)} assigned={len(clips)}"
+        )
+        for clip_dir in clips:
+            _process_clip_dir(clip_dir)
+        return
+
     scene_dirs: list[Path]
     if args.scene_key:
         scene_dirs = [mask_root / args.scene_key]
@@ -309,179 +553,13 @@ def main() -> None:
         scene_dirs = [p for p in sorted(mask_root.iterdir()) if p.is_dir()]
 
     for scene_dir in scene_dirs:
-        scene_key = scene_dir.name
-        hd, scene_id, sequence_id = _parse_scene_key(scene_key)
-        cam_dir = data_root / hd / scene_id / sequence_id / "cam0" / "data"
-        if not cam_dir.is_dir() and not args.use_masked_rgb:
-            print(f"[WARN] Missing cam dir for {scene_key}: {cam_dir}. Use --use_masked_rgb to caption from masked_rgb.")
-
-        cam_files = _sorted_images(cam_dir) if cam_dir.is_dir() else []
-
+        # Backward-compatible behavior: per-scene sharding (can be imbalanced).
         clip_iter_index = -1
         for clip_dir in _iter_clip_dirs(scene_dir):
             clip_iter_index += 1
             if (clip_iter_index % int(args.world_size)) != int(args.rank):
                 continue
-            # parse window start from parent dir name "<start>_<end>"
-            window_dir = clip_dir.parent
-            try:
-                window_start_str, window_end_str = window_dir.name.split("_", 1)
-                window_start = int(window_start_str)
-                window_end = int(window_end_str)
-            except Exception:
-                print(f"[WARN] Skip invalid window dir: {window_dir}")
-                continue
-            window_len = int(window_end) - int(window_start) + 1
-            if args.strict_window_len and window_len != int(args.window_len):
-                print(
-                    f"[WARN] Skip window (len mismatch): {window_dir} "
-                    f"len={window_len} expected={int(args.window_len)}"
-                )
-                continue
-            try:
-                clip_local_start = int(clip_dir.name.split("_")[-1])
-            except Exception:
-                print(f"[WARN] Skip invalid clip dir: {clip_dir}")
-                continue
-
-            if args.use_mask_frame_indices:
-                mask_dir = clip_dir / "mask"
-                if not mask_dir.is_dir():
-                    print(f"[WARN] Missing mask dir: {mask_dir}")
-                    continue
-                local_indices_all = []
-                for p in _sorted_images(mask_dir):
-                    stem = p.stem
-                    if stem.isdigit():
-                        local_indices_all.append(int(stem))
-                if not local_indices_all:
-                    print(f"[WARN] No mask frames in: {mask_dir}")
-                    continue
-            else:
-                # Uniform sample over 81-frame clip local indices [0..80]
-                n = int(args.sample_frames)
-                if n <= 0:
-                    local_indices_all = [0, 40, 80]
-                else:
-                    local_indices_all = []
-                    if n == 1:
-                        local_indices_all = [0]
-                    else:
-                        for k in range(n):
-                            t = k * 80 / (n - 1)
-                            local_indices_all.append(int(round(t)))
-                    # de-dup
-                    local_indices_all = sorted(set(local_indices_all))
-
-            # Compute global range for naming/debugging.
-            # Mapping follows UniDataset InteriorNet loader convention:
-            # global_idx = window_start + clip_start + local_idx
-            local_start = min(local_indices_all)
-            local_end = max(local_indices_all)
-            global_start = window_start + clip_local_start + local_start
-            global_end = window_start + clip_local_start + local_end
-
-            if args.strict_window_len:
-                strict_window_end = window_start + int(args.window_len) - 1
-                if global_end > strict_window_end:
-                    print(
-                        f"[WARN] Skip clip (exceeds window end): {clip_dir} "
-                        f"global_end={global_end} window_end={strict_window_end}"
-                    )
-                    continue
-
-            # Choose which local indices to actually caption with.
-            # If --use_mask_frame_indices is set and mask has 81 frames, you likely don't want to feed all frames.
-            # Reuse --sample_frames as "how many frames to feed" in both modes.
-            local_indices_used = local_indices_all
-            if args.use_mask_frame_indices:
-                n = int(args.sample_frames)
-                if n > 0 and n < len(local_indices_all):
-                    if n == 1:
-                        local_indices_used = [local_indices_all[0]]
-                    else:
-                        local_indices_used = []
-                        last = len(local_indices_all) - 1
-                        for k in range(n):
-                            pos = k * last / (n - 1)
-                            local_indices_used.append(local_indices_all[int(round(pos))])
-                        local_indices_used = sorted(set(local_indices_used))
-
-            out_name_fields = {
-                "global_start": global_start,
-                "global_end": global_end,
-                "local_start": local_start,
-                "local_end": local_end,
-                "window_start": window_start,
-                "clip_start": clip_local_start,
-            }
-
-            out_name = args.out_name
-            if "{" in out_name and "}" in out_name:
-                try:
-                    out_name = out_name.format(**out_name_fields)
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to format --out_name template: {args.out_name!r} with {out_name_fields}"
-                    ) from e
-
-            if args.use_masked_rgb:
-                src_dir = clip_dir / "masked_rgb"
-                if not src_dir.is_dir():
-                    print(f"[WARN] Missing masked_rgb dir: {src_dir}")
-                    continue
-                # Use file list directly; if local_indices exceed, just clamp.
-                files = _sorted_images(src_dir)
-                if not files:
-                    print(f"[WARN] No images in {src_dir}")
-                    continue
-                picked = []
-                for li in local_indices_used:
-                    if li < 0:
-                        continue
-                    if li >= len(files):
-                        continue
-                    picked.append(str(files[li]))
-                if not picked:
-                    print(f"[WARN] No picked frames in {src_dir} for indices={local_indices_used}")
-                    continue
-                out_path = clip_dir / out_name
-            else:
-                clip_global_start = window_start + clip_local_start
-                global_indices = [clip_global_start + li for li in local_indices_used]
-                if not cam_files:
-                    print(f"[WARN] No cam files for {scene_key}; skip clip {clip_dir}")
-                    continue
-                picked = []
-                for gi in global_indices:
-                    if gi < 0 or gi >= len(cam_files):
-                        continue
-                    picked.append(str(cam_files[gi]))
-                if not picked:
-                    print(f"[WARN] No picked frames for {clip_dir} global_indices={global_indices}")
-                    continue
-                out_path = clip_dir / out_name
-
-            if args.skip_existing and out_path.is_file():
-                print(f"[SKIP] {clip_dir} -> {out_path} (exists)")
-                continue
-
-            try:
-                obj = _caption_from_image_paths(
-                    model=model,
-                    processor=processor,
-                    image_paths=picked,
-                    max_new_tokens=int(args.max_new_tokens),
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                )
-            except Exception as e:
-                print(f"[ERROR] caption failed for {clip_dir}: {e}")
-                continue
-
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
-            print(f"[OK] {clip_dir} -> {out_path}")
+            _process_clip_dir(clip_dir)
 
 
 if __name__ == "__main__":
