@@ -331,6 +331,17 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     args = parse_args()
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    env_rank = int(os.environ.get("RANK", "0"))
+    env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # Support torchrun: when user does not explicitly pass rank/world_size,
+    # inherit from distributed env vars.
+    if env_world_size > 1:
+        if int(args.world_size) == 1:
+            args.world_size = env_world_size
+        if int(args.rank) == 0:
+            args.rank = env_rank
+
     if int(args.world_size) <= 0:
         raise ValueError("--world_size must be >= 1")
     if int(args.rank) < 0 or int(args.rank) >= int(args.world_size):
@@ -344,19 +355,23 @@ def main() -> None:
 
     # Device setup
     if args.device == "cuda" and torch.cuda.is_available():
-        # Under CUDA_VISIBLE_DEVICES, the selected GPU is exposed as local index 0.
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(0)
+        # torchrun: use LOCAL_RANK; manual CUDA_VISIBLE_DEVICES per process: local rank defaults to 0.
+        device = torch.device(f"cuda:{env_local_rank}")
+        torch.cuda.set_device(env_local_rank)
 
         # Some FastVideo layers (e.g., vocab-parallel embedding) expect TP/SP groups
         # to be initialized even in single-process mode.
-        # Use a unique tcp:// port per shard to avoid collisions when users launch
-        # multiple independent processes (one per GPU) without torchrun.
-        dist_port = 29500 + int(args.rank)
+        # torchrun mode: use env:// shared rendezvous.
+        # standalone per-process mode: use unique tcp:// port per shard.
+        if env_world_size > 1:
+            dist_init_method = "env://"
+        else:
+            dist_port = 29500 + int(args.rank)
+            dist_init_method = f"tcp://127.0.0.1:{dist_port}"
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=1,
             sp_size=1,
-            distributed_init_method=f"tcp://127.0.0.1:{dist_port}",
+            distributed_init_method=dist_init_method,
         )
     else:
         device = torch.device("cpu")
