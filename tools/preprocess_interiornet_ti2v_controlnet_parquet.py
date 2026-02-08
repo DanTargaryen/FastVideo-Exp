@@ -39,6 +39,7 @@ import ftfy
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import pyarrow.parquet as pq
 from PIL import Image
 from tqdm import tqdm
 
@@ -54,6 +55,22 @@ from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.pipelines.stages.text_encoding import TextEncodingStage
 
 logger = init_logger(__name__)
+
+
+def _load_existing_ids(parquet_rank_dir: Path) -> set[str]:
+    ids: set[str] = set()
+    if not parquet_rank_dir.is_dir():
+        return ids
+    for pf in sorted(parquet_rank_dir.rglob("*.parquet")):
+        try:
+            table = pq.read_table(str(pf), columns=["id"])
+            col = table.column("id").to_pylist()
+            for x in col:
+                if x is not None:
+                    ids.add(str(x))
+        except Exception as e:
+            logger.warning("Failed to read existing ids from %s: %s", pf, e)
+    return ids
 
 
 def _prompt_clean(text: str) -> str:
@@ -324,6 +341,11 @@ def parse_args() -> argparse.Namespace:
         help="If set, require clip_dir/masked_rgb to exist. "
         "When missing, skip the clip (no rgb*mask fallback).",
     )
+    p.add_argument(
+        "--skip_existing_ids",
+        action="store_true",
+        help="Resume-friendly mode: skip records whose id already exists in output parquet rank shard.",
+    )
     return p.parse_args()
 
 
@@ -423,6 +445,14 @@ def main() -> None:
     out_dir_rank = output_dir / f"rank_{int(args.rank):02d}"
     writer = ParquetDatasetWriter(str(out_dir_rank), samples_per_file=int(args.samples_per_file))
     buffer: list[dict[str, Any]] = []
+    existing_ids: set[str] = set()
+    if bool(args.skip_existing_ids):
+        existing_ids = _load_existing_ids(out_dir_rank)
+        logger.info(
+            "Resume mode enabled: found %d existing ids in %s",
+            len(existing_ids),
+            out_dir_rank,
+        )
 
     scene_dirs = [mask_root / args.scene_key] if args.scene_key else [p for p in sorted(mask_root.iterdir()) if p.is_dir()]
     # Build flat clip list and shard by rank/world_size for stable partitioning.
@@ -613,6 +643,8 @@ def main() -> None:
 
         empty_lat = np.zeros((0,), dtype=np.float32)
         record_id = f"{scene_key}/{window_dir.name}/{clip_dir.name}"
+        if bool(args.skip_existing_ids) and record_id in existing_ids:
+            continue
         record = {
             "id": record_id,
             "text_embedding_bytes": text_emb.tobytes(),
@@ -637,6 +669,8 @@ def main() -> None:
             "fps": float(args.fps),
         }
         buffer.append(record)
+        if bool(args.skip_existing_ids):
+            existing_ids.add(record_id)
 
         if len(buffer) >= int(args.flush_frequency):
             table = records_to_table(buffer, pyarrow_schema_ti2v_controlnet)
