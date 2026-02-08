@@ -297,6 +297,17 @@ def _sorted_pngs(dir_path: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.name)
 
 
+def _sorted_depth_files(dir_path: Path) -> list[Path]:
+    files = [
+        p
+        for p in dir_path.iterdir()
+        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
+    ]
+    if files and all(p.stem.isdigit() for p in files):
+        return sorted(files, key=lambda p: int(p.stem))
+    return sorted(files, key=lambda p: p.name)
+
+
 def _slice_by_id_or_index(files: list[Path], start: int, end: int) -> list[Path]:
     if not files:
         return []
@@ -540,7 +551,7 @@ def main() -> None:
         if str(args.depth_dir).strip():
             ddir = Path(os.path.expanduser(os.path.expandvars(str(args.depth_dir).strip())))
             if ddir.is_dir():
-                depth_files = _sorted_pngs(ddir)
+                depth_files = _sorted_depth_files(ddir)
         else:
             # Auto-derive depth dir from MatrixCity layout used in UniDataset:
             # small_city_depth/street/<split>/<street>_depth/<street>_depth/*.exr
@@ -553,7 +564,7 @@ def main() -> None:
                 / f"{street_name}_depth"
             )
             if auto_depth_dir.is_dir():
-                depth_files = _sorted_pngs(auto_depth_dir)
+                depth_files = _sorted_depth_files(auto_depth_dir)
 
         window_files = _slice_by_id_or_index(rgb_files, window_start, window_end)
         if not window_files:
@@ -561,7 +572,7 @@ def main() -> None:
         if len(window_files) < int(args.window_len):
             window_files = window_files + [window_files[-1]] * (int(args.window_len) - len(window_files))
 
-        if depth_files is not None:
+        if depth_files is not None and len(depth_files) > 0:
             depth_window = _slice_by_id_or_index(depth_files, window_start, window_end)
             if not depth_window:
                 depth_window = [depth_files[min(max(window_start, 0), len(depth_files) - 1)]]
@@ -569,6 +580,8 @@ def main() -> None:
                 depth_window = depth_window + [depth_window[-1]] * (len(window_files) - len(depth_window))
         else:
             # If no depth is provided, we can't build a valid union control latent; skip.
+            if depth_files is not None and len(depth_files) == 0:
+                logger.warning("Empty depth dir for %s (street=%s); skip clip", clip_dir, street_name)
             continue
 
         needed = clip_start + int(args.clip_length)
