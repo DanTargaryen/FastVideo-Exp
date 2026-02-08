@@ -489,6 +489,20 @@ def main() -> None:
                     all_clips.append(clip_dir)
 
     clips = [p for i, p in enumerate(all_clips) if (i % int(args.world_size)) == int(args.rank)]
+    if bool(args.skip_existing_ids) and existing_ids:
+        before = len(clips)
+        clips = [
+            p
+            for p in clips
+            if f"{p.parent.parent.name}/{p.parent.name}/{p.name}" not in existing_ids
+        ]
+        logger.info(
+            "Resume filter on rank_%02d: %d -> %d clips (skipped %d existing)",
+            int(args.rank),
+            before,
+            len(clips),
+            before - len(clips),
+        )
     pbar = tqdm(clips, desc=f"matrixcity->parquet[r{args.rank}/{args.world_size}]")
 
     for clip_dir in pbar:
