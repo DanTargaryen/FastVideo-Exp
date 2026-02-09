@@ -20,6 +20,7 @@ Key behavior:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,9 @@ from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
+)
+from fastvideo.models.dits.controlnet_union_components import (
+    WanControlNetUnionInput,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 
@@ -261,6 +265,61 @@ def _parse_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def _is_union_controlnet(model) -> bool:
+    return "union" in model.__class__.__name__.lower()
+
+
+def _controlnet_dir_is_union(controlnet_dir: str) -> bool:
+    p = Path(str(controlnet_dir))
+    if "union" in p.name.lower():
+        return True
+    cfg = p / "config.json"
+    if cfg.exists():
+        try:
+            obj = json.loads(cfg.read_text(encoding="utf-8"))
+            cls_name = str(obj.get("_class_name", "")).lower()
+            if "union" in cls_name:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _split_union_control_latent(control_latent: torch.Tensor,
+                                num_channels_latents: int
+                                ) -> tuple[torch.Tensor, torch.Tensor | None,
+                                           torch.Tensor, torch.Tensor]:
+    c = int(num_channels_latents)
+    if control_latent.shape[1] == 3 * c:
+        depth = control_latent[:, :c]
+        masked = control_latent[:, c:2 * c]
+        mask = control_latent[:, 2 * c:3 * c]
+        normal = None
+        return depth, normal, masked, mask
+    if control_latent.shape[1] == 4 * c:
+        depth = control_latent[:, :c]
+        normal = control_latent[:, c:2 * c]
+        masked = control_latent[:, 2 * c:3 * c]
+        mask = control_latent[:, 3 * c:4 * c]
+        return depth, normal, masked, mask
+    raise ValueError(
+        f"Union control_latent channel mismatch: got {control_latent.shape[1]}, "
+        f"expected 3*C or 4*C (C={c}).")
+
+
+def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
+                             num_channels_latents: int) -> dict:
+    if not _is_union_controlnet(controlnet):
+        return {"controlnet_states": control_latent}
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent, num_channels_latents)
+    return {
+        "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
+        "mask": mask,
+        "masked_latent": masked,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         "Record ODE trajectories (TI2V + ControlNet) with FlowMatchEuler")
@@ -382,12 +441,17 @@ def main() -> None:
     fastvideo_args.pipeline_config.flow_shift = float(args.flow_shift)
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
 
+    use_union_controlnet = _controlnet_dir_is_union(args.controlnet_dir)
     if args.teacher_mode == "bidirectional":
         fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
-        fastvideo_args.override_controlnet_cls_name = "WanControlnet3DModel"
+        fastvideo_args.override_controlnet_cls_name = (
+            "WanControlnetUnion3DModel"
+            if use_union_controlnet else "WanControlnet3DModel")
     else:
         fastvideo_args.override_transformer_cls_name = "CausalWanTransformer3DModel"
-        fastvideo_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+        fastvideo_args.override_controlnet_cls_name = (
+            "CausalWanControlnetUnion3DModel"
+            if use_union_controlnet else "CausalWanControlnet3DModel")
 
     transformer = PipelineComponentLoader.load_module(
         "transformer", transformer_dir, "diffusers", fastvideo_args)
@@ -500,6 +564,7 @@ def main() -> None:
         control_latent = _ensure_bcfhw(_decode_tensor(row, "control_latent"),
                                        name="control_latent").to(
                                            device=device, dtype=dtype)
+        num_channels_latents = int(transformer.num_channels_latents)
 
         latent_t = int(control_latent.shape[2])
         latent_h = int(control_latent.shape[3])
@@ -579,7 +644,8 @@ def main() -> None:
                     hidden_states=latent_model_input,
                     encoder_hidden_states=[text_embedding],
                     timestep=timestep,
-                    controlnet_states=control_latent,
+                    **_build_controlnet_kwargs(controlnet, control_latent,
+                                               num_channels_latents),
                 )
                 pred_flow = transformer(
                     latent_model_input,
@@ -603,7 +669,8 @@ def main() -> None:
                     hidden_states=latent_model_input,
                     encoder_hidden_states=[negative],
                     timestep=timestep,
-                    controlnet_states=control_latent,
+                    **_build_controlnet_kwargs(controlnet, control_latent,
+                                               num_channels_latents),
                 )
                 pred_uncond = transformer(
                     latent_model_input,
