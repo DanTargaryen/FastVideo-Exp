@@ -288,11 +288,36 @@ def load_model_from_full_model_state_dict(
     """
     meta_sd = model.state_dict()
     sharded_sd = {}
+    # List of allowed parameter name patterns.
+    # Used in two directions:
+    # 1) model has extra params not present in checkpoint (initialize to zeros)
+    # 2) checkpoint has extra params not present in model (skip with warning)
+    ALLOWED_NEW_PARAM_PATTERNS = [
+        "gate_compress",
+        "union",
+        "feat_to_union",
+        "union_cond_embedding",
+        "union_transformer",
+        "task_embedding",
+        "control_type_proj",
+        "spatial_ch_projs",
+    ]  # Can be extended as needed
+
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping)  # type: ignore
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
+            # Allow forward compatibility for Union variants:
+            # if checkpoint has extra Union-related keys that current model
+            # does not define, skip them instead of hard-failing.
+            if any(pattern in target_param_name
+                   for pattern in ALLOWED_NEW_PARAM_PATTERNS):
+                logger.warning(
+                    "Skipping checkpoint parameter not present in model: %s",
+                    target_param_name,
+                )
+                continue
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
@@ -317,18 +342,6 @@ def load_model_from_full_model_state_dict(
         logger.warning("Found unloaded parameters in meta state dict: %s",
                        unused_keys)
 
-    # List of allowed parameter name patterns
-    # Note: Union ControlNet introduces new parameters (e.g., feat_to_union, union_transformer).
-    ALLOWED_NEW_PARAM_PATTERNS = [
-        "gate_compress",
-        "union",
-        "feat_to_union",
-        "union_cond_embedding",
-        "union_transformer",
-        "task_embedding",
-        "control_type_proj",
-        "spatial_ch_projs",
-    ]  # Can be extended as needed
     for new_param_name in unused_keys:
         if not any(pattern in new_param_name
                    for pattern in ALLOWED_NEW_PARAM_PATTERNS):
