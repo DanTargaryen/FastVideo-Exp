@@ -12,7 +12,6 @@ from fastvideo.configs.models.dits import WanVideoConfig
 from fastvideo.distributed.parallel_state import get_sp_world_size
 from fastvideo.layers.rotary_embedding import get_rotary_pos_embed
 from fastvideo.layers.visual_embedding import PatchEmbed
-from fastvideo.logger import init_logger
 from fastvideo.models.dits.base import BaseDiT
 from fastvideo.models.dits.wanvideo import WanTimeTextImageEmbedding, WanTransformerBlock
 from fastvideo.platforms import current_platform
@@ -23,9 +22,6 @@ from fastvideo.models.dits.controlnet_union_components import (
     WanControlNetUnionInput,
     zero_module,
 )
-
-logger = init_logger(__name__)
-
 
 def _resize_bcfhw_nearest(x: torch.Tensor,
                           target_hw: tuple[int, int]) -> torch.Tensor:
@@ -79,14 +75,9 @@ class WanControlnetUnion3DModel(BaseDiT):
 
         # Union config (fallback to safe defaults)
         self.num_control_type = int(hf_config.get("num_control_type", 2))
-        self.union_dim = int(hf_config.get("num_trans_channel", inner_dim))
-        if self.union_dim != inner_dim:
-            logger.warning(
-                "union_dim (%s) != inner_dim (%s); overriding to inner_dim to match checkpoint shapes.",
-                self.union_dim,
-                inner_dim,
-            )
-            self.union_dim = inner_dim
+        # Keep Union transformer dimension aligned with latent embedding dim,
+        # same as Diff-Factory's WanControlnetUnion implementation.
+        self.union_dim = inner_dim
         self.num_trans_head = int(
             hf_config.get("num_trans_head", min(8, config.num_attention_heads)))
         self.num_trans_layer = int(hf_config.get("num_trans_layer", 1))
@@ -129,10 +120,10 @@ class WanControlnetUnion3DModel(BaseDiT):
         self.spatial_ch_projs = zero_module(
             nn.Linear(self.union_dim, inner_dim))
         self.feat_to_union = nn.Identity()
-        if self.union_dim != inner_dim:
-            self.feat_to_union = nn.Linear(inner_dim, self.union_dim)
         self.control_type_proj = nn.Linear(self.num_control_type,
                                            inner_dim * 6)
+        nn.init.zeros_(self.control_type_proj.weight)
+        nn.init.zeros_(self.control_type_proj.bias)
 
         # 4. Transformer blocks (bidirectional)
         self.blocks = nn.ModuleList([

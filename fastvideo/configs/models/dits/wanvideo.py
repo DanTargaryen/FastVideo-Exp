@@ -101,6 +101,14 @@ class WanVideoArchConfig(DiTArchConfig):
     num_frames_per_block: int = 3
     sliding_window_num_frames: int = 21
 
+    # Union ControlNet (for diffusers config compatibility)
+    num_control_type: int = 2
+    num_trans_layer: int = 1
+    num_trans_head: int = 8
+    num_trans_channel: int | None = None
+    control_input_channels: int | None = None
+    conditioning_embedding_out_channels: tuple[int, ...] = (16, 32, 96, 256)
+
     def __post_init__(self):
         super().__post_init__()
         self.out_channels = self.out_channels or self.in_channels
