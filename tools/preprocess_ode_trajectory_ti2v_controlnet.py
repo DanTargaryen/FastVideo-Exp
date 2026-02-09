@@ -128,6 +128,22 @@ def _get_parquet_file_lengths(paths: list[str]) -> list[int]:
     return lengths
 
 
+def _load_existing_ids(parquet_rank_dir: str | os.PathLike[str]) -> set[str]:
+    ids: set[str] = set()
+    rank_dir = Path(parquet_rank_dir)
+    if not rank_dir.is_dir():
+        return ids
+    for pf in sorted(rank_dir.rglob("*.parquet")):
+        try:
+            table = pq.read_table(str(pf), columns=["id"])
+            for x in table.column("id").to_pylist():
+                if x is not None:
+                    ids.add(str(x))
+        except Exception as e:
+            logger.warning("Failed to read existing ids from %s: %s", pf, e)
+    return ids
+
+
 def _read_row_by_global_index(paths: list[str], lengths: list[int], index: int,
                               columns: list[str]) -> dict:
     if index < 0:
@@ -317,6 +333,12 @@ def parse_args() -> argparse.Namespace:
                    default=-1,
                    help="End global index (exclusive; -1 means dataset end)")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--skip_existing_ids",
+        action="store_true",
+        help=
+        "Resume mode: skip samples whose id already exists in out_dir/rank_xx parquet files.",
+    )
     return p.parse_args()
 
 
@@ -422,6 +444,15 @@ def main() -> None:
     writer = ParquetDatasetWriter(out_dir_rank,
                                   samples_per_file=int(args.samples_per_file))
     buffer: list[dict[str, Any]] = []
+    existing_ids: set[str] = set()
+    if bool(args.skip_existing_ids):
+        existing_ids = _load_existing_ids(out_dir_rank)
+        logger.info(
+            "Resume mode enabled on rank_%02d: found %d existing ids in %s",
+            rank,
+            len(existing_ids),
+            out_dir_rank,
+        )
 
     # Distribute indices across ranks
     indices = list(range(start, end))
@@ -452,6 +483,8 @@ def main() -> None:
     for idx in indices:
         row = _read_row_by_global_index(parquet_files, lengths, idx, cols)
         sample_id = str(row.get("id", f"sample_{idx:06d}"))
+        if bool(args.skip_existing_ids) and sample_id in existing_ids:
+            continue
         caption = str(row.get("caption", ""))
         fps = float(row.get("fps", 0.0))
         width = int(row.get("width", 0))
@@ -617,6 +650,8 @@ def main() -> None:
             fps=fps,
         )
         buffer.append(record)
+        if bool(args.skip_existing_ids):
+            existing_ids.add(sample_id)
 
         if len(buffer) >= int(args.flush_frequency):
             table = records_to_table(buffer,
