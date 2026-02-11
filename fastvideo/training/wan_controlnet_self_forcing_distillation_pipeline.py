@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
+import json
 from copy import deepcopy
 from typing import Any, cast
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +29,27 @@ logger = init_logger(__name__)
 
 def _is_union_controlnet(model) -> bool:
     return "union" in model.__class__.__name__.lower()
+
+
+def _controlnet_path_is_union(controlnet_path: str) -> bool:
+    p = Path(str(controlnet_path))
+    # Fast path: folder name/path hint.
+    if "union" in str(p).lower():
+        return True
+    cfg = p / "config.json"
+    if cfg.exists():
+        try:
+            obj = json.loads(cfg.read_text(encoding="utf-8"))
+            cls_name = str(obj.get("_class_name", "")).lower()
+            if "union" in cls_name:
+                return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse ControlNet config %s for union detection: %s",
+                str(cfg),
+                str(exc),
+            )
+    return False
 
 
 def _split_union_control_latent(control_latent: torch.Tensor,
@@ -114,8 +137,13 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                         training_args.controlnet_model_path)
             prev_cn_override = getattr(training_args,
                                        "override_controlnet_cls_name", None)
-            # Align student with causal inference path.
-            training_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+            # Align student with causal inference path (Union vs non-Union).
+            if _controlnet_path_is_union(training_args.controlnet_model_path):
+                training_args.override_controlnet_cls_name = "CausalWanControlnetUnion3DModel"
+            else:
+                training_args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+            logger.info("Student controlnet override class: %s",
+                        training_args.override_controlnet_cls_name)
             try:
                 self.controlnet = PipelineComponentLoader.load_module(
                     module_name="controlnet",
