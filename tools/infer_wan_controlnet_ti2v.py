@@ -48,6 +48,7 @@ Phase-1 init weights (no diffusers-format model folder; use base model for confi
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,7 +92,12 @@ def _controlnet_dir_is_union(controlnet_dir: str) -> bool:
             cls_name = str(obj.get("_class_name", "")).lower()
             if "union" in cls_name:
                 return True
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse %s for union controlnet detection: %s",
+                str(cfg),
+                str(exc),
+            )
             pass
     return False
 
