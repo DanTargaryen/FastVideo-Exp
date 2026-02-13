@@ -22,9 +22,9 @@ model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diff
 real_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 fake_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 
-controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
-real_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
-fake_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-warp-mask
+controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+real_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+fake_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
 
 init_weights_from_safetensors: ""
 init_controlnet_weights_from_safetensors: ""
@@ -90,13 +90,13 @@ flow_shift: 5
 # ---- Checkpointing / logs ----
 output_dir: /vePFS-buaa/linming/workspace/worldrender/phase2_ckpt/wan_controlnet_self_forcing_phase2
 checkpoints_total_limit: 2
-training_state_checkpointing_steps: 1000
+training_state_checkpointing_steps: 250
 # Additionally save consolidated (single-file) generator inference checkpoints every N steps:
 # - `generator_inference_transformer/` (student transformer)
 # - `generator_inference_controlnet/` (student controlnet)
 # This is slower than distributed checkpointing and may use significant CPU RAM, but it's
 # convenient for inference/export.
-weight_only_checkpointing_steps: 1000
+weight_only_checkpointing_steps: 500
 log_validation: false
 
 # ---- Tracking / Preview ----

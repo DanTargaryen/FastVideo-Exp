@@ -319,8 +319,9 @@ def save_checkpoint(transformer,
         if controlnet is not None and controlnet_cpu_state is not None:
             reverse_mapping = getattr(controlnet, "reverse_param_names_mapping", {})
             if not reverse_mapping:
-                logger.warning(
-                    "controlnet reverse_param_names_mapping is empty; skipping consolidated controlnet export."
+                raise ValueError(
+                    "controlnet reverse_param_names_mapping is empty; "
+                    "cannot export consolidated controlnet checkpoint."
                 )
             else:
                 controlnet_save_dir = os.path.join(

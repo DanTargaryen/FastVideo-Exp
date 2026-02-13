@@ -71,7 +71,7 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
     Phase-1 ODE-init training (TI2V + ControlNet).
 
     - Trajectories are recorded with a bidirectional teacher (see preprocess tool).
-    - Student runs with causal masking (CausalWanTransformer3DModel + CausalWanControlnet3DModel).
+    - Student runs with causal masking (CausalWanTransformer3DModel + CausalWanControlnetUnion3DModel).
     - Loss: predict x0 from x_t (flow) and MSE against teacher x0.
     """
 
@@ -94,12 +94,25 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         logger.info("Loading student controlnet from: %s",
                     training_args.controlnet_model_path)
-        self.controlnet = PipelineComponentLoader.load_module(
-            module_name="controlnet",
-            component_model_path=training_args.controlnet_model_path,
-            transformers_or_diffusers="diffusers",
-            fastvideo_args=training_args,
-        )
+        prev_cn_override = getattr(training_args,
+                                   "override_controlnet_cls_name", None)
+        training_args.override_controlnet_cls_name = "CausalWanControlnetUnion3DModel"
+        try:
+            self.controlnet = PipelineComponentLoader.load_module(
+                module_name="controlnet",
+                component_model_path=training_args.controlnet_model_path,
+                transformers_or_diffusers="diffusers",
+                fastvideo_args=training_args,
+            )
+        finally:
+            training_args.override_controlnet_cls_name = prev_cn_override
+        if not _is_union_controlnet(self.controlnet):
+            raise ValueError(
+                "Phase-1 ODE student controlnet must be Union. "
+                "Please use a Union ControlNet checkpoint/config."
+            )
+        logger.info("Phase-1 student controlnet class: %s",
+                    self.controlnet.__class__.__name__)
         modules["controlnet"] = self.controlnet
         return modules
 
@@ -468,8 +481,8 @@ if __name__ == "__main__":
     parser = TrainingArgs.add_cli_args(parser)
     parser = FastVideoArgs.add_cli_args(parser)
     args = parser.parse_args()
-    # Force student to use causal transformer/controlnet
+    # Force student to use causal transformer/Union controlnet
     args.override_transformer_cls_name = "CausalWanTransformer3DModel"
-    args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+    args.override_controlnet_cls_name = "CausalWanControlnetUnion3DModel"
     args.dit_cpu_offload = False
     main(args)

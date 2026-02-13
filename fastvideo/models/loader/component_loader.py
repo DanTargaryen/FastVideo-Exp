@@ -579,6 +579,19 @@ class ControlNetLoader(ComponentLoader):
                     ".safetensors"
                 ), "init_controlnet_weights_from_safetensors must be a .safetensors file or a directory"
                 safetensors_list = [str(custom_weights_path)]
+            logger.info(
+                "ControlNet init override enabled, loading %s safetensors from %s",
+                len(safetensors_list),
+                custom_weights_path,
+            )
+        else:
+            logger.info(
+                "ControlNet init override disabled, loading %s safetensors from component path %s",
+                len(safetensors_list),
+                model_path,
+            )
+
+        logger.info("ControlNet safetensors files: %s", safetensors_list)
 
         default_dtype = PRECISION_TO_TYPE[
             fastvideo_args.pipeline_config.dit_precision] if fastvideo_args.pipeline_config.dit_precision else torch.bfloat16

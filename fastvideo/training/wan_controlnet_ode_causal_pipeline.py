@@ -17,7 +17,7 @@ def main(args) -> None:
     if not args.override_transformer_cls_name:
         args.override_transformer_cls_name = "CausalWanTransformer3DModel"
     if not args.override_controlnet_cls_name:
-        args.override_controlnet_cls_name = "CausalWanControlnet3DModel"
+        args.override_controlnet_cls_name = "CausalWanControlnetUnion3DModel"
 
     pipeline = ODEInitControlnetTrainingPipeline.from_pretrained(
         args.pretrained_model_name_or_path, args=args)
