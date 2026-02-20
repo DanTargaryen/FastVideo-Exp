@@ -387,6 +387,7 @@ class CausalWanTransformer3DModel(BaseDiT):
 
         # Causal-specific
         self.block_mask = None
+        self._block_mask_cache: dict[tuple[Any, ...], BlockMask] = {}
         self.num_frame_per_block = config.arch_config.num_frames_per_block
         assert self.num_frame_per_block <= 3
         self.independent_first_frame = False
@@ -449,6 +450,110 @@ class CausalWanTransformer3DModel(BaseDiT):
         # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
 
         return block_mask
+
+    @staticmethod
+    def _prepare_teacher_forcing_mask(
+        device: torch.device | str,
+        num_frames: int = 21,
+        frame_seqlen: int = 1560,
+        num_frame_per_block: int = 1,
+    ) -> BlockMask:
+        total_length = num_frames * frame_seqlen * 2
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        clean_ends = num_frames * frame_seqlen
+        context_ends = torch.zeros(total_length + padded_length,
+                                   device=device,
+                                   dtype=torch.long)
+        noise_context_starts = torch.zeros(total_length + padded_length,
+                                           device=device,
+                                           dtype=torch.long)
+        noise_context_ends = torch.zeros(total_length + padded_length,
+                                         device=device,
+                                         dtype=torch.long)
+        noise_noise_starts = torch.zeros(total_length + padded_length,
+                                         device=device,
+                                         dtype=torch.long)
+        noise_noise_ends = torch.zeros(total_length + padded_length,
+                                       device=device,
+                                       dtype=torch.long)
+
+        attention_block_size = frame_seqlen * num_frame_per_block
+        frame_indices = torch.arange(
+            start=0,
+            end=num_frames * frame_seqlen,
+            step=attention_block_size,
+            device=device,
+            dtype=torch.long,
+        )
+        for start in frame_indices:
+            context_ends[start:start + attention_block_size] = start + attention_block_size
+
+        noisy_image_start_list = torch.arange(
+            num_frames * frame_seqlen,
+            total_length,
+            step=attention_block_size,
+            device=device,
+            dtype=torch.long,
+        )
+        noisy_image_end_list = noisy_image_start_list + attention_block_size
+        for block_index, (start, end) in enumerate(
+                zip(noisy_image_start_list, noisy_image_end_list)):
+            noise_noise_starts[start:end] = start
+            noise_noise_ends[start:end] = end
+            noise_context_ends[start:end] = block_index * attention_block_size
+
+        def attention_mask(_b, _h, q_idx, kv_idx):
+            clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
+            c1 = ((kv_idx < noise_noise_ends[q_idx]) &
+                  (kv_idx >= noise_noise_starts[q_idx]))
+            c2 = ((kv_idx < noise_context_ends[q_idx]) &
+                  (kv_idx >= noise_context_starts[q_idx]))
+            noise_mask = (q_idx >= clean_ends) & (c1 | c2)
+            eye_mask = q_idx == kv_idx
+            return eye_mask | clean_mask | noise_mask
+
+        return create_block_mask(
+            attention_mask,
+            B=None,
+            H=None,
+            Q_LEN=total_length + padded_length,
+            KV_LEN=total_length + padded_length,
+            _compile=False,
+            device=device,
+        )
+
+    def _get_train_block_mask(
+        self,
+        *,
+        device: torch.device,
+        num_frames: int,
+        frame_seqlen: int,
+        teacher_forcing: bool,
+    ) -> BlockMask:
+        if teacher_forcing:
+            key = ("teacher_forcing", int(num_frames), int(frame_seqlen),
+                   int(self.num_frame_per_block))
+            if key not in self._block_mask_cache:
+                self._block_mask_cache[key] = self._prepare_teacher_forcing_mask(
+                    device=device,
+                    num_frames=num_frames,
+                    frame_seqlen=frame_seqlen,
+                    num_frame_per_block=self.num_frame_per_block,
+                )
+            return self._block_mask_cache[key]
+
+        key = ("causal", int(num_frames), int(frame_seqlen),
+               int(self.num_frame_per_block), int(self.local_attn_size))
+        if key not in self._block_mask_cache:
+            self._block_mask_cache[key] = self._prepare_blockwise_causal_attn_mask(
+                device=device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size,
+            )
+        return self._block_mask_cache[key]
 
     def _forward_inference(
                 self,
@@ -615,6 +720,8 @@ class CausalWanTransformer3DModel(BaseDiT):
                 | None = None,
                 start_frame: int = 0,
                 block_controlnet_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+                clean_x: torch.Tensor | None = None,
+                aug_t: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
 
         orig_dtype = hidden_states.dtype
@@ -665,6 +772,7 @@ class CausalWanTransformer3DModel(BaseDiT):
         post_patch_num_frames = hidden_states.shape[2]
         post_patch_height = hidden_states.shape[3]
         post_patch_width = hidden_states.shape[4]
+        teacher_forcing = clean_x is not None
 
         # Get rotary embeddings
         d = self.hidden_size // self.num_attention_heads
@@ -679,23 +787,32 @@ class CausalWanTransformer3DModel(BaseDiT):
             rope_theta=10000,
             start_frame=start_frame
         )
+        if teacher_forcing:
+            freqs_cos = torch.cat([freqs_cos, freqs_cos], dim=0)
+            freqs_sin = torch.cat([freqs_sin, freqs_sin], dim=0)
         freqs_cos = freqs_cos.to(hidden_states.device)
         freqs_sin = freqs_sin.to(hidden_states.device)
         freqs_cis = (freqs_cos,
                      freqs_sin) if freqs_cos is not None else None
 
         # Construct blockwise causal attn mask
-        if self.block_mask is None:
-            self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                device=hidden_states.device,
-                num_frames=post_patch_num_frames,
-                frame_seqlen=post_patch_height * post_patch_width,
-                num_frame_per_block=self.num_frame_per_block,
-                local_attn_size=self.local_attn_size
-            )
+        block_mask = self._get_train_block_mask(
+            device=hidden_states.device,
+            num_frames=post_patch_num_frames,
+            frame_seqlen=post_patch_height * post_patch_width,
+            teacher_forcing=teacher_forcing,
+        )
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if teacher_forcing:
+            assert clean_x is not None
+            clean_tokens = self.patch_embedding(clean_x).flatten(2).transpose(1, 2)
+            hidden_states = torch.cat([clean_tokens, hidden_states], dim=1)
 
-        encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(1, self.text_len - encoder_hidden_states.size(1), encoder_hidden_states.size(2))], dim=1)
+        encoder_hidden_states = torch.cat([
+            encoder_hidden_states,
+            encoder_hidden_states.new_zeros(batch_size, self.text_len - encoder_hidden_states.size(1),
+                                            encoder_hidden_states.size(2))
+        ], dim=1)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
                         timestep_2d.flatten(), encoder_hidden_states, encoder_hidden_states_image)
@@ -703,6 +820,47 @@ class CausalWanTransformer3DModel(BaseDiT):
                                                 (6, self.hidden_size)).unflatten(
                                                     dim=0,
                                                     sizes=timestep_2d.shape)
+        if teacher_forcing:
+            if aug_t is None:
+                aug_t_2d = torch.zeros_like(timestep_2d)
+            else:
+                if not isinstance(aug_t, torch.Tensor):
+                    aug_t_2d = torch.as_tensor(aug_t, device=timestep_2d.device)
+                else:
+                    aug_t_2d = aug_t.to(device=timestep_2d.device)
+                if aug_t_2d.dim() == 0:
+                    aug_t_2d = aug_t_2d.view(1, 1).expand_as(timestep_2d)
+                elif aug_t_2d.dim() == 1:
+                    if aug_t_2d.numel() == 1:
+                        aug_t_2d = aug_t_2d.view(1, 1).expand_as(timestep_2d)
+                    elif aug_t_2d.numel() == batch_size:
+                        aug_t_2d = aug_t_2d.view(batch_size, 1).expand_as(
+                            timestep_2d)
+                    elif aug_t_2d.numel() == batch_size * num_frames:
+                        aug_t_2d = aug_t_2d.view(batch_size, num_frames)
+                    elif batch_size == 1 and aug_t_2d.numel() == num_frames:
+                        aug_t_2d = aug_t_2d.view(1, num_frames)
+                    else:
+                        raise ValueError(
+                            f"Unsupported aug_t shape {tuple(aug_t_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                        )
+                elif aug_t_2d.dim() == 2:
+                    if aug_t_2d.shape == (batch_size, 1):
+                        aug_t_2d = aug_t_2d.expand(batch_size, num_frames)
+                    elif aug_t_2d.shape != (batch_size, num_frames):
+                        raise ValueError(
+                            f"Unsupported aug_t shape {tuple(aug_t_2d.shape)} for batch_size={batch_size} num_frames={num_frames}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Unsupported aug_t dim {aug_t_2d.dim()} for shape {tuple(aug_t_2d.shape)}"
+                    )
+
+            temb_clean = self.condition_embedder.time_embedder(aug_t_2d.flatten())
+            timestep_proj_clean = self.condition_embedder.time_modulation(
+                temb_clean).unflatten(1, (6, self.hidden_size)).unflatten(
+                    dim=0, sizes=aug_t_2d.shape)
+            timestep_proj = torch.cat([timestep_proj_clean, timestep_proj], dim=1)
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
@@ -725,26 +883,53 @@ class CausalWanTransformer3DModel(BaseDiT):
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states,
                     timestep_proj, freqs_cis,
-                    block_mask=self.block_mask)
+                    block_mask=block_mask)
                 if control_interval is not None:
                     control_index = int(block_index / control_interval)
                     control_index = min(
                         control_index,
                         len(block_controlnet_hidden_states) - 1)
-                    hidden_states = hidden_states + block_controlnet_hidden_states[
+                    control_hidden = block_controlnet_hidden_states[
                         control_index].to(hidden_states.dtype)
+                    if teacher_forcing:
+                        if control_hidden.shape[1] == hidden_states.shape[1] // 2:
+                            control_hidden = torch.cat(
+                                [torch.zeros_like(control_hidden), control_hidden],
+                                dim=1,
+                            )
+                        elif control_hidden.shape[1] != hidden_states.shape[1]:
+                            raise ValueError(
+                                "ControlNet residual length mismatch in teacher-forcing mode: "
+                                f"residual={control_hidden.shape[1]} hidden={hidden_states.shape[1]}"
+                            )
+                    hidden_states = hidden_states + control_hidden
         else:
             for block_index, block in enumerate(self.blocks):
                 hidden_states = block(hidden_states, encoder_hidden_states,
                                         timestep_proj, freqs_cis,
-                                        block_mask=self.block_mask)
+                                        block_mask=block_mask)
                 if control_interval is not None:
                     control_index = int(block_index / control_interval)
                     control_index = min(
                         control_index,
                         len(block_controlnet_hidden_states) - 1)
-                    hidden_states = hidden_states + block_controlnet_hidden_states[
+                    control_hidden = block_controlnet_hidden_states[
                         control_index].to(hidden_states.dtype)
+                    if teacher_forcing:
+                        if control_hidden.shape[1] == hidden_states.shape[1] // 2:
+                            control_hidden = torch.cat(
+                                [torch.zeros_like(control_hidden), control_hidden],
+                                dim=1,
+                            )
+                        elif control_hidden.shape[1] != hidden_states.shape[1]:
+                            raise ValueError(
+                                "ControlNet residual length mismatch in teacher-forcing mode: "
+                                f"residual={control_hidden.shape[1]} hidden={hidden_states.shape[1]}"
+                            )
+                    hidden_states = hidden_states + control_hidden
+
+        if teacher_forcing:
+            hidden_states = hidden_states[:, hidden_states.shape[1] // 2:]
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep_2d.shape).unsqueeze(2)

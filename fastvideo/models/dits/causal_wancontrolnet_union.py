@@ -221,6 +221,8 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         crossattn_cache: list[dict[str, Any]] | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        clean_hidden_states: torch.Tensor | None = None,
+        aug_t: torch.Tensor | None = None,
         **_kwargs,
     ) -> tuple[torch.Tensor, ...]:
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -432,5 +434,16 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 block_mask=block_mask,
             )
             residuals.append(proj(hidden_states))
+
+        if clean_hidden_states is not None:
+            # Teacher-forcing dual-stream compatibility:
+            # keep ControlNet conditioning on noisy branch, and prepend
+            # zero residuals for the clean branch so transformer can consume
+            # concatenated [clean, noisy] token streams.
+            padded_residuals: list[torch.Tensor] = []
+            for res in residuals:
+                padded_residuals.append(
+                    torch.cat([torch.zeros_like(res), res], dim=1))
+            return tuple(padded_residuals)
 
         return tuple(residuals)

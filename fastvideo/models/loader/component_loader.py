@@ -13,6 +13,7 @@ from typing import cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -33,6 +34,35 @@ from fastvideo.models.registry import ModelRegistry
 from fastvideo.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _collect_safetensors_keys(weight_files: list[str]) -> set[str]:
+    keys: set[str] = set()
+    for sf_path in weight_files:
+        with safe_open(sf_path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                keys.add(k)
+    return keys
+
+
+def _validate_union_controlnet_weights(
+    weight_files: list[str],
+    source_desc: str,
+) -> None:
+    keys = _collect_safetensors_keys(weight_files)
+    required_prefixes = [
+        "union_transformer.",
+        "control_type_proj.",
+        "task_embedding",
+        "spatial_ch_projs.",
+        "union_cond_embedding.",
+    ]
+    missing = [p for p in required_prefixes if not any(k.startswith(p) for k in keys)]
+    if missing:
+        raise ValueError(
+            "ControlNet is forced to Union, but checkpoint weights do not look like Union weights. "
+            f"Missing required Union key prefixes: {missing}. Source: {source_desc}"
+        )
 
 
 class ComponentLoader(ABC):
@@ -535,14 +565,7 @@ class ControlNetLoader(ComponentLoader):
             else:
                 cls_name = "WanControlnet3DModel"
             logger.info("Fallback controlnet cls_name to %s", cls_name)
-        if cls_name is None or cls_name == "TransformersModel":
-            # Heuristic fallback when _class_name is missing/invalid.
-            name_hint = str(model_path).lower()
-            if "union" in name_hint:
-                cls_name = "WanControlnetUnion3DModel"
-            else:
-                cls_name = "WanControlnet3DModel"
-            logger.info("Fallback controlnet cls_name to %s", cls_name)
+        union_requested = bool(cls_name and "union" in cls_name.lower())
         fastvideo_args.model_paths["controlnet"] = model_path
 
         # Important: do NOT mutate pipeline_config.dit_config in-place (ControlNet arch differs).
@@ -590,6 +613,10 @@ class ControlNetLoader(ComponentLoader):
                 len(safetensors_list),
                 model_path,
             )
+
+        if union_requested:
+            source_desc = str(custom_weights_path) if use_custom_weights else str(model_path)
+            _validate_union_controlnet_weights(safetensors_list, source_desc)
 
         logger.info("ControlNet safetensors files: %s", safetensors_list)
 

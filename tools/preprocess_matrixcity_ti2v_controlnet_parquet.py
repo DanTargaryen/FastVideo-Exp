@@ -382,6 +382,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--latent_repeat", type=int, default=0)
     p.add_argument(
+        "--write_vae_latent",
+        action="store_true",
+        help=(
+            "If set, encode RGB clip and write non-empty vae_latent fields. "
+            "Required for AR-TF phase-1 training."
+        ),
+    )
+    p.add_argument(
         "--skip_existing_ids",
         action="store_true",
         help="Resume-friendly mode: skip records whose id already exists in output parquet rank shard.",
@@ -664,6 +672,7 @@ def main() -> None:
             ],
             dim=0,
         )
+        rgb_tchw = None
         if masked_rgb_paths is not None:
             masked_rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in masked_rgb_paths], dim=0)
         else:
@@ -671,6 +680,25 @@ def main() -> None:
                 continue
             rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths], dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
+
+        vae_lat_np = None
+        if bool(args.write_vae_latent):
+            if rgb_tchw is None:
+                rgb_tchw = torch.stack(
+                    [
+                        _load_rgb_frame(
+                            p, int(args.max_height), int(args.max_width)
+                        )
+                        for p in rgb_paths
+                    ],
+                    dim=0,
+                )
+            rgb_bcthw = _to_vae_input(rgb_tchw, normalize=True).to(
+                device=device, dtype=torch.float32
+            )
+            vae_lat = _encode_video_latents(vae, rgb_bcthw, sample_mode="mode")
+            # Keep standard latent channels (z_dim) for main transformer input.
+            vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
 
         video_n = torch.cat(
             [
@@ -700,9 +728,9 @@ def main() -> None:
             "text_embedding_bytes": text_emb.tobytes(),
             "text_embedding_shape": list(text_emb.shape),
             "text_embedding_dtype": "float32",
-            "vae_latent_bytes": empty_lat.tobytes(),
-            "vae_latent_shape": [],
-            "vae_latent_dtype": "",
+            "vae_latent_bytes": (vae_lat_np.tobytes() if vae_lat_np is not None else empty_lat.tobytes()),
+            "vae_latent_shape": (list(vae_lat_np.shape) if vae_lat_np is not None else []),
+            "vae_latent_dtype": ("float32" if vae_lat_np is not None else ""),
             "first_frame_latent_bytes": first_lat_np.tobytes(),
             "first_frame_latent_shape": list(first_lat_np.shape),
             "first_frame_latent_dtype": "float32",
