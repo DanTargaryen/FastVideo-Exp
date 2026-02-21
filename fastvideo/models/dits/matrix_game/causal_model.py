@@ -207,7 +207,10 @@ class CausalMatrixGameSelfAttention(nn.Module):
                 key=padded_roped_key.transpose(2, 1),
                 value=padded_v.transpose(2, 1),
                 block_mask=block_mask
-            )[:, :, :-padded_length].transpose(2, 1)
+            )
+            if padded_length > 0:
+                x = x[:, :, :-padded_length]
+            x = x.transpose(2, 1)
         else:
             # Calculate frame_seqlen correctly from grid_sizes (single frame token count)
             if grid_sizes is not None:

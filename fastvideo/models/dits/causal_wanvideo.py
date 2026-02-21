@@ -118,7 +118,12 @@ class CausalWanSelfAttention(nn.Module):
                 key=padded_roped_key.transpose(2, 1),
                 value=padded_v.transpose(2, 1),
                 block_mask=block_mask
-            )[:, :, :-padded_length].transpose(2, 1)
+            )
+            # Note: when padded_length == 0, slicing with `:-0` returns an empty
+            # tensor. Keep full sequence in that case.
+            if padded_length > 0:
+                x = x[:, :, :-padded_length]
+            x = x.transpose(2, 1)
         else:
             frame_seqlen = q.shape[1]
             current_end = current_start + roped_query.shape[1]
