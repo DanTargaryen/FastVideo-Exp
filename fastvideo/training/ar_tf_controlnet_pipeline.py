@@ -294,6 +294,13 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
         args = cast(TrainingArgs, self.training_args)
         device = get_local_torch_device()
         model_dtype = get_compute_dtype()
+        # Base TrainingPipeline.train() may overwrite self.noise_scheduler with
+        # FlowMatchEulerDiscreteScheduler, which does not implement add_noise.
+        # AR-TF requires SelfForcingFlowMatchScheduler APIs.
+        scheduler = self.noise_scheduler
+        if not hasattr(scheduler, "add_noise"):
+            scheduler = self.modules["scheduler"]
+            self.noise_scheduler = scheduler
 
         for _ in range(args.gradient_accumulation_steps):
             training_batch = self._get_next_batch(training_batch)
@@ -324,11 +331,11 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                 int(args.num_frame_per_block),
                 device,
             )
-            timestep = self.noise_scheduler.timesteps.to(device).index_select(
+            timestep = scheduler.timesteps.to(device).index_select(
                 0, timestep_indices.flatten()
             ).reshape(bsz, num_frames)
 
-            noisy_input = self.noise_scheduler.add_noise(
+            noisy_input = scheduler.add_noise(
                 clean_latent.flatten(0, 1),
                 noise.flatten(0, 1),
                 timestep,
@@ -338,7 +345,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             context_timestep = None
             if int(getattr(args, "context_noise", 0)) > 0:
                 max_ctx = min(int(args.context_noise),
-                              int(self.noise_scheduler.timesteps.numel()))
+                              int(scheduler.timesteps.numel()))
                 if max_ctx > 0:
                     context_indices = self._sample_blockwise_timestep_indices(
                         bsz,
@@ -348,10 +355,10 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                         min_index=0,
                         max_index=max_ctx,
                     )
-                    context_timestep = self.noise_scheduler.timesteps.to(
+                    context_timestep = scheduler.timesteps.to(
                         device).index_select(0, context_indices.flatten()).reshape(
                             bsz, num_frames)
-                    clean_context = self.noise_scheduler.add_noise(
+                    clean_context = scheduler.add_noise(
                         clean_latent.flatten(0, 1),
                         noise.flatten(0, 1),
                         context_timestep,
@@ -365,8 +372,8 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                     timestep = timestep.clone()
                     timestep[:, 0] = 0.0
             clean_context_bcfhw = clean_context.permute(0, 2, 1, 3, 4).contiguous()
-            if hasattr(self.noise_scheduler, "training_target"):
-                target_flow = self.noise_scheduler.training_target(
+            if hasattr(scheduler, "training_target"):
+                target_flow = scheduler.training_target(
                     clean_latent.flatten(0, 1),
                     noise.flatten(0, 1),
                     timestep,
@@ -414,8 +421,8 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             per_frame_loss = (pred_flow.float() - target_flow.float()).pow(2).mean(
                 dim=(2, 3, 4)
             )
-            if hasattr(self.noise_scheduler, "training_weight"):
-                weight = self.noise_scheduler.training_weight(timestep).unflatten(
+            if hasattr(scheduler, "training_weight"):
+                weight = scheduler.training_weight(timestep).unflatten(
                     0, (bsz, num_frames))
                 per_frame_loss = per_frame_loss * weight.to(
                     device=per_frame_loss.device, dtype=per_frame_loss.dtype)
