@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import shutil
 import time
 from collections.abc import Callable, Iterator
 from enum import Enum
@@ -267,30 +268,58 @@ def save_checkpoint(transformer,
     if scheduler is not None:
         states["scheduler"] = SchedulerWrapper(scheduler)
     dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
-    logger.info("rank: %s, saving distributed checkpoint to %s",
+    skip_dcp_save = os.environ.get("FASTVIDEO_SKIP_DCP_SAVE", "0") == "1"
+    strict_dcp_save = os.environ.get("FASTVIDEO_STRICT_DCP_SAVE", "0") == "1"
+    if skip_dcp_save:
+        logger.warning(
+            "rank: %s, FASTVIDEO_SKIP_DCP_SAVE=1 -> skipping distributed checkpoint save",
+            rank,
+            local_main_process_only=False,
+        )
+    else:
+        logger.info("rank: %s, saving distributed checkpoint to %s",
+                    rank,
+                    dcp_dir,
+                    local_main_process_only=False)
+        try:
+            if os.environ.get("FASTVIDEO_EMPTY_CACHE_BEFORE_DCP", "0") == "1" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            begin_time = time.perf_counter()
+            dcp.save(states, checkpoint_id=dcp_dir)
+            end_time = time.perf_counter()
+            logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
+                        rank,
+                        end_time - begin_time,
+                        local_main_process_only=False)
+        except Exception as e:
+            logger.warning(
+                "rank: %s, distributed checkpoint save failed; continue with consolidated safetensors only. error=%s",
                 rank,
-                dcp_dir,
-                local_main_process_only=False)
-
-    begin_time = time.perf_counter()
-    dcp.save(states, checkpoint_id=dcp_dir)
-    end_time = time.perf_counter()
-
-    logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
-                rank,
-                end_time - begin_time,
-                local_main_process_only=False)
+                str(e).splitlines()[0] if str(e) else repr(e),
+                local_main_process_only=False,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if strict_dcp_save:
+                raise
 
     cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
     controlnet_cpu_state = None
     if controlnet is not None:
         controlnet_cpu_state = gather_state_dict_on_cpu_rank0(controlnet, device=None)
     if rank == 0:
-        # Save model weights (consolidated)
+        # Save model weights (consolidated).
+        # Keep `transformer/` for backward compatibility and mirror to
+        # `generator_inference_transformer/` for direct inference.
         transformer_save_dir = os.path.join(save_dir, "transformer")
+        inference_transformer_save_dir = os.path.join(
+            save_dir, "generator_inference_transformer")
         os.makedirs(transformer_save_dir, exist_ok=True)
-        weight_path = os.path.join(transformer_save_dir,
-                                   "diffusion_pytorch_model.safetensors")
+        os.makedirs(inference_transformer_save_dir, exist_ok=True)
+        weight_path = os.path.join(
+            transformer_save_dir, "diffusion_pytorch_model.safetensors")
+        inference_weight_path = os.path.join(
+            inference_transformer_save_dir, "diffusion_pytorch_model.safetensors")
         logger.info("rank: %s, saving consolidated checkpoint to %s",
                     rank,
                     weight_path,
@@ -300,6 +329,13 @@ def save_checkpoint(transformer,
         diffusers_state_dict = custom_to_hf_state_dict(
             cpu_state, transformer.reverse_param_names_mapping)
         save_file(diffusers_state_dict, weight_path)
+        # Mirror for direct inference.
+        try:
+            if os.path.exists(inference_weight_path):
+                os.remove(inference_weight_path)
+            os.link(weight_path, inference_weight_path)
+        except Exception:
+            shutil.copy2(weight_path, inference_weight_path)
 
         logger.info("rank: %s, consolidated checkpoint saved to %s",
                     rank,
@@ -314,7 +350,12 @@ def save_checkpoint(transformer,
         # save dict as json
         with open(config_path, "w") as f:
             json.dump(config_dict, f, indent=4)
+        inference_config_path = os.path.join(inference_transformer_save_dir,
+                                             "config.json")
+        shutil.copy2(config_path, inference_config_path)
         logger.info("--> checkpoint saved at step %s to %s", step, weight_path)
+        logger.info("--> inference transformer checkpoint mirrored to %s",
+                    inference_weight_path)
 
         if controlnet is not None and controlnet_cpu_state is not None:
             reverse_mapping = getattr(controlnet, "reverse_param_names_mapping", {})

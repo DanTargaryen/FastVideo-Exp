@@ -665,6 +665,12 @@ class TrainingPipeline(LoRAPipeline, ABC):
             if step % self.training_args.training_state_checkpointing_steps == 0:
                 with self.profiler_controller.region(
                         "profiler_region_training_save_checkpoint"):
+                    # Free gradient buffers before checkpoint to reduce peak CUDA memory.
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if getattr(self, "optimizer_2", None) is not None:
+                        self.optimizer_2.zero_grad(set_to_none=True)
+                    if os.environ.get("FASTVIDEO_EMPTY_CACHE_BEFORE_DCP", "0") == "1" and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     controlnet = getattr(self, "controlnet", None)
                     save_checkpoint(self.transformer, self.global_rank,
                                     self.training_args.output_dir, step,
@@ -691,6 +697,12 @@ class TrainingPipeline(LoRAPipeline, ABC):
                         gpu_memory_usage, trainable_params)
 
         self.tracker.finish()
+        # Final checkpoint also benefits from releasing grad memory first.
+        self.optimizer.zero_grad(set_to_none=True)
+        if getattr(self, "optimizer_2", None) is not None:
+            self.optimizer_2.zero_grad(set_to_none=True)
+        if os.environ.get("FASTVIDEO_EMPTY_CACHE_BEFORE_DCP", "0") == "1" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         controlnet = getattr(self, "controlnet", None)
         save_checkpoint(self.transformer, self.global_rank,
                         self.training_args.output_dir,
