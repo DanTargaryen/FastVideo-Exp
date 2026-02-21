@@ -317,9 +317,10 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             assert encoder_attention_mask is not None
 
             bsz, c, num_frames, height, width = clean_latent.shape
+            clean_latent_btfhw = clean_latent.permute(0, 2, 1, 3, 4).contiguous()
 
-            noise = torch.randn(
-                clean_latent.shape,
+            noise_btfhw = torch.randn(
+                clean_latent_btfhw.shape,
                 generator=self.noise_gen_cuda,
                 device=device,
                 dtype=clean_latent.dtype,
@@ -335,13 +336,13 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                 0, timestep_indices.flatten()
             ).reshape(bsz, num_frames)
 
-            noisy_input = scheduler.add_noise(
-                clean_latent.flatten(0, 1),
-                noise.flatten(0, 1),
+            noisy_input_btfhw = scheduler.add_noise(
+                clean_latent_btfhw.flatten(0, 1),
+                noise_btfhw.flatten(0, 1),
                 timestep,
             ).unflatten(0, (bsz, num_frames))
 
-            clean_context = clean_latent
+            clean_context_btfhw = clean_latent_btfhw
             context_timestep = None
             if int(getattr(args, "context_noise", 0)) > 0:
                 max_ctx = min(int(args.context_noise),
@@ -358,28 +359,28 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                     context_timestep = scheduler.timesteps.to(
                         device).index_select(0, context_indices.flatten()).reshape(
                             bsz, num_frames)
-                    clean_context = scheduler.add_noise(
-                        clean_latent.flatten(0, 1),
-                        noise.flatten(0, 1),
+                    clean_context_btfhw = scheduler.add_noise(
+                        clean_latent_btfhw.flatten(0, 1),
+                        noise_btfhw.flatten(0, 1),
                         context_timestep,
                     ).unflatten(0, (bsz, num_frames))
 
             # TI2V teacher-forcing anchor: keep first latent frame fixed to first frame condition.
-            noisy_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
+            noisy_input = noisy_input_btfhw.permute(0, 2, 1, 3, 4).contiguous()
             if noisy_input.shape[2] >= 1:
                 noisy_input[:, :, :1] = first_frame_latent
                 if args.independent_first_frame:
                     timestep = timestep.clone()
                     timestep[:, 0] = 0.0
-            clean_context_bcfhw = clean_context.permute(0, 2, 1, 3, 4).contiguous()
+            clean_context_bcfhw = clean_context_btfhw.permute(0, 2, 1, 3, 4).contiguous()
             if hasattr(scheduler, "training_target"):
                 target_flow = scheduler.training_target(
-                    clean_latent.flatten(0, 1),
-                    noise.flatten(0, 1),
+                    clean_latent_btfhw.flatten(0, 1),
+                    noise_btfhw.flatten(0, 1),
                     timestep,
                 ).unflatten(0, (bsz, num_frames))
             else:
-                target_flow = noise - clean_latent
+                target_flow = noise_btfhw - clean_latent_btfhw
 
             forward_batch = ForwardBatch(data_type="ti2v_controlnet")
             forward_batch.prompt_embeds = [encoder_hidden_states]
