@@ -14,6 +14,20 @@ from fastvideo.utils import get_compute_dtype
 from fastvideo.layers.rotary_embedding import _apply_rotary_emb
 
 
+def _maybe_get_attn_metadata():
+    """Return attention metadata if forward context exists, else None.
+
+    During activation-checkpoint recompute in backward, modules can be re-run
+    outside `set_forward_context(...)`. In that case we fall back to `None`,
+    which matches the common training path in this codebase.
+    """
+    try:
+        forward_context: ForwardContext = get_forward_context()
+        return forward_context.attn_metadata
+    except AssertionError:
+        return None
+
+
 class DistributedAttention(nn.Module):
     """Distributed attention layer.
     """
@@ -91,8 +105,7 @@ class DistributedAttention(nn.Module):
         local_rank = get_sp_parallel_rank()
         world_size = get_sp_world_size()
 
-        forward_context: ForwardContext = get_forward_context()
-        ctx_attn_metadata = forward_context.attn_metadata
+        ctx_attn_metadata = _maybe_get_attn_metadata()
 
         # Stack QKV
         qkv = torch.cat([q, k, v],
@@ -201,8 +214,7 @@ class DistributedAttention_VSA(DistributedAttention):
         assert q.dim() == 4 and k.dim() == 4 and v.dim(
         ) == 4, "Expected 4D tensors"
 
-        forward_context: ForwardContext = get_forward_context()
-        ctx_attn_metadata = forward_context.attn_metadata
+        ctx_attn_metadata = _maybe_get_attn_metadata()
 
         batch_size, seq_len, num_heads, head_dim = q.shape
         # Stack QKV
@@ -313,8 +325,7 @@ class LocalAttention(nn.Module):
         assert q.dim() == 4 and k.dim() == 4 and v.dim(
         ) == 4, "Expected 4D tensors"
 
-        forward_context: ForwardContext = get_forward_context()
-        ctx_attn_metadata = forward_context.attn_metadata
+        ctx_attn_metadata = _maybe_get_attn_metadata()
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
