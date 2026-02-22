@@ -785,6 +785,12 @@ def main() -> None:
 
         traj_np = traj_tensor.cpu().numpy().astype(save_dtype, copy=False)
         t_np = t_tensor.cpu().numpy()
+        logger.info(
+            "sample=%s saved trajectory states=%d timesteps=%s",
+            sample_id,
+            int(traj_tensor.shape[0]),
+            [float(x) for x in t_np.tolist()],
+        )
 
         record = ode_ti2v_controlnet_record_creator(
             video_name=sample_id,
