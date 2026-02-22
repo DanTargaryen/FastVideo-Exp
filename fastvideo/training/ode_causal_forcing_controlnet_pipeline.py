@@ -99,8 +99,8 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
     Causal-Forcing style Stage-2 ODE regression under FastVideo.
 
     For each sample trajectory:
-    - target_latent := trajectory[:, -1]
-    - noisy_input sampled from trajectory at random timestep index
+    - target_latent := trajectory[:, -1] (clean GT when provided by data)
+    - noisy_input sampled from rollout states only (exclude clean GT if present)
     - student runs without TF clean branch (no clean_x / clean_hidden_states)
     - loss = MSE(pred_x0, target_latent), masked by timestep != 0
     """
@@ -316,10 +316,40 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
                 raise ValueError("trajectory_latents must contain at least 2 states")
 
             target_latent = traj_latents[:, -1]      # [B, T, C, H, W]
-            ode_valid_latents = traj_latents
-            ode_valid_timesteps = traj_timesteps
+
+            # Support both formats:
+            # 1) Causal-Forcing aligned data:
+            #    traj_latents includes clean GT at last index, and
+            #    traj_timesteps is either same length with last timestep=0,
+            #    or one shorter (rollout-only timesteps).
+            # 2) Legacy FastVideo data:
+            #    traj_latents are rollout-only; last index is rollout final.
+            has_clean_timestep_tail = (
+                traj_timesteps.shape[1] == traj_latents.shape[1]
+                and torch.all(traj_timesteps[:, -1] == 0)
+            )
+            if has_clean_timestep_tail:
+                ode_valid_latents = traj_latents[:, :-1]
+                ode_valid_timesteps = traj_timesteps[:, :-1]
+            elif traj_timesteps.shape[1] == traj_latents.shape[1] - 1:
+                ode_valid_latents = traj_latents[:, :-1]
+                ode_valid_timesteps = traj_timesteps
+            elif traj_timesteps.shape[1] == traj_latents.shape[1]:
+                # Backward-compat fallback: sample from all states.
+                ode_valid_latents = traj_latents
+                ode_valid_timesteps = traj_timesteps
+            else:
+                raise ValueError(
+                    "Unsupported trajectory shape relation: "
+                    f"latents_steps={traj_latents.shape[1]}, "
+                    f"timesteps_steps={traj_timesteps.shape[1]}"
+                )
 
             bsz, num_steps, num_frames, num_channels, height, width = ode_valid_latents.shape
+            if num_steps <= 0:
+                raise ValueError(
+                    "No rollout states available for noisy-input sampling."
+                )
 
             step_index = self._sample_step_indices(
                 bsz,

@@ -393,6 +393,23 @@ def parse_args() -> argparse.Namespace:
                    help="End global index (exclusive; -1 means dataset end)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
+        "--append_clean_latent",
+        action="store_true",
+        help=(
+            "Append clean GT latent (vae_latent) as the last trajectory state so that "
+            "-2 is rollout-final and -1 is clean GT, matching Causal-Forcing."
+        ),
+    )
+    p.add_argument(
+        "--trajectory_indices",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated trajectory indices to keep, e.g. "
+            "'0,12,24,36,-2,-1'. Applied after optional clean appending."
+        ),
+    )
+    p.add_argument(
         "--skip_existing_ids",
         action="store_true",
         help=
@@ -525,6 +542,12 @@ def main() -> None:
 
     torch.manual_seed(int(args.seed) + rank)
     np.random.seed(int(args.seed) + rank)
+    selected_indices: list[int] | None = None
+    if str(args.trajectory_indices).strip() != "":
+        selected_indices = [
+            int(x.strip()) for x in str(args.trajectory_indices).split(",")
+            if x.strip() != ""
+        ]
 
     cols = [
         "id",
@@ -543,6 +566,12 @@ def main() -> None:
         "control_latent_shape",
         "control_latent_dtype",
     ]
+    if bool(args.append_clean_latent):
+        cols.extend([
+            "vae_latent_bytes",
+            "vae_latent_shape",
+            "vae_latent_dtype",
+        ])
 
     for idx in indices:
         row = _read_row_by_global_index(parquet_files, lengths, idx, cols)
@@ -710,10 +739,43 @@ def main() -> None:
                                                               dtype=dtype)
             traj_latents.append(current_latents.detach().clone())
 
-        traj_np = torch.stack(traj_latents, dim=0).squeeze(
-            1).to(dtype=torch.float32).cpu().numpy().astype(save_dtype,
-                                                            copy=False)
-        t_np = t_list.to(dtype=torch.float32).cpu().numpy()
+        traj_tensor = torch.stack(traj_latents, dim=0).squeeze(1).to(
+            dtype=torch.float32)
+        t_tensor = t_list.to(dtype=torch.float32)
+
+        # Causal-Forcing alignment: append clean GT latent as the last state.
+        if bool(args.append_clean_latent):
+            clean_latent = _ensure_bcfhw(
+                _decode_tensor(row, "vae_latent"), name="vae_latent"
+            ).to(device=device, dtype=torch.float32)
+            if clean_latent.shape[0] != 1:
+                raise ValueError(
+                    f"Expected batch=1 vae_latent for ODE preprocessing, got {tuple(clean_latent.shape)}"
+                )
+            # traj_tensor: [S, C, F, H, W], clean_latent[0]: [C, F, H, W]
+            traj_tensor = torch.cat([traj_tensor, clean_latent[0:1]], dim=0)
+            # Keep timesteps aligned in length; the clean target is t=0.
+            t_tensor = torch.cat([
+                t_tensor,
+                torch.tensor([0.0], device=t_tensor.device, dtype=t_tensor.dtype),
+            ], dim=0)
+
+        if selected_indices is not None:
+            n_states = int(traj_tensor.shape[0])
+            idx = torch.tensor(
+                [(i + n_states) if i < 0 else i for i in selected_indices],
+                device=traj_tensor.device,
+                dtype=torch.long,
+            )
+            if torch.any(idx < 0) or torch.any(idx >= n_states):
+                raise ValueError(
+                    f"trajectory_indices out of range for {n_states} states: {selected_indices}"
+                )
+            traj_tensor = traj_tensor.index_select(0, idx)
+            t_tensor = t_tensor.index_select(0, idx)
+
+        traj_np = traj_tensor.cpu().numpy().astype(save_dtype, copy=False)
+        t_np = t_tensor.cpu().numpy()
 
         record = ode_ti2v_controlnet_record_creator(
             video_name=sample_id,
