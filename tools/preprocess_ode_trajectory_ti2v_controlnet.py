@@ -374,6 +374,14 @@ def parse_args() -> argparse.Namespace:
                    default="bidirectional",
                    choices=["bidirectional", "causal"],
                    help="Teacher attention mode for trajectory sampling")
+    p.add_argument(
+        "--use_clean_prefix",
+        action="store_true",
+        help=(
+            "Enable Causal-Forcing style clean-prefix teacher forcing during ODE rollout. "
+            "Requires --teacher_mode causal and input parquet to include vae_latent."
+        ),
+    )
     p.add_argument("--dtype",
                    type=str,
                    default="bf16",
@@ -468,6 +476,8 @@ def main() -> None:
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
 
     use_union_controlnet = _controlnet_dir_is_union(args.controlnet_dir)
+    if bool(args.use_clean_prefix) and args.teacher_mode != "causal":
+        raise ValueError("--use_clean_prefix requires --teacher_mode causal")
     if args.teacher_mode == "bidirectional":
         fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
         fastvideo_args.override_controlnet_cls_name = (
@@ -575,7 +585,7 @@ def main() -> None:
         "control_latent_shape",
         "control_latent_dtype",
     ]
-    if bool(args.append_clean_latent):
+    if bool(args.append_clean_latent) or bool(args.use_clean_prefix):
         cols.extend([
             "vae_latent_bytes",
             "vae_latent_shape",
@@ -602,6 +612,11 @@ def main() -> None:
         control_latent = _ensure_bcfhw(_decode_tensor(row, "control_latent"),
                                        name="control_latent").to(
                                            device=device, dtype=dtype)
+        clean_latent: torch.Tensor | None = None
+        if bool(args.use_clean_prefix) or bool(args.append_clean_latent):
+            clean_latent = _ensure_bcfhw(
+                _decode_tensor(row, "vae_latent"), name="vae_latent").to(
+                    device=device, dtype=dtype)
         num_channels_latents = int(transformer.num_channels_latents)
 
         latent_t = int(control_latent.shape[2])
@@ -694,6 +709,8 @@ def main() -> None:
                     hidden_states=latent_model_input,
                     encoder_hidden_states=[text_embedding],
                     timestep=timestep,
+                    clean_hidden_states=clean_latent
+                    if bool(args.use_clean_prefix) else None,
                     **_build_controlnet_kwargs(controlnet, control_latent,
                                                num_channels_latents),
                 )
@@ -702,6 +719,9 @@ def main() -> None:
                     [text_embedding],
                     timestep,
                     block_controlnet_hidden_states=control_res,
+                    clean_x=clean_latent
+                    if bool(args.use_clean_prefix) else None,
+                    aug_t=None,
                 ).permute(0, 2, 1, 3, 4)
 
             if guidance_scale == 1.0:
@@ -719,6 +739,8 @@ def main() -> None:
                     hidden_states=latent_model_input,
                     encoder_hidden_states=[negative],
                     timestep=timestep,
+                    clean_hidden_states=clean_latent
+                    if bool(args.use_clean_prefix) else None,
                     **_build_controlnet_kwargs(controlnet, control_latent,
                                                num_channels_latents),
                 )
@@ -727,6 +749,9 @@ def main() -> None:
                     [negative],
                     timestep,
                     block_controlnet_hidden_states=control_res_uncond,
+                    clean_x=clean_latent
+                    if bool(args.use_clean_prefix) else None,
+                    aug_t=None,
                 ).permute(0, 2, 1, 3, 4)
             return pred_uncond + guidance_scale * (pred_flow - pred_uncond)
 
@@ -754,9 +779,12 @@ def main() -> None:
 
         # Causal-Forcing alignment: append clean GT latent as the last state.
         if bool(args.append_clean_latent):
+            if clean_latent is None:
+                raise ValueError(
+                    "--append_clean_latent requires vae_latent to be loaded.")
             clean_latent = _ensure_bcfhw(
-                _decode_tensor(row, "vae_latent"), name="vae_latent"
-            ).to(device=device, dtype=torch.float32)
+                clean_latent, name="vae_latent").to(device=device,
+                                                     dtype=torch.float32)
             if clean_latent.shape[0] != 1:
                 raise ValueError(
                     f"Expected batch=1 vae_latent for ODE preprocessing, got {tuple(clean_latent.shape)}"
