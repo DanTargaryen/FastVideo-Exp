@@ -274,7 +274,6 @@ def save_checkpoint(transformer,
         logger.warning(
             "rank: %s, FASTVIDEO_SKIP_DCP_SAVE=1 -> skipping distributed checkpoint save",
             rank,
-            local_main_process_only=False,
         )
     else:
         logger.info("rank: %s, saving distributed checkpoint to %s",
@@ -296,7 +295,6 @@ def save_checkpoint(transformer,
                 "rank: %s, distributed checkpoint save failed; continue with consolidated safetensors only. error=%s",
                 rank,
                 str(e).splitlines()[0] if str(e) else repr(e),
-                local_main_process_only=False,
             )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
