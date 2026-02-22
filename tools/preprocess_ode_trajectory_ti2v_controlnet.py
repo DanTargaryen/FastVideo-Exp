@@ -574,6 +574,10 @@ def main() -> None:
         t_list = _build_schedule_timesteps(scheduler, num_steps, device)
         expand_timesteps = bool(
             getattr(fastvideo_args.pipeline_config, "expand_timesteps", False))
+        if args.teacher_mode == "causal" and expand_timesteps:
+            logger.info(
+                "teacher_mode=causal: using frame-level timesteps for ControlNet/Transformer (disable token-level expanded timesteps)."
+            )
         image_latents = first_frame_latent.to(
             device=device, dtype=dtype) if first_frame_latent is not None else None
         first_frame_mask = torch.ones(
@@ -624,6 +628,14 @@ def main() -> None:
                 temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
                 timestep = temp_ts.unsqueeze(0).expand(
                     latent_model_input.shape[0], -1)
+                if args.teacher_mode == "causal":
+                    # Causal Union ControlNet expects frame-level timesteps [B, F].
+                    # Token-level expanded timesteps (e.g., [B, F*H*W]) cause
+                    # mismatch when fusing global control embeddings.
+                    timestep = torch.full((latent_model_input.shape[0], latent_t),
+                                          float(t_cur),
+                                          device=device,
+                                          dtype=torch.float32)
             else:
                 if image_latents is None:
                     latent_model_input = current_latents
