@@ -303,10 +303,13 @@ def save_checkpoint(transformer,
             if strict_dcp_save:
                 raise
 
-    cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
+    # For inference export we must save the full module state_dict, not only trainable params.
+    cpu_state = gather_state_dict_on_cpu_rank0(
+        transformer, device=None, trainable_only=False)
     controlnet_cpu_state = None
     if controlnet is not None:
-        controlnet_cpu_state = gather_state_dict_on_cpu_rank0(controlnet, device=None)
+        controlnet_cpu_state = gather_state_dict_on_cpu_rank0(
+            controlnet, device=None, trainable_only=False)
     if rank == 0:
         # Save model weights (consolidated).
         # Keep `transformer/` for backward compatibility and mirror to

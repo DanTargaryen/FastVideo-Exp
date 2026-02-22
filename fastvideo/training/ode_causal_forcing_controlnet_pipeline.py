@@ -99,10 +99,9 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
     Causal-Forcing style Stage-2 ODE regression under FastVideo.
 
     For each sample trajectory:
-    - clean_latent := trajectory[:, -1]
-    - target_latent := trajectory[:, -2]
-    - noisy_input sampled from trajectory[:, :-1] at random timestep index
-    - student runs in TF mode (clean_x / clean_hidden_states)
+    - target_latent := trajectory[:, -1]
+    - noisy_input sampled from trajectory at random timestep index
+    - student runs without TF clean branch (no clean_x / clean_hidden_states)
     - loss = MSE(pred_x0, target_latent), masked by timestep != 0
     """
 
@@ -316,10 +315,9 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
             if traj_latents.shape[1] < 2:
                 raise ValueError("trajectory_latents must contain at least 2 states")
 
-            clean_latent = traj_latents[:, -1]       # [B, T, C, H, W]
-            target_latent = traj_latents[:, -2]      # [B, T, C, H, W]
-            ode_valid_latents = traj_latents[:, :-1]  # exclude clean target anchor
-            ode_valid_timesteps = traj_timesteps[:, :-1]
+            target_latent = traj_latents[:, -1]      # [B, T, C, H, W]
+            ode_valid_latents = traj_latents
+            ode_valid_timesteps = traj_timesteps
 
             bsz, num_steps, num_frames, num_channels, height, width = ode_valid_latents.shape
 
@@ -345,14 +343,10 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
 
             # [B, T, C, H, W] -> [B, C, T, H, W]
             latent_model_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
-            clean_context = clean_latent.permute(0, 2, 1, 3, 4).contiguous()
 
             # TI2V anchor at the first latent frame.
             if latent_model_input.shape[2] >= 1:
                 latent_model_input[:, :, :1] = first_frame_latent
-                if args.independent_first_frame:
-                    timestep = timestep.clone()
-                    timestep[:, 0] = 0.0
 
             batch = ForwardBatch(data_type="ti2v_controlnet")
             batch.prompt_embeds = [training_batch.encoder_hidden_states]
@@ -372,8 +366,6 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
                     hidden_states=latent_model_input.to(dtype=model_dtype),
                     encoder_hidden_states=[training_batch.encoder_hidden_states.to(dtype=model_dtype)],
                     timestep=timestep.to(device, dtype=model_dtype),
-                    clean_hidden_states=clean_context.to(dtype=model_dtype),
-                    aug_t=None,
                     **_build_controlnet_kwargs(
                         self.controlnet,
                         control_latent.to(dtype=model_dtype),
@@ -385,8 +377,6 @@ class CausalForcingODERegressionControlNetTrainingPipeline(TrainingPipeline):
                     [training_batch.encoder_hidden_states.to(dtype=model_dtype)],
                     timestep.to(device, dtype=model_dtype),
                     block_controlnet_hidden_states=control_res,
-                    clean_x=clean_context.to(dtype=model_dtype),
-                    aug_t=None,
                 ).permute(0, 2, 1, 3, 4)
 
             pred_x0 = pred_noise_to_pred_video(
