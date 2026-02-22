@@ -358,7 +358,7 @@ def parse_args() -> argparse.Namespace:
                    help="Number of ODE steps to record (default: 50)")
     p.add_argument("--flow_shift",
                    type=float,
-                   default=8.0,
+                   default=5.0,
                    help="FlowMatchEuler shift (must match training)")
     p.add_argument("--guidance_scale",
                    type=float,
@@ -755,16 +755,22 @@ def main() -> None:
                 ).permute(0, 2, 1, 3, 4)
             return pred_uncond + guidance_scale * (pred_flow - pred_uncond)
 
-        # Euler update across timesteps
-        for step_i in range(int(t_list.numel()) - 1):
+        # Euler update across timesteps.
+        # Match Causal-Forcing behavior: run one extra final update to sigma=0.
+        n_sched = int(t_list.numel())
+        for step_i in range(n_sched):
             t_cur = t_list[step_i]
-            t_next = t_list[step_i + 1]
             pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
 
             idx_cur = torch.argmin((timesteps_1d - t_cur.float()).abs())
-            idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
             sigma_cur = sigmas_1d[idx_cur]
-            sigma_next = sigmas_1d[idx_next]
+            if step_i + 1 < n_sched:
+                t_next = t_list[step_i + 1]
+                idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
+                sigma_next = sigmas_1d[idx_next]
+            else:
+                sigma_next = torch.tensor(
+                    0.0, device=sigma_cur.device, dtype=sigma_cur.dtype)
             dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
 
             current_latents = current_latents + dt * pred_flow_btchw.permute(
@@ -775,7 +781,13 @@ def main() -> None:
 
         traj_tensor = torch.stack(traj_latents, dim=0).squeeze(1).to(
             dtype=torch.float32)
-        t_tensor = t_list.to(dtype=torch.float32)
+        # Keep one timestep entry per recorded latent state.
+        # The final rollout state corresponds to sigma=0.
+        t_tensor = torch.cat([
+            t_list.to(dtype=torch.float32),
+            torch.tensor([0.0], device=t_list.device, dtype=torch.float32),
+        ],
+                             dim=0)
 
         # Causal-Forcing alignment: append clean GT latent as the last state.
         if bool(args.append_clean_latent):
