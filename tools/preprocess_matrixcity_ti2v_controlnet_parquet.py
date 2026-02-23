@@ -393,6 +393,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--caption_key", type=str, default="Video_Caption")
     p.add_argument("--samples_per_file", type=int, default=8)
     p.add_argument("--flush_frequency", type=int, default=8)
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=0,
+        help="Stop after writing this many samples. 0 means no limit.",
+    )
+    p.add_argument(
+        "--max_samples_global",
+        action="store_true",
+        help=(
+            "When used with --max_samples and world_size>1, apply the limit globally "
+            "by letting rank0 process all clips (other ranks stay idle)."
+        ),
+    )
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--latent_repeat", type=int, default=0)
@@ -523,7 +537,21 @@ def main() -> None:
                 if clip_dir.is_dir() and clip_dir.name.startswith("clip_start_"):
                     all_clips.append(clip_dir)
 
-    clips = [p for i, p in enumerate(all_clips) if (i % int(args.world_size)) == int(args.rank)]
+    if int(args.max_samples) > 0 and bool(args.max_samples_global) and int(
+            args.world_size) > 1:
+        if int(args.rank) == 0:
+            clips = list(all_clips)
+            logger.info(
+                "Using global max_samples=%d across all ranks via rank0-only processing.",
+                int(args.max_samples),
+            )
+        else:
+            clips = []
+    else:
+        clips = [
+            p for i, p in enumerate(all_clips)
+            if (i % int(args.world_size)) == int(args.rank)
+        ]
     if bool(args.skip_existing_ids) and existing_ids:
         before = len(clips)
         clips = [
@@ -538,7 +566,9 @@ def main() -> None:
             len(clips),
             before - len(clips),
         )
-    pbar = tqdm(clips, desc=f"matrixcity->parquet[r{args.rank}/{args.world_size}]")
+    pbar = tqdm(clips,
+                desc=f"matrixcity->parquet[r{args.rank}/{args.world_size}]")
+    written_count = 0
 
     for clip_dir in pbar:
         window_dir = clip_dir.parent
@@ -862,6 +892,7 @@ def main() -> None:
             "fps": float(args.fps),
         }
         buffer.append(record)
+        written_count += 1
         if bool(args.skip_existing_ids):
             existing_ids.add(record_id)
 
@@ -870,6 +901,14 @@ def main() -> None:
             writer.append_table(table)
             writer.flush(num_workers=1, write_remainder=False)
             buffer = []
+
+        if int(args.max_samples) > 0 and written_count >= int(args.max_samples):
+            logger.info(
+                "Reached max_samples=%d on rank_%02d, stopping early.",
+                int(args.max_samples),
+                int(args.rank),
+            )
+            break
 
     if buffer:
         table = records_to_table(buffer, pyarrow_schema_ti2v_controlnet)
