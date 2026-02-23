@@ -519,6 +519,10 @@ def main() -> None:
     writer = ParquetDatasetWriter(str(out_dir_rank), samples_per_file=int(args.samples_per_file))
     buffer: list[dict[str, Any]] = []
     existing_ids: set[str] = set()
+    # Cache per-street sequence file lists to avoid repeated expensive directory scans.
+    rgb_files_cache: dict[tuple[str, str], list[Path]] = {}
+    depth_files_cache: dict[tuple[str, str, str], list[Path] | None] = {}
+    normal_seq_files_cache: dict[str, list[Path]] = {}
     if bool(args.skip_existing_ids):
         existing_ids = _load_existing_ids(out_dir_rank)
         logger.info(
@@ -593,32 +597,41 @@ def main() -> None:
         if not prompt:
             continue
 
-        rgb_dir = rgb_root / "small_city" / "street" / str(args.street_split) / street_name / street_name
-        if not rgb_dir.is_dir():
-            continue
-        rgb_files = _sorted_pngs(rgb_dir)
+        rgb_cache_key = (str(rgb_root), str(args.street_split), street_name)
+        if rgb_cache_key not in rgb_files_cache:
+            rgb_dir = rgb_root / "small_city" / "street" / str(args.street_split) / street_name / street_name
+            if not rgb_dir.is_dir():
+                rgb_files_cache[rgb_cache_key] = []
+            else:
+                rgb_files_cache[rgb_cache_key] = _sorted_pngs(rgb_dir)
+        rgb_files = rgb_files_cache[rgb_cache_key]
         if not rgb_files:
             continue
 
         # Optional depth dir
-        depth_files: list[Path] | None = None
-        if str(args.depth_dir).strip():
-            ddir = Path(os.path.expanduser(os.path.expandvars(str(args.depth_dir).strip())))
-            if ddir.is_dir():
-                depth_files = _sorted_depth_files(ddir)
-        else:
-            # Auto-derive depth dir from MatrixCity layout used in UniDataset:
-            # small_city_depth/street/<split>/<street>_depth/<street>_depth/*.exr
-            auto_depth_dir = (
-                depth_root
-                / "small_city_depth"
-                / "street"
-                / str(args.street_split)
-                / f"{street_name}_depth"
-                / f"{street_name}_depth"
-            )
-            if auto_depth_dir.is_dir():
-                depth_files = _sorted_depth_files(auto_depth_dir)
+        depth_dir_cfg = str(args.depth_dir).strip()
+        depth_cache_key = (str(depth_root), str(args.street_split), f"{street_name}::{depth_dir_cfg}")
+        if depth_cache_key not in depth_files_cache:
+            depth_files_local: list[Path] | None = None
+            if depth_dir_cfg:
+                ddir = Path(os.path.expanduser(os.path.expandvars(depth_dir_cfg)))
+                if ddir.is_dir():
+                    depth_files_local = _sorted_depth_files(ddir)
+            else:
+                # Auto-derive depth dir from MatrixCity layout used in UniDataset:
+                # small_city_depth/street/<split>/<street>_depth/<street>_depth/*.exr
+                auto_depth_dir = (
+                    depth_root
+                    / "small_city_depth"
+                    / "street"
+                    / str(args.street_split)
+                    / f"{street_name}_depth"
+                    / f"{street_name}_depth"
+                )
+                if auto_depth_dir.is_dir():
+                    depth_files_local = _sorted_depth_files(auto_depth_dir)
+            depth_files_cache[depth_cache_key] = depth_files_local
+        depth_files = depth_files_cache[depth_cache_key]
 
         window_files = _slice_by_id_or_index(rgb_files, window_start, window_end)
         if not window_files:
@@ -716,7 +729,10 @@ def main() -> None:
                 for nd in normal_dir_candidates:
                     if not nd.is_dir():
                         continue
-                    nfiles = _sorted_pngs(nd)
+                    nd_key = str(nd)
+                    if nd_key not in normal_seq_files_cache:
+                        normal_seq_files_cache[nd_key] = _sorted_pngs(nd)
+                    nfiles = normal_seq_files_cache[nd_key]
                     if not nfiles:
                         continue
                     normal_window = _slice_by_id_or_index(
