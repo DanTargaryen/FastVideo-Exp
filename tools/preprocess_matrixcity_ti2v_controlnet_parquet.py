@@ -651,8 +651,12 @@ def main() -> None:
             if n_map:
                 normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
 
-        # Priority 2: external normal_root with matrixcity-like mirrored hierarchy.
+        # Priority 2: external normal_root.
         if normal_paths is None and normal_root is not None:
+            # 2a) Mirrored clip hierarchy:
+            #   <normal_root>/<street>/<window>/<clip>/normal/*.png
+            # or
+            #   <normal_root>/<street>/<window>/<clip>/*.png
             ext_dir_1 = normal_root / street_name / window_dir.name / clip_dir.name / "normal"
             ext_dir_2 = normal_root / street_name / window_dir.name / clip_dir.name
             for ext_dir in (ext_dir_1, ext_dir_2):
@@ -664,6 +668,40 @@ def main() -> None:
                         n_map[int(p.stem)] = p
                 if n_map:
                     normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
+                    break
+
+            # 2b) MatrixCity sequence hierarchy:
+            #   <normal_root>/small_city_normal/street/<split>/<street>_normal/<street>_normal/*.png
+            #   <normal_root>/small_city_normal/street/<split>/<street>/<street>/*.png
+            # and the same patterns when --normal_root already points to small_city_normal.
+            if normal_paths is None:
+                normal_dir_candidates = [
+                    normal_root / "small_city_normal" / "street" / str(args.street_split) / f"{street_name}_normal" / f"{street_name}_normal",
+                    normal_root / "small_city_normal" / "street" / str(args.street_split) / street_name / street_name,
+                    normal_root / "street" / str(args.street_split) / f"{street_name}_normal" / f"{street_name}_normal",
+                    normal_root / "street" / str(args.street_split) / street_name / street_name,
+                    normal_root / f"{street_name}_normal" / f"{street_name}_normal",
+                    normal_root / street_name / street_name,
+                ]
+                for nd in normal_dir_candidates:
+                    if not nd.is_dir():
+                        continue
+                    nfiles = _sorted_pngs(nd)
+                    if not nfiles:
+                        continue
+                    normal_window = _slice_by_id_or_index(
+                        nfiles, window_start, window_end)
+                    if not normal_window:
+                        continue
+                    if len(normal_window) < len(window_files):
+                        normal_window = normal_window + [normal_window[-1]] * (
+                            len(window_files) - len(normal_window))
+                    needed_n = clip_start + int(args.clip_length)
+                    if needed_n > len(normal_window):
+                        normal_window = normal_window + [normal_window[-1]] * (
+                            needed_n - len(normal_window))
+                    normal_paths = normal_window[clip_start:clip_start +
+                                                 int(args.clip_length)]
                     break
 
         if bool(args.require_normal) and normal_paths is None:
