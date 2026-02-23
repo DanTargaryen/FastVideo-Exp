@@ -346,6 +346,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument(
+        "--normal_root",
+        type=str,
+        default="",
+        help=(
+            "Optional normal root. If set, script tries "
+            "<normal_root>/<street>/<window>/<clip>/normal first, then "
+            "<normal_root>/<street>/<window>/<clip>."
+        ),
+    )
+    p.add_argument(
+        "--require_normal",
+        action="store_true",
+        help="If set, only keep clips with valid normal frames (4-part control latent).",
+    )
     p.add_argument("--rank", type=int, default=0)
     p.add_argument("--world_size", type=int, default=1)
     p.add_argument("--street_split", type=str, default="train_dense_half", help="train_dense_half/train_dense/test")
@@ -423,6 +438,7 @@ def main() -> None:
     rgb_root = Path(os.path.expanduser(os.path.expandvars(args.rgb_root)))
     depth_root = Path(os.path.expanduser(os.path.expandvars(args.depth_root))) if str(args.depth_root).strip() else rgb_root
     output_dir = Path(os.path.expanduser(os.path.expandvars(args.output_dir)))
+    normal_root = Path(os.path.expanduser(os.path.expandvars(args.normal_root))) if str(args.normal_root).strip() else None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.device == "cuda" and torch.cuda.is_available():
@@ -624,6 +640,35 @@ def main() -> None:
         if bool(args.require_masked_rgb) and masked_rgb_paths is None:
             continue
 
+        normal_paths: list[Path] | None = None
+        # Priority 1: normal under the clip directory.
+        local_normal_dir = clip_dir / "normal"
+        if local_normal_dir.is_dir():
+            n_map: dict[int, Path] = {}
+            for p in local_normal_dir.iterdir():
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
+                    n_map[int(p.stem)] = p
+            if n_map:
+                normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
+
+        # Priority 2: external normal_root with matrixcity-like mirrored hierarchy.
+        if normal_paths is None and normal_root is not None:
+            ext_dir_1 = normal_root / street_name / window_dir.name / clip_dir.name / "normal"
+            ext_dir_2 = normal_root / street_name / window_dir.name / clip_dir.name
+            for ext_dir in (ext_dir_1, ext_dir_2):
+                if not ext_dir.is_dir():
+                    continue
+                n_map: dict[int, Path] = {}
+                for p in ext_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
+                        n_map[int(p.stem)] = p
+                if n_map:
+                    normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
+                    break
+
+        if bool(args.require_normal) and normal_paths is None:
+            continue
+
         embeds_list = text_stage.encode_text(
             prompt,
             fastvideo_args=fastvideo_args,
@@ -680,6 +725,12 @@ def main() -> None:
                 continue
             rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths], dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
+        normal_tchw = None
+        if normal_paths is not None:
+            normal_tchw = torch.stack(
+                [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
+                dim=0,
+            )
 
         vae_lat_np = None
         if bool(args.write_vae_latent):
@@ -700,23 +751,49 @@ def main() -> None:
             # Keep standard latent channels (z_dim) for main transformer input.
             vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
 
-        video_n = torch.cat(
-            [
-                _to_vae_input(depth_tchw, normalize=False),
-                _to_vae_input(masked_rgb_tchw, normalize=True),
-                _to_vae_input(mask_tchw, normalize=False),
-            ],
-            dim=0,
-        ).to(device=device, dtype=torch.float32)
-        lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to("cpu", dtype=torch.float32)
-        depth_lat = lat_n[0]
-        masked_lat = lat_n[1]
-        mask_lat = lat_n[2]
+        if normal_tchw is not None:
+            video_n = torch.cat(
+                [
+                    _to_vae_input(depth_tchw, normalize=False),
+                    # Keep consistent with existing union preprocess in repo.
+                    _to_vae_input(normal_tchw, normalize=False),
+                    _to_vae_input(masked_rgb_tchw, normalize=True),
+                    _to_vae_input(mask_tchw, normalize=False),
+                ],
+                dim=0,
+            ).to(device=device, dtype=torch.float32)
+            lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to(
+                "cpu", dtype=torch.float32
+            )
+            depth_lat = lat_n[0]
+            normal_lat = lat_n[1]
+            masked_lat = lat_n[2]
+            mask_lat = lat_n[3]
+        else:
+            video_n = torch.cat(
+                [
+                    _to_vae_input(depth_tchw, normalize=False),
+                    _to_vae_input(masked_rgb_tchw, normalize=True),
+                    _to_vae_input(mask_tchw, normalize=False),
+                ],
+                dim=0,
+            ).to(device=device, dtype=torch.float32)
+            lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to(
+                "cpu", dtype=torch.float32
+            )
+            depth_lat = lat_n[0]
+            masked_lat = lat_n[1]
+            mask_lat = lat_n[2]
         if latent_repeat != 1:
             depth_lat = depth_lat.repeat(latent_repeat, 1, 1, 1)
+            if normal_tchw is not None:
+                normal_lat = normal_lat.repeat(latent_repeat, 1, 1, 1)
             masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
             mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
-        control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+        if normal_tchw is not None:
+            control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
+        else:
+            control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
         control_lat_np = control_lat.numpy()
 
         empty_lat = np.zeros((0,), dtype=np.float32)
