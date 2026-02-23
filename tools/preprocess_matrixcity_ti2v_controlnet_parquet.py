@@ -34,6 +34,7 @@ import html
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -411,6 +412,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--caption_key", type=str, default="Video_Caption")
     p.add_argument("--samples_per_file", type=int, default=8)
     p.add_argument("--flush_frequency", type=int, default=8)
+    p.add_argument("--debug_timing", action="store_true",
+                   help="Print per-clip stage timing for profiling.")
     p.add_argument(
         "--max_samples",
         type=int,
@@ -594,6 +597,7 @@ def main() -> None:
     written_count = 0
 
     for clip_dir in pbar:
+        t_clip0 = time.perf_counter()
         window_dir = clip_dir.parent
         street_dir = window_dir.parent
         street_name = street_dir.name
@@ -813,6 +817,8 @@ def main() -> None:
             pmin=float(args.depth_percentile_min),
             pmax=float(args.depth_percentile_max),
         )
+        if bool(args.debug_timing):
+            logger.info("[timing] %s depth_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
         mask_tchw = torch.stack(
             [
                 _load_mask_frame(
@@ -825,6 +831,8 @@ def main() -> None:
             ],
             dim=0,
         )
+        if bool(args.debug_timing):
+            logger.info("[timing] %s mask_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
         rgb_tchw = None
         if masked_rgb_paths is not None:
             masked_rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in masked_rgb_paths], dim=0)
@@ -839,6 +847,8 @@ def main() -> None:
                 [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
                 dim=0,
             )
+        if bool(args.debug_timing):
+            logger.info("[timing] %s normal_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
 
         vae_lat_np = None
         if bool(args.write_vae_latent):
@@ -860,6 +870,8 @@ def main() -> None:
                                             compute_dtype=compute_dtype)
             # Keep standard latent channels (z_dim) for main transformer input.
             vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
+            if bool(args.debug_timing):
+                logger.info("[timing] %s rgb_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)
 
         if normal_tchw is not None:
             video_n = torch.cat(
@@ -911,6 +923,8 @@ def main() -> None:
         else:
             control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
         control_lat_np = control_lat.numpy()
+        if bool(args.debug_timing):
+            logger.info("[timing] %s control_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)
 
         empty_lat = np.zeros((0,), dtype=np.float32)
         record_id = f"{street_name}/{window_dir.name}/{clip_dir.name}"
@@ -949,6 +963,8 @@ def main() -> None:
             writer.append_table(table)
             writer.flush(num_workers=1, write_remainder=False)
             buffer = []
+            if bool(args.debug_timing):
+                logger.info("[timing] %s flushed %.2fs", clip_dir, time.perf_counter() - t_clip0)
 
         if int(args.max_samples) > 0 and written_count >= int(args.max_samples):
             logger.info(
