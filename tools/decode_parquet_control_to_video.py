@@ -162,6 +162,13 @@ def main() -> None:
                    help="Also save PNG frames under out_dir/frames_*")
     p.add_argument("--prefer_four", action="store_true",
                    help="Prefer 4-way split when ambiguous")
+    p.add_argument(
+        "--mask_binarize_threshold",
+        type=float,
+        default=0.5,
+        help=
+        "Binarize decoded mask before saving (>=thr -> 1, else 0). Set <0 to disable.",
+    )
     args = p.parse_args()
 
     cols = ["id", "control_latent_bytes", "control_latent_shape",
@@ -222,6 +229,9 @@ def main() -> None:
     decoded_depth = _decode(depth_lat)
     decoded_masked = _decode(masked_lat)
     decoded_mask = _decode(mask_lat)
+    if float(args.mask_binarize_threshold) >= 0.0:
+        thr = float(args.mask_binarize_threshold)
+        decoded_mask = (decoded_mask >= thr).to(decoded_mask.dtype)
 
     _save_video(decoded_depth, out_dir / "depth.mp4", args.fps, as_gray=True)
     _save_video(decoded_masked, out_dir / "masked_rgb.mp4", args.fps, as_gray=False)
