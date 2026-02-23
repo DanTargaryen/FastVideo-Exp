@@ -59,6 +59,15 @@ from fastvideo.pipelines.stages.text_encoding import TextEncodingStage
 logger = init_logger(__name__)
 
 
+def _to_torch_dtype(dtype_str: str) -> torch.dtype:
+    s = str(dtype_str).strip().lower()
+    if s == "bf16":
+        return torch.bfloat16
+    if s == "fp16":
+        return torch.float16
+    return torch.float32
+
+
 def _load_existing_ids(parquet_rank_dir: Path) -> set[str]:
     ids: set[str] = set()
     if not parquet_rank_dir.is_dir():
@@ -236,8 +245,17 @@ def _postprocess_vae_latents(vae, latents: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _encode_video_latents(vae, video_bcthw: torch.Tensor, *, sample_mode: str) -> torch.Tensor:
-    with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=torch.cuda.is_available() and video_bcthw.is_cuda):
+def _encode_video_latents(vae,
+                          video_bcthw: torch.Tensor,
+                          *,
+                          sample_mode: str,
+                          compute_dtype: torch.dtype = torch.float32
+                          ) -> torch.Tensor:
+    use_autocast = bool(torch.cuda.is_available() and video_bcthw.is_cuda
+                        and compute_dtype != torch.float32)
+    with torch.autocast(device_type="cuda",
+                        dtype=compute_dtype,
+                        enabled=use_autocast):
         out = vae.encode(video_bcthw)
     if sample_mode == "mode":
         latents = out.mode()
@@ -476,6 +494,7 @@ def main() -> None:
         )
     else:
         device = torch.device("cpu")
+    compute_dtype = _to_torch_dtype(str(args.dtype))
 
     pipeline_config = PipelineConfig.from_pretrained(model_path)
     fastvideo_args = FastVideoArgs(
@@ -775,8 +794,13 @@ def main() -> None:
                 first_rgb = _load_rgb_frame(masked_rgb_paths[0], int(args.max_height), int(args.max_width))
         else:
             first_rgb = _load_rgb_frame(rgb_paths[0], int(args.max_height), int(args.max_width))
-        first_bcthw = _to_vae_input(first_rgb[None, ...], normalize=True).to(device=device, dtype=torch.float32)
-        first_lat = _encode_video_latents(vae, first_bcthw, sample_mode="mode")
+        first_bcthw = _to_vae_input(first_rgb[None, ...],
+                                    normalize=True).to(device=device,
+                                                       dtype=compute_dtype)
+        first_lat = _encode_video_latents(vae,
+                                          first_bcthw,
+                                          sample_mode="mode",
+                                          compute_dtype=compute_dtype)
         if latent_repeat != 1:
             first_lat = first_lat.repeat(1, latent_repeat, 1, 1, 1)
         first_lat = first_lat[0, :, 0].unsqueeze(0)
@@ -829,9 +853,11 @@ def main() -> None:
                     dim=0,
                 )
             rgb_bcthw = _to_vae_input(rgb_tchw, normalize=True).to(
-                device=device, dtype=torch.float32
-            )
-            vae_lat = _encode_video_latents(vae, rgb_bcthw, sample_mode="mode")
+                device=device, dtype=compute_dtype)
+            vae_lat = _encode_video_latents(vae,
+                                            rgb_bcthw,
+                                            sample_mode="mode",
+                                            compute_dtype=compute_dtype)
             # Keep standard latent channels (z_dim) for main transformer input.
             vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
 
@@ -845,8 +871,11 @@ def main() -> None:
                     _to_vae_input(mask_tchw, normalize=False),
                 ],
                 dim=0,
-            ).to(device=device, dtype=torch.float32)
-            lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to(
+            ).to(device=device, dtype=compute_dtype)
+            lat_n = _encode_video_latents(vae,
+                                          video_n,
+                                          sample_mode="mode",
+                                          compute_dtype=compute_dtype).to(
                 "cpu", dtype=torch.float32
             )
             depth_lat = lat_n[0]
@@ -861,8 +890,11 @@ def main() -> None:
                     _to_vae_input(mask_tchw, normalize=False),
                 ],
                 dim=0,
-            ).to(device=device, dtype=torch.float32)
-            lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to(
+            ).to(device=device, dtype=compute_dtype)
+            lat_n = _encode_video_latents(vae,
+                                          video_n,
+                                          sample_mode="mode",
+                                          compute_dtype=compute_dtype).to(
                 "cpu", dtype=torch.float32
             )
             depth_lat = lat_n[0]
