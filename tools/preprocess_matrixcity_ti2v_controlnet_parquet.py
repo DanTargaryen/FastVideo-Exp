@@ -172,6 +172,74 @@ def _read_depth_any(path: Path) -> np.ndarray:
     return arr.astype(np.float32)
 
 
+def _read_normal_any(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".exr":
+        try:
+            import cv2  # lazy import; EXR requires OpenCV built with EXR support
+
+            arr = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if arr is None:
+                raise FileNotFoundError(path)
+            if arr.ndim == 3 and arr.shape[2] >= 3:
+                # OpenCV returns BGR; convert to RGB
+                arr = arr[..., :3][..., ::-1]
+            elif arr.ndim == 2:
+                arr = np.repeat(arr[..., None], 3, axis=2)
+            return arr.astype(np.float32)
+        except Exception:
+            pass
+    arr = imageio.imread(path)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    elif arr.ndim == 3 and arr.shape[2] > 3:
+        arr = arr[..., :3]
+    return arr.astype(np.float32)
+
+
+def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
+    n = _read_normal_any(path)
+    if n.ndim != 3 or n.shape[2] < 3:
+        raise ValueError(f"Invalid normal shape from {path}: {tuple(n.shape)}")
+
+    # Range normalization:
+    # - EXR normals are often in [-1, 1]
+    # - PNG/JPG normals are often in [0, 255]
+    finite = np.isfinite(n)
+    if not finite.any():
+        n = np.zeros_like(n, dtype=np.float32)
+    else:
+        vmin = float(np.nanmin(n))
+        vmax = float(np.nanmax(n))
+        if vmin >= -1.05 and vmax <= 1.05 and (vmin < -0.05 or vmax > 1.05):
+            n = (n + 1.0) * 0.5
+        elif vmin < -0.05:
+            n = (n + 1.0) * 0.5
+        elif vmax > 1.5:
+            n = n / (65535.0 if vmax > 255.0 else 255.0)
+
+    n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
+    n = np.clip(n[..., :3], 0.0, 1.0)
+
+    # Center-crop to target aspect ratio, then bilinear resize.
+    h0, w0 = n.shape[:2]
+    target_ratio = float(width) / float(height)
+    current_ratio = float(w0) / float(h0)
+    if current_ratio > target_ratio:
+        new_w = int(h0 * target_ratio)
+        left = max(0, (w0 - new_w) // 2)
+        n = n[:, left:left + new_w, :]
+    else:
+        new_h = int(w0 / target_ratio)
+        top = max(0, (h0 - new_h) // 2)
+        n = n[top:top + new_h, :, :]
+
+    t = torch.from_numpy(n).permute(2, 0, 1).contiguous().unsqueeze(0)
+    t = torch.nn.functional.interpolate(
+        t, size=(int(height), int(width)), mode="bilinear", align_corners=False
+    )
+    return t[0]
+
+
 def _load_depth_sequence(depth_paths: list[Path], height: int, width: int, *, pmin: float, pmax: float) -> torch.Tensor:
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
@@ -317,6 +385,17 @@ def _sorted_pngs(dir_path: Path) -> list[Path]:
 
 
 def _sorted_depth_files(dir_path: Path) -> list[Path]:
+    files = [
+        p
+        for p in dir_path.iterdir()
+        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
+    ]
+    if files and all(p.stem.isdigit() for p in files):
+        return sorted(files, key=lambda p: int(p.stem))
+    return sorted(files, key=lambda p: p.name)
+
+
+def _sorted_normal_files(dir_path: Path) -> list[Path]:
     files = [
         p
         for p in dir_path.iterdir()
@@ -712,7 +791,7 @@ def main() -> None:
         if local_normal_dir.is_dir():
             n_map: dict[int, Path] = {}
             for p in local_normal_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr") and p.stem.isdigit():
                     n_map[int(p.stem)] = p
             if n_map:
                 normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
@@ -730,7 +809,7 @@ def main() -> None:
                     continue
                 n_map: dict[int, Path] = {}
                 for p in ext_dir.iterdir():
-                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
+                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr") and p.stem.isdigit():
                         n_map[int(p.stem)] = p
                 if n_map:
                     normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
@@ -754,7 +833,7 @@ def main() -> None:
                         continue
                     nd_key = str(nd)
                     if nd_key not in normal_seq_files_cache:
-                        normal_seq_files_cache[nd_key] = _sorted_pngs(nd)
+                        normal_seq_files_cache[nd_key] = _sorted_normal_files(nd)
                     nfiles = normal_seq_files_cache[nd_key]
                     if not nfiles:
                         continue
@@ -844,7 +923,7 @@ def main() -> None:
         normal_tchw = None
         if normal_paths is not None:
             normal_tchw = torch.stack(
-                [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
+                [_load_normal_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
                 dim=0,
             )
         if bool(args.debug_timing):
