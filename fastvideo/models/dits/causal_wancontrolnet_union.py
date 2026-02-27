@@ -437,13 +437,10 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
 
         if clean_hidden_states is not None:
             # Teacher-forcing dual-stream compatibility:
-            # keep ControlNet conditioning on noisy branch, and prepend
-            # zero residuals for the clean branch so transformer can consume
-            # concatenated [clean, noisy] token streams.
-            padded_residuals: list[torch.Tensor] = []
+            # duplicate residuals to both [clean, noisy] token streams.
+            duplicated_residuals: list[torch.Tensor] = []
             for res in residuals:
-                padded_residuals.append(
-                    torch.cat([torch.zeros_like(res), res], dim=1))
-            return tuple(padded_residuals)
+                duplicated_residuals.append(torch.cat([res, res], dim=1))
+            return tuple(duplicated_residuals)
 
         return tuple(residuals)
