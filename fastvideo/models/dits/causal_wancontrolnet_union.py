@@ -268,8 +268,18 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
 
     def _get_block_mask(self, *, num_frames: int, frame_seqlen: int,
                         device: torch.device, teacher_forcing: bool) -> Any:
-        key = ("tf", int(num_frames), int(frame_seqlen)) if teacher_forcing else (
-            "causal", int(num_frames), int(frame_seqlen))
+        key = (
+            "tf",
+            int(num_frames),
+            int(frame_seqlen),
+            int(self.num_frame_per_block),
+        ) if teacher_forcing else (
+            "causal",
+            int(num_frames),
+            int(frame_seqlen),
+            int(self.num_frame_per_block),
+            int(self.local_attn_size),
+        )
         mask = self._block_mask_cache.get(key)
         if mask is None:
             if teacher_forcing:

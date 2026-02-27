@@ -897,12 +897,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                     control_hidden = block_controlnet_hidden_states[
                         control_index].to(hidden_states.dtype)
                     if teacher_forcing:
-                        if control_hidden.shape[1] == hidden_states.shape[1] // 2:
-                            control_hidden = torch.cat(
-                                [torch.zeros_like(control_hidden), control_hidden],
-                                dim=1,
-                            )
-                        elif control_hidden.shape[1] != hidden_states.shape[1]:
+                        if control_hidden.shape[1] != hidden_states.shape[1]:
                             raise ValueError(
                                 "ControlNet residual length mismatch in teacher-forcing mode: "
                                 f"residual={control_hidden.shape[1]} hidden={hidden_states.shape[1]}"
@@ -921,12 +916,7 @@ class CausalWanTransformer3DModel(BaseDiT):
                     control_hidden = block_controlnet_hidden_states[
                         control_index].to(hidden_states.dtype)
                     if teacher_forcing:
-                        if control_hidden.shape[1] == hidden_states.shape[1] // 2:
-                            control_hidden = torch.cat(
-                                [torch.zeros_like(control_hidden), control_hidden],
-                                dim=1,
-                            )
-                        elif control_hidden.shape[1] != hidden_states.shape[1]:
+                        if control_hidden.shape[1] != hidden_states.shape[1]:
                             raise ValueError(
                                 "ControlNet residual length mismatch in teacher-forcing mode: "
                                 f"residual={control_hidden.shape[1]} hidden={hidden_states.shape[1]}"
