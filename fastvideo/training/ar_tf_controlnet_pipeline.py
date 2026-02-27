@@ -393,6 +393,10 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                 attn_metadata=None,
                 forward_batch=forward_batch,
             ):
+                # Keep teacher-forcing clean stream at t=0.
+                clean_aug_t = torch.zeros_like(
+                    timestep, device=device, dtype=model_dtype
+                )
                 num_channels_latents = getattr(
                     self.transformer, "num_channels_latents", control_latent.shape[1] // 3
                 )
@@ -401,8 +405,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                     encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
                     timestep=timestep.to(device, dtype=model_dtype),
                     clean_hidden_states=clean_context_bcfhw.to(dtype=model_dtype),
-                    aug_t=None if context_timestep is None else context_timestep.to(
-                        device, dtype=model_dtype),
+                    aug_t=clean_aug_t,
                     **_build_controlnet_kwargs(
                         self.controlnet,
                         control_latent.to(dtype=model_dtype),
@@ -415,8 +418,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                     timestep.to(device, dtype=model_dtype),
                     block_controlnet_hidden_states=control_res,
                     clean_x=clean_context_bcfhw.to(dtype=model_dtype),
-                    aug_t=None if context_timestep is None else context_timestep.to(
-                        device, dtype=model_dtype),
+                    aug_t=clean_aug_t,
                 ).permute(0, 2, 1, 3, 4)
 
             per_frame_loss = (pred_flow.float() - target_flow.float()).pow(2).mean(
