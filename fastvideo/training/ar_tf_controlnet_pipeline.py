@@ -104,7 +104,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
     """
 
     _required_config_modules = ["scheduler", "transformer", "vae"]
-    trainable_transformer_names = ["transformer", "controlnet"]
+    trainable_transformer_names = ["transformer"]
 
     def set_schemas(self) -> None:
         self.train_dataset_schema = pyarrow_schema_ti2v_controlnet
@@ -167,25 +167,20 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
         self.controlnet = self.get_module("controlnet")
         self.vae = self.get_module("vae")
         self.vae.requires_grad_(False)
+        # AR-TF variant: freeze ControlNet and train transformer backbone only.
+        self.controlnet.requires_grad_(False)
+        self.controlnet.eval()
 
         if training_args.enable_gradient_checkpointing_type is not None:
             self.transformer = apply_activation_checkpointing(
                 self.transformer,
                 checkpointing_type=training_args.enable_gradient_checkpointing_type,
             )
-            self.controlnet = apply_activation_checkpointing(
-                self.controlnet,
-                checkpointing_type=training_args.enable_gradient_checkpointing_type,
-            )
 
         betas = tuple(float(x.strip()) for x in training_args.betas.split(","))
-        params_to_optimize: list[torch.nn.Parameter] = []
-        for module in self.trainable_transformer_modules.values():
-            if not isinstance(module, torch.nn.Module):
-                continue
-            params_to_optimize.extend(
-                [p for p in module.parameters() if p.requires_grad]
-            )
+        params_to_optimize: list[torch.nn.Parameter] = [
+            p for p in self.transformer.parameters() if p.requires_grad
+        ]
         self.optimizer = torch.optim.AdamW(
             params_to_optimize,
             lr=training_args.learning_rate,
@@ -287,7 +282,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
 
     def train_one_step(self, training_batch):  # type: ignore[override]
         self.transformer.train()
-        self.controlnet.train()
+        self.controlnet.eval()
         self.optimizer.zero_grad()
         training_batch.total_loss = 0.0
 
@@ -400,18 +395,19 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
                 num_channels_latents = getattr(
                     self.transformer, "num_channels_latents", control_latent.shape[1] // 3
                 )
-                control_res = self.controlnet(
-                    hidden_states=noisy_input.to(dtype=model_dtype),
-                    encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
-                    timestep=timestep.to(device, dtype=model_dtype),
-                    clean_hidden_states=clean_context_bcfhw.to(dtype=model_dtype),
-                    aug_t=clean_aug_t,
-                    **_build_controlnet_kwargs(
-                        self.controlnet,
-                        control_latent.to(dtype=model_dtype),
-                        num_channels_latents,
-                    ),
-                )
+                with torch.no_grad():
+                    control_res = self.controlnet(
+                        hidden_states=noisy_input.to(dtype=model_dtype),
+                        encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
+                        timestep=timestep.to(device, dtype=model_dtype),
+                        clean_hidden_states=clean_context_bcfhw.to(dtype=model_dtype),
+                        aug_t=clean_aug_t,
+                        **_build_controlnet_kwargs(
+                            self.controlnet,
+                            control_latent.to(dtype=model_dtype),
+                            num_channels_latents,
+                        ),
+                    )
                 pred_flow = self.transformer(
                     noisy_input.to(dtype=model_dtype),
                     [encoder_hidden_states.to(dtype=model_dtype)],
@@ -439,8 +435,7 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             training_batch.total_loss += float(loss.detach().item())
 
         grad_norm = clip_grad_norm_while_handling_failing_dtensor_cases(
-            [p for p in self.transformer.parameters() if p.requires_grad]
-            + [p for p in self.controlnet.parameters() if p.requires_grad],
+            [p for p in self.transformer.parameters() if p.requires_grad],
             args.max_grad_norm if args.max_grad_norm is not None else 0.0,
         )
         self.optimizer.step()
