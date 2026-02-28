@@ -679,32 +679,36 @@ def main() -> None:
         traj_latents.append(current_latents.detach().clone())
 
         def _predict_flow_at_t(t_cur: torch.Tensor, step_index: int) -> torch.Tensor:
-            if expand_timesteps:
-                if image_latents is None:
-                    latent_model_input = current_latents
-                else:
+            # Keep TI2V anchor consistent with inference:
+            # - expand_timesteps=True  : blend first frame by mask.
+            # - expand_timesteps=False : hard overwrite first latent frame.
+            latent_model_input = current_latents
+            if image_latents is not None:
+                if expand_timesteps:
                     latent_model_input = (
                         (1 - first_frame_mask) * image_latents +
                         first_frame_mask * current_latents
                     )
+                else:
+                    latent_model_input = latent_model_input.clone()
+                    latent_model_input[:, :, :1] = image_latents[:, :, :1]
+
+            if args.teacher_mode == "causal":
+                # Causal ControlNet/DiT expects frame-level timesteps [B, F].
+                # Crucial for first-chunk quality: keep anchor frame timestep at 0.
+                timestep = torch.full((latent_model_input.shape[0], latent_t),
+                                      float(t_cur),
+                                      device=device,
+                                      dtype=torch.float32)
+                if image_latents is not None:
+                    timestep = timestep.clone()
+                    timestep[:, 0] = 0.0
+            elif expand_timesteps:
                 temp_ts = (first_frame_mask[0, 0] * float(t_cur))
                 temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
                 timestep = temp_ts.unsqueeze(0).expand(
                     latent_model_input.shape[0], -1)
-                if args.teacher_mode == "causal":
-                    # Causal Union ControlNet expects frame-level timesteps [B, F].
-                    # Token-level expanded timesteps (e.g., [B, F*H*W]) cause
-                    # mismatch when fusing global control embeddings.
-                    timestep = torch.full((latent_model_input.shape[0], latent_t),
-                                          float(t_cur),
-                                          device=device,
-                                          dtype=torch.float32)
             else:
-                if image_latents is None:
-                    latent_model_input = current_latents
-                else:
-                    latent_model_input = torch.cat(
-                        [current_latents, image_latents], dim=1)
                 timestep = torch.full((latent_model_input.shape[0],),
                                       float(t_cur),
                                       device=device,
