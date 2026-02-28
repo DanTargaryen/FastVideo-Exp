@@ -443,11 +443,13 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             loss.backward()
             training_batch.total_loss += float(loss.detach().item())
 
-        grad_norm = clip_grad_norm_while_handling_failing_dtensor_cases(
-            [p for p in self.transformer.parameters() if p.requires_grad]
-            + [p for p in self.controlnet.parameters() if p.requires_grad],
-            args.max_grad_norm if args.max_grad_norm is not None else 0.0,
-        )
+        grad_norm = None
+        if args.max_grad_norm is not None and float(args.max_grad_norm) > 0.0:
+            grad_norm = clip_grad_norm_while_handling_failing_dtensor_cases(
+                [p for p in self.transformer.parameters() if p.requires_grad]
+                + [p for p in self.controlnet.parameters() if p.requires_grad],
+                float(args.max_grad_norm),
+            )
         self.optimizer.step()
         self.lr_scheduler.step()
 
