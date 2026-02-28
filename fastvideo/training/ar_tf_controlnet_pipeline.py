@@ -372,9 +372,11 @@ class ARTFControlnetTrainingPipeline(TrainingPipeline):
             noisy_input = noisy_input_btfhw.permute(0, 2, 1, 3, 4).contiguous()
             if noisy_input.shape[2] >= 1:
                 noisy_input[:, :, :1] = first_frame_latent
-                if args.independent_first_frame:
-                    timestep = timestep.clone()
-                    timestep[:, 0] = 0.0
+                # Strict alignment with causal ODE trajectory sampling:
+                # always force the first latent frame timestep to 0 when
+                # first-frame conditioning is injected.
+                timestep = timestep.clone()
+                timestep[:, 0] = 0.0
             clean_context_bcfhw = clean_context_btfhw.permute(0, 2, 1, 3, 4).contiguous()
             if hasattr(scheduler, "training_target"):
                 target_flow = scheduler.training_target(
