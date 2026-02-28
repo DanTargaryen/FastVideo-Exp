@@ -207,6 +207,12 @@ def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
     channel_like = (1, 3, 16, 32, 48, 64)
     if x.dim() == 4:
         # [C, F, H, W] or [F, C, H, W]
+        # Prefer [C, F, H, W] when the 2nd dim looks like latent-time (small),
+        # e.g. shapes like [144, 3, H, W] for 9-frame clips.
+        if int(x.shape[1]) <= 32 and int(x.shape[0]) > int(x.shape[1]):
+            return x.unsqueeze(0)
+        if int(x.shape[0]) <= 32 and int(x.shape[1]) > int(x.shape[0]):
+            return x.permute(1, 0, 2, 3).contiguous().unsqueeze(0)
         if x.shape[0] in channel_like and x.shape[1] > 4:
             return x.unsqueeze(0)
         if x.shape[1] in channel_like and x.shape[0] > 4:
@@ -214,6 +220,10 @@ def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
         return x.unsqueeze(0)
     if x.dim() == 5:
         # [B, C, F, H, W] or [B, F, C, H, W]
+        if int(x.shape[2]) <= 32 and int(x.shape[1]) > int(x.shape[2]):
+            return x
+        if int(x.shape[1]) <= 32 and int(x.shape[2]) > int(x.shape[1]):
+            return x.permute(0, 2, 1, 3, 4).contiguous()
         if x.shape[1] in channel_like and x.shape[2] > 4:
             return x
         if x.shape[2] in channel_like and x.shape[1] > 4:
