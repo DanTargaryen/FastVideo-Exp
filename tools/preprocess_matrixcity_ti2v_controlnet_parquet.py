@@ -351,6 +351,68 @@ def _infer_latent_repeat(model_path: str, z_dim: int) -> int:
     return 1
 
 
+def _infer_target_num_channels_latents(model_path: str, z_dim: int) -> int:
+    """
+    Infer target latent channel count (C) for Wan DiT/ControlNet inputs.
+    Prefer `num_channels_latents` from transformer config. If missing,
+    fall back to in_channels/z_dim.
+    """
+    cfg_path = Path(model_path) / "transformer" / "config.json"
+    if not cfg_path.exists():
+        return int(z_dim)
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return int(z_dim)
+
+    c = cfg.get("num_channels_latents")
+    if isinstance(c, (int, float)) and int(c) > 0:
+        return int(c)
+
+    in_channels = cfg.get("in_channels")
+    if isinstance(in_channels, (int, float)):
+        in_channels = int(in_channels)
+        if in_channels > 0 and in_channels % int(z_dim) == 0:
+            return in_channels // int(z_dim)
+
+    return int(z_dim)
+
+
+def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
+    """
+    Ensure latent tensor channel count equals target_c.
+    Accept shape [C, F, H, W].
+    """
+    if lat.ndim != 4:
+        raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
+    c = int(lat.shape[0])
+    target_c = int(target_c)
+    if c == target_c:
+        return lat
+    if c < target_c and target_c % c == 0:
+        k = target_c // c
+        logger.warning(
+            "%s channel mismatch: got C=%d, target C=%d; repeating channels by x%d",
+            name,
+            c,
+            target_c,
+            k,
+        )
+        return lat.repeat(k, 1, 1, 1)
+    if c > target_c and c % target_c == 0:
+        logger.warning(
+            "%s channel mismatch: got C=%d, target C=%d; truncating to first %d channels",
+            name,
+            c,
+            target_c,
+            target_c,
+        )
+        return lat[:target_c]
+    raise ValueError(
+        f"{name} channel mismatch: got C={c}, target C={target_c}, cannot auto-align"
+    )
+
+
 def _list_caption_files(clip_dir: Path, pattern: str) -> list[Path]:
     return sorted([p for p in clip_dir.glob(pattern) if p.is_file()], key=lambda p: p.name)
 
@@ -613,8 +675,23 @@ def main() -> None:
         z_dim = getattr(getattr(vae, "config", None), "z_dim", None)
     if z_dim is None:
         z_dim = 16
-    latent_repeat = int(args.latent_repeat) if int(args.latent_repeat) > 0 else _infer_latent_repeat(model_path, int(z_dim))
+    target_num_channels_latents = _infer_target_num_channels_latents(
+        model_path, int(z_dim)
+    )
+    if int(args.latent_repeat) > 0:
+        latent_repeat = int(args.latent_repeat)
+    else:
+        if int(z_dim) > 0 and target_num_channels_latents % int(z_dim) == 0:
+            latent_repeat = target_num_channels_latents // int(z_dim)
+        else:
+            latent_repeat = _infer_latent_repeat(model_path, int(z_dim))
     latent_repeat = max(1, int(latent_repeat))
+    logger.info(
+        "VAE z_dim=%d target_num_channels_latents=%d latent_repeat=%d",
+        int(z_dim),
+        int(target_num_channels_latents),
+        int(latent_repeat),
+    )
 
     out_dir_rank = output_dir / f"rank_{int(args.rank):02d}"
     writer = ParquetDatasetWriter(str(out_dir_rank), samples_per_file=int(args.samples_per_file))
@@ -997,6 +1074,17 @@ def main() -> None:
                 normal_lat = normal_lat.repeat(latent_repeat, 1, 1, 1)
             masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
             mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
+        depth_lat = _align_latent_channels(
+            depth_lat, target_num_channels_latents, "depth_lat"
+        )
+        if normal_tchw is not None:
+            normal_lat = _align_latent_channels(
+                normal_lat, target_num_channels_latents, "normal_lat"
+            )
+        masked_lat = _align_latent_channels(
+            masked_lat, target_num_channels_latents, "masked_lat"
+        )
+        mask_lat = _align_latent_channels(mask_lat, target_num_channels_latents, "mask_lat")
         if normal_tchw is not None:
             control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
         else:
