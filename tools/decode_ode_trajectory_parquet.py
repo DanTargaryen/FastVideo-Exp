@@ -99,17 +99,28 @@ def _ensure_traj_scfhw(x: torch.Tensor) -> torch.Tensor:
         x = x.squeeze(0)
     if x.dim() != 5:
         raise ValueError(f"Unsupported trajectory_latents shape: {tuple(x.shape)}")
-    # Prefer [S, F, C, H, W] -> [S, C, F, H, W] when dim-1 looks like
-    # latent-time (small) and dim-2 looks like channels (larger), e.g.
-    # [S, 3, 48, H, W] for 9-frame data.
-    if int(x.shape[1]) <= 32 and int(x.shape[2]) > int(x.shape[1]):
-        return x.permute(0, 2, 1, 3, 4).contiguous()
-    # [S, C, F, H, W]
-    if x.shape[1] in channel_like and x.shape[2] > 4:
+    d1 = int(x.shape[1])
+    d2 = int(x.shape[2])
+    d1_like_c = d1 in channel_like
+    d2_like_c = d2 in channel_like
+
+    # Unambiguous channel-like dimension.
+    if d1_like_c and not d2_like_c:
         return x
-    # [S, F, C, H, W] -> [S, C, F, H, W]
-    if x.shape[2] in channel_like and x.shape[1] > 4:
+    if d2_like_c and not d1_like_c:
         return x.permute(0, 2, 1, 3, 4).contiguous()
+
+    # Ambiguous (e.g. d1=48, d2=3 or d1=3, d2=48): treat larger dim as channel.
+    if d1_like_c and d2_like_c:
+        if d1 >= d2:
+            return x
+        return x.permute(0, 2, 1, 3, 4).contiguous()
+
+    # Fallback heuristic.
+    if d1 <= 32 and d2 > d1:
+        return x.permute(0, 2, 1, 3, 4).contiguous()
+    if d2 <= 32 and d1 > d2:
+        return x
     return x
 
 
