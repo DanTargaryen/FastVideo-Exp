@@ -287,14 +287,27 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
                                                                       torch.Tensor]]:
         latent_vis_dict: dict[str, torch.Tensor] = {}
         device = get_local_torch_device()
-        target_latent = traj_latents[:, -1]
+        # Strict chunkwise ODE alignment:
+        # - traj_latents[:, -1] is clean latent condition (clean_x)
+        # - traj_latents[:, -2] is regression target
+        if traj_latents.shape[1] < 2:
+            raise ValueError(
+                "ODE trajectory must contain at least 2 states for strict chunkwise training: "
+                "need [-2]=target and [-1]=clean condition."
+            )
+        clean_latent = traj_latents[:, -1]
+        target_latent = traj_latents[:, -2]
+        traj_latents_valid = traj_latents[:, :-1]
+        traj_timesteps_valid = traj_timesteps[:, :-1]
 
-        # Shapes: traj_latents [B, S, T, C, H, W], traj_timesteps [B, S]
-        bsz, steps, num_frames, num_channels, height, width = traj_latents.shape
+        # Shapes:
+        # - traj_latents_valid [B, S-1, T, C, H, W]
+        # - traj_timesteps_valid [B, S-1]
+        bsz, steps, num_frames, num_channels, height, width = traj_latents_valid.shape
 
         if self._cached_closest_idx_per_dmd is None:
             # Compute closest indices to the desired DMD timesteps.
-            ts = traj_timesteps[0].to(dtype=torch.float32)
+            ts = traj_timesteps_valid[0].to(dtype=torch.float32)
             dmd = self.dmd_denoising_steps.to(device=device,
                                               dtype=torch.float32)
             idx = torch.argmin((ts.unsqueeze(0) - dmd.unsqueeze(1)).abs(),
@@ -307,7 +320,7 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         assert self._cached_closest_idx_per_dmd is not None
         relevant_traj_latents = torch.index_select(
-            traj_latents,
+            traj_latents_valid,
             dim=1,
             index=self._cached_closest_idx_per_dmd.to(traj_latents.device))
 
@@ -333,6 +346,7 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
 
         latent_model_input = noisy_input.permute(0, 2, 1, 3, 4).contiguous()
         latent_model_input[:, :, :1] = first_frame_latent
+        clean_latent_input = clean_latent.permute(0, 2, 1, 3, 4).contiguous()
         from fastvideo.utils import get_compute_dtype
         model_dtype = get_compute_dtype()
         if not hasattr(self, "_dtype_debug_logged"):
@@ -360,6 +374,9 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
         with set_forward_context(current_timestep=int(timestep[0, 0].item()),
                                  attn_metadata=None,
                                  forward_batch=batch):
+            clean_aug_t = torch.zeros_like(timestep,
+                                           device=device,
+                                           dtype=model_dtype)
             num_channels_latents = getattr(self.transformer,
                                            "num_channels_latents",
                                            control_latent.shape[1] // 3)
@@ -367,6 +384,8 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
                 hidden_states=latent_model_input.to(dtype=model_dtype),
                 encoder_hidden_states=[encoder_hidden_states.to(dtype=model_dtype)],
                 timestep=timestep.to(device, dtype=model_dtype),
+                clean_hidden_states=clean_latent_input.to(dtype=model_dtype),
+                aug_t=clean_aug_t,
                 **_build_controlnet_kwargs(
                     self.controlnet,
                     control_latent.to(dtype=model_dtype),
@@ -378,6 +397,8 @@ class ODEInitControlnetTrainingPipeline(TrainingPipeline):
                 [encoder_hidden_states.to(dtype=model_dtype)],
                 timestep.to(device, dtype=model_dtype),
                 block_controlnet_hidden_states=control_res,
+                clean_x=clean_latent_input.to(dtype=model_dtype),
+                aug_t=clean_aug_t,
             ).permute(0, 2, 1, 3, 4)
 
         pred_video = pred_noise_to_pred_video(
