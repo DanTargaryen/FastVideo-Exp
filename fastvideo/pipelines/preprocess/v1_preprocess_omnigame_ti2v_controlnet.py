@@ -166,59 +166,96 @@ def _load_mask_frame(path: str,
     return t
 
 
-def _load_depth_frames_from_folder(control_dir: str, frame_indices: list[int],
-                                   height: int, width: int) -> torch.Tensor:
+def _read_depth_any(path: str) -> np.ndarray:
+    p = _maybe_expand(path)
+    if str(p).lower().endswith(".exr"):
+        try:
+            arr = cv2.imread(p, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if arr is None:
+                raise FileNotFoundError(p)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            return arr.astype(np.float32)
+        except Exception:
+            pass
+    arr = imageio.imread(p)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32)
+
+
+def _load_depth_frames_from_folder(
+    control_dir: str,
+    frame_indices: list[int],
+    height: int,
+    width: int,
+    *,
+    pmin: float,
+    pmax: float,
+) -> torch.Tensor:
     """
-    Mirrors Diff-Factory `process_control_depth` in run_wan_controlnet_depth_mask.py.
-    Returns (T,3,H,W) with valid depth in [0,1] and invalid pixels = -1.
+    Keep depth preprocessing consistent with preprocess_matrixcity_ti2v_controlnet_parquet.py:
+      - center-crop to aspect, resize with NEAREST
+      - heuristic unit scaling
+      - clip-wise percentile normalization
+      - invert depth (near->1, far->0), invalid->-1
+    Returns: (T,3,H,W)
     """
     folder = _maybe_expand(control_dir)
     depths: list[np.ndarray] = []
     target_ratio = float(width) / float(height)
     for idx in frame_indices:
         fname = os.path.join(folder, f"{int(idx):06d}.png")
-        depthmap = imageio.imread(fname).astype(np.float32)
-        if depthmap.ndim == 3:
-            depthmap = depthmap[..., 0]
-        depthmap = depthmap / 65535.0
+        d = _read_depth_any(fname)
 
-        h0, w0 = depthmap.shape
+        h0, w0 = d.shape
         current_ratio = float(w0) / float(h0)
         if current_ratio > target_ratio:
             new_w = int(h0 * target_ratio)
             left = max(0, (w0 - new_w) // 2)
-            depthmap = depthmap[:, left:left + new_w]
+            d = d[:, left:left + new_w]
         else:
             new_h = int(w0 / target_ratio)
             top = max(0, (h0 - new_h) // 2)
-            depthmap = depthmap[top:top + new_h, :]
+            d = d[top:top + new_h, :]
 
-        depthmap = cv2.resize(depthmap, (int(width), int(height)),
-                              interpolation=cv2.INTER_NEAREST)
+        d = np.array(
+            Image.fromarray(d).resize((int(width), int(height)),
+                                      resample=Image.NEAREST)).astype(np.float32)
 
-        near_mask = depthmap < 0.0015
-        far_mask = depthmap > (65500.0 / 65535.0)
-        valid = ~(near_mask | far_mask)
-        depthmap[~valid] = np.nan
-        depths.append(depthmap)
+        mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+        if mx > 1000.0:
+            d = d / 1000.0
+        elif mx > 100.0:
+            d = d / 100.0
 
-    stacked = np.stack(depths, 0)
-    global_min = np.nanmin(stacked)
-    global_max = np.nanmax(stacked)
-    if not np.isfinite(global_min) or not np.isfinite(global_max):
-        global_min, global_max = 0.0, 1.0
-    if (global_max - global_min) < 1e-6:
-        global_max = global_min + 1e-6
+        valid = np.isfinite(d) & (d > 1e-6)
+        d[~valid] = np.nan
+        depths.append(d)
+
+    stacked = np.stack(depths, axis=0)
+    valid_vals = stacked[np.isfinite(stacked)]
+    if valid_vals.size == 0:
+        lo, hi = 0.0, 1.0
+    else:
+        lo = float(np.percentile(valid_vals, pmin))
+        hi = float(np.percentile(valid_vals, pmax))
+        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+            lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
+            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                lo, hi = 0.0, 1.0
 
     frames = []
-    for depthmap in depths:
-        depthmap = (depthmap - global_min) / (global_max - global_min)
-        depthmap = 1.0 - depthmap
-        depthmap = np.nan_to_num(depthmap, nan=-1.0)
-        t = torch.from_numpy(depthmap).float().unsqueeze(0).repeat(3, 1, 1)
+    denom = max(hi - lo, 1e-6)
+    for d in depths:
+        dn = (d - lo) / denom
+        dn = np.clip(dn, 0.0, 1.0)
+        dn = 1.0 - dn
+        dn = np.nan_to_num(dn, nan=-1.0)
+        t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         frames.append(t)
 
-    return torch.stack(frames, dim=0)  # TCHW
+    return torch.stack(frames, dim=0)
 
 
 def _load_normal_frames_from_folder(normal_dir: str, frame_indices: list[int],
@@ -375,6 +412,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_invert",
                    action="store_true",
                    help="Invert mask after loading/binarization (1->0, 0->1).")
+    p.add_argument("--depth_percentile_min",
+                   type=float,
+                   default=5.0,
+                   help="Lower percentile for clip-wise depth normalization.")
+    p.add_argument("--depth_percentile_max",
+                   type=float,
+                   default=95.0,
+                   help="Upper percentile for clip-wise depth normalization.")
     p.add_argument("--latent_repeat",
                    type=int,
                    default=0,
@@ -552,9 +597,14 @@ def main(args: argparse.Namespace) -> None:
         first_lat_np = first_lat.to("cpu", dtype=torch.float32).numpy()
 
         # ---- control latents ----
-        depth_tchw = _load_depth_frames_from_folder(control_dir, frame_indices,
-                                                    args.max_height,
-                                                    args.max_width)  # T,3,H,W
+        depth_tchw = _load_depth_frames_from_folder(
+            control_dir,
+            frame_indices,
+            args.max_height,
+            args.max_width,
+            pmin=float(args.depth_percentile_min),
+            pmax=float(args.depth_percentile_max),
+        )  # T,3,H,W
         normal_dir = str(s.get("normal_path", "") or s.get("normal_dir", ""))
         if not normal_dir and args.normal_root:
             normal_dir = str(args.normal_root)
