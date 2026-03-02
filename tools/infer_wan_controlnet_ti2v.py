@@ -1129,8 +1129,18 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
+            if first_frame_timestep_zero and image_latents is not None:
+                timestep = torch.ones((latents.shape[0], latent_t),
+                                      device=device,
+                                      dtype=torch.float32) * t_cur.to(
+                                          dtype=torch.float32)
+                timestep[:, 0] = 0
+                return timestep
             return t_cur.expand(latents.shape[0])
         temp_ts = (first_frame_mask[0, 0] * t_cur)
+        if first_frame_timestep_zero and image_latents is not None:
+            temp_ts = temp_ts.clone()
+            temp_ts[0] = 0
         temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
         return temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
@@ -1168,11 +1178,20 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             ).permute(0, 2, 1, 3, 4)
 
             if float(guidance_scale) != 1.0:
+                control_res_uncond = controlnet(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=negative_prompt_embeds_list,
+                    timestep=timestep,
+                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                               num_channels_latents),
+                )
+                if isinstance(control_res_uncond, (list, tuple)):
+                    control_res_uncond = [x.to(dtype=latents.dtype) for x in control_res_uncond]
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
                     timestep,
-                    block_controlnet_hidden_states=control_res,
+                    block_controlnet_hidden_states=control_res_uncond,
                 ).permute(0, 2, 1, 3, 4)
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
