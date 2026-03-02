@@ -131,7 +131,12 @@ def _load_rgb_frame(path: Path, height: int, width: int) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
-def _load_mask_frame(path: Path, height: int, width: int, *, threshold: float | None) -> torch.Tensor:
+def _load_mask_frame(path: Path,
+                     height: int,
+                     width: int,
+                     *,
+                     threshold: float | None,
+                     invert: bool = False) -> torch.Tensor:
     img = Image.open(path).convert("L")
     arr_u8 = np.asarray(img).astype(np.uint8)
     h0, w0 = arr_u8.shape[:2]
@@ -146,9 +151,13 @@ def _load_mask_frame(path: Path, height: int, width: int, *, threshold: float | 
         top = max(0, (h0 - new_h) // 2)
         arr_u8 = arr_u8[top:top + new_h, :]
     arr_u8 = np.array(Image.fromarray(arr_u8).resize((int(width), int(height)), resample=Image.NEAREST))
-    arr = arr_u8.astype(np.float32) / 255.0
+    # Support both binary masks stored as {0,1} and {0,255}.
+    denom = 1.0 if int(arr_u8.max()) <= 1 else 255.0
+    arr = arr_u8.astype(np.float32) / float(denom)
     if threshold is not None:
         arr = (arr > float(threshold)).astype(np.float32)
+    if invert:
+        arr = 1.0 - arr
     return torch.from_numpy(arr)[None, ...].repeat(3, 1, 1).contiguous()
 
 
@@ -438,11 +447,25 @@ def _pick_indexed_files(files: dict[int, Path], length: int) -> list[Path]:
     return out
 
 
+def _frame_index_from_stem(stem: str) -> int | None:
+    if stem.isdigit():
+        return int(stem)
+    m = re.search(r"(\d+)$", stem)
+    if m is None:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
 def _sorted_pngs(dir_path: Path) -> list[Path]:
     files = [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")]
-    # Prefer integer-stem sort when possible
-    if files and all(p.stem.isdigit() for p in files):
-        return sorted(files, key=lambda p: int(p.stem))
+    # Prefer numeric-frame sort when possible (supports both "0001" and "mask_0001").
+    if files:
+        parsed = [(_frame_index_from_stem(p.stem), p) for p in files]
+        if all(idx is not None for idx, _ in parsed):
+            return [p for _, p in sorted(parsed, key=lambda x: (int(x[0]), x[1].name))]
     return sorted(files, key=lambda p: p.name)
 
 
@@ -452,8 +475,10 @@ def _sorted_depth_files(dir_path: Path) -> list[Path]:
         for p in dir_path.iterdir()
         if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
     ]
-    if files and all(p.stem.isdigit() for p in files):
-        return sorted(files, key=lambda p: int(p.stem))
+    if files:
+        parsed = [(_frame_index_from_stem(p.stem), p) for p in files]
+        if all(idx is not None for idx, _ in parsed):
+            return [p for _, p in sorted(parsed, key=lambda x: (int(x[0]), x[1].name))]
     return sorted(files, key=lambda p: p.name)
 
 
@@ -463,8 +488,10 @@ def _sorted_normal_files(dir_path: Path) -> list[Path]:
         for p in dir_path.iterdir()
         if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
     ]
-    if files and all(p.stem.isdigit() for p in files):
-        return sorted(files, key=lambda p: int(p.stem))
+    if files:
+        parsed = [(_frame_index_from_stem(p.stem), p) for p in files]
+        if all(idx is not None for idx, _ in parsed):
+            return [p for _, p in sorted(parsed, key=lambda x: (int(x[0]), x[1].name))]
     return sorted(files, key=lambda p: p.name)
 
 
@@ -476,8 +503,9 @@ def _slice_by_id_or_index(files: list[Path], start: int, end: int) -> list[Path]
     if 0 <= start <= end < n:
         return files[start:end + 1]
     # id-range
-    if all(p.stem.isdigit() for p in files):
-        ids = [int(p.stem) for p in files]
+    parsed_ids = [_frame_index_from_stem(p.stem) for p in files]
+    if all(fid is not None for fid in parsed_ids):
+        ids = [int(fid) for fid in parsed_ids]
         lo = None
         hi = None
         # find first >= start and last <= end
@@ -546,6 +574,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_width", type=int, default=512)
     p.add_argument("--max_height", type=int, default=384)
     p.add_argument("--mask_threshold", type=float, default=0.5)
+    p.add_argument("--mask_invert",
+                   action="store_true",
+                   help="Invert mask after loading/binarization (1->0, 0->1).")
     p.add_argument("--depth_dir", type=str, default="", help="Optional direct depth directory aligned to rgb (png/exr).")
     p.add_argument("--depth_percentile_min", type=float, default=5.0)
     p.add_argument("--depth_percentile_max", type=float, default=95.0)
@@ -844,8 +875,10 @@ def main() -> None:
             continue
         mask_files_map: dict[int, Path] = {}
         for p in mask_dir.iterdir():
-            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
-                mask_files_map[int(p.stem)] = p
+            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+                idx = _frame_index_from_stem(p.stem)
+                if idx is not None:
+                    mask_files_map[idx] = p
         if not mask_files_map:
             continue
         mask_paths = _pick_indexed_files(mask_files_map, int(args.clip_length))
@@ -855,8 +888,10 @@ def main() -> None:
         if masked_rgb_dir.is_dir():
             mr_map: dict[int, Path] = {}
             for p in masked_rgb_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp") and p.stem.isdigit():
-                    mr_map[int(p.stem)] = p
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+                    idx = _frame_index_from_stem(p.stem)
+                    if idx is not None:
+                        mr_map[idx] = p
             if mr_map:
                 masked_rgb_paths = _pick_indexed_files(mr_map, int(args.clip_length))
         if bool(args.require_masked_rgb) and masked_rgb_paths is None:
@@ -868,8 +903,10 @@ def main() -> None:
         if local_normal_dir.is_dir():
             n_map: dict[int, Path] = {}
             for p in local_normal_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr") and p.stem.isdigit():
-                    n_map[int(p.stem)] = p
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr"):
+                    idx = _frame_index_from_stem(p.stem)
+                    if idx is not None:
+                        n_map[idx] = p
             if n_map:
                 normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
 
@@ -886,8 +923,10 @@ def main() -> None:
                     continue
                 n_map: dict[int, Path] = {}
                 for p in ext_dir.iterdir():
-                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr") and p.stem.isdigit():
-                        n_map[int(p.stem)] = p
+                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".exr"):
+                        idx = _frame_index_from_stem(p.stem)
+                        if idx is not None:
+                            n_map[idx] = p
                 if n_map:
                     normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
                     break
@@ -982,6 +1021,7 @@ def main() -> None:
                     int(args.max_height),
                     int(args.max_width),
                     threshold=None if float(args.mask_threshold) < 0 else float(args.mask_threshold),
+                    invert=bool(args.mask_invert),
                 )
                 for p in mask_paths
             ],
