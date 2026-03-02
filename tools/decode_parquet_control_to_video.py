@@ -55,9 +55,22 @@ def _read_row_by_global_index(data_path: str, index: int,
         pf = pq.ParquetFile(fp)
         n = int(pf.metadata.num_rows) if pf.metadata is not None else 0
         if remaining < n:
-            table = pf.read_row_group(0, columns=columns)
-            row = table.slice(remaining, 1).to_pylist()[0]
-            return row
+            # Handle files with multiple row groups.
+            rg_count = pf.num_row_groups
+            rg_remaining = remaining
+            for rg in range(rg_count):
+                rg_rows = int(pf.metadata.row_group(rg).num_rows)
+                if rg_remaining >= rg_rows:
+                    rg_remaining -= rg_rows
+                    continue
+                table = pf.read_row_group(rg, columns=columns)
+                rows = table.slice(rg_remaining, 1).to_pylist()
+                if not rows:
+                    break
+                return rows[0]
+            raise IndexError(
+                f"failed to locate row index={index} inside parquet file: {fp}"
+            )
         remaining -= n
     raise IndexError(f"index out of range: {index}")
 
@@ -231,7 +244,12 @@ def main() -> None:
     decoded_mask = _decode(mask_lat)
     if float(args.mask_binarize_threshold) >= 0.0:
         thr = float(args.mask_binarize_threshold)
-        decoded_mask = (decoded_mask >= thr).to(decoded_mask.dtype)
+        # Aggregate channels before thresholding for stable binary masks.
+        # mask was encoded from repeated 3-channel input, but decode may have
+        # small per-channel deviations.
+        decoded_mask_1c = decoded_mask.mean(dim=1, keepdim=True)
+        decoded_mask_1c = (decoded_mask_1c >= thr).to(decoded_mask.dtype)
+        decoded_mask = decoded_mask_1c.repeat(1, decoded_mask.shape[1], 1, 1, 1)
 
     _save_video(decoded_depth, out_dir / "depth.mp4", args.fps, as_gray=True)
     _save_video(decoded_masked, out_dir / "masked_rgb.mp4", args.fps, as_gray=False)
