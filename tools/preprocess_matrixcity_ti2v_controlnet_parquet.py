@@ -249,7 +249,15 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
     return t[0]
 
 
-def _load_depth_sequence(depth_paths: list[Path], height: int, width: int, *, pmin: float, pmax: float) -> torch.Tensor:
+def _load_depth_sequence(
+    depth_paths: list[Path],
+    height: int,
+    width: int,
+    *,
+    pmin: float,
+    pmax: float,
+    invert_depth: bool,
+) -> torch.Tensor:
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
     for p in depth_paths:
@@ -294,7 +302,8 @@ def _load_depth_sequence(depth_paths: list[Path], height: int, width: int, *, pm
     for d in depths:
         dn = (d - lo) / denom
         dn = np.clip(dn, 0.0, 1.0)
-        dn = 1.0 - dn
+        if invert_depth:
+            dn = 1.0 - dn
         dn = np.nan_to_num(dn, nan=-1.0)
         t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         out.append(t)
@@ -580,6 +589,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--depth_dir", type=str, default="", help="Optional direct depth directory aligned to rgb (png/exr).")
     p.add_argument("--depth_percentile_min", type=float, default=5.0)
     p.add_argument("--depth_percentile_max", type=float, default=95.0)
+    depth_inv_group = p.add_mutually_exclusive_group()
+    depth_inv_group.add_argument(
+        "--depth_invert",
+        dest="depth_invert",
+        action="store_true",
+        default=True,
+        help="Use 1-depth mapping after normalization (near->1, far->0).",
+    )
+    depth_inv_group.add_argument(
+        "--no_depth_invert",
+        dest="depth_invert",
+        action="store_false",
+        help="Disable 1-depth mapping after normalization.",
+    )
     p.add_argument("--caption_pattern", type=str, default="caption*.json")
     p.add_argument("--caption_key", type=str, default="Video_Caption")
     p.add_argument("--samples_per_file", type=int, default=8)
@@ -1011,6 +1034,7 @@ def main() -> None:
             int(args.max_width),
             pmin=float(args.depth_percentile_min),
             pmax=float(args.depth_percentile_max),
+            invert_depth=bool(args.depth_invert),
         )
         if bool(args.debug_timing):
             logger.info("[timing] %s depth_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
