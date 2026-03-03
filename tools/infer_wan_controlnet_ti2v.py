@@ -829,13 +829,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         num_channels_latents = getattr(transformer, "num_channels_latents",
                                        control_chunk.shape[1] // 3)
-        stride = max(int(controlnet_stride), 1)
-        cached_control_scale: float | None = None
-        cached_control_res_cond = None
-        cached_control_res_uncond = None
 
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
-            nonlocal cached_control_scale, cached_control_res_cond, cached_control_res_uncond
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
             if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
@@ -868,49 +863,20 @@ def _causal_dmd_rollout_ti2v_controlnet(
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
                                 enabled=(dtype != torch.float32)):
-                control_scale = _controlnet_scale_for_step(
-                    int(step_index),
-                    int(t_list.numel()),
-                    controlnet_weight=float(controlnet_weight),
-                    guidance_start=float(controlnet_guidance_start),
-                    guidance_end=float(controlnet_guidance_end),
-                )
-                refresh_control = (
-                    control_scale > 0.0 and
-                    ((int(step_index) % stride) == 0 or
-                     cached_control_res_cond is None or
-                     cached_control_scale is None or
-                     abs(float(cached_control_scale) - float(control_scale)) > 1e-12)
-                )
                 with set_forward_context(current_timestep=int(step_index),
                                          attn_metadata=None,
                                          forward_batch=batch):
-                    if control_scale > 0.0 and refresh_control:
-                        control_res_cond = controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=prompt_embeds_list,
-                            timestep=timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache,
-                            crossattn_cache=control_crossattn_cache,
-                            current_start=start_index * frame_seq_length,
-                            start_frame=start_index,
-                        )
-                        control_res_cond = _scale_control_residual(
-                            control_res_cond,
-                            scale=control_scale,
-                            target_dtype=latents.dtype,
-                        )
-                        cached_control_res_cond = control_res_cond
-                        cached_control_scale = float(control_scale)
-                    elif control_scale > 0.0:
-                        control_res_cond = cached_control_res_cond
-                    else:
-                        control_res_cond = None
-                        cached_control_res_cond = None
-                        cached_control_res_uncond = None
-                        cached_control_scale = None
+                    control_res_cond = controlnet(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds_list,
+                        timestep=timestep,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
+                        kv_cache=control_kv_cache,
+                        crossattn_cache=control_crossattn_cache,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    )
                     pred_flow_cond_btchw = transformer(
                         latent_model_input,
                         prompt_embeds_list,
@@ -928,29 +894,17 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        if control_scale > 0.0 and refresh_control:
-                            control_res_uncond = controlnet(
-                                hidden_states=latent_model_input,
-                                encoder_hidden_states=negative_prompt_embeds_list,
-                                timestep=timestep,
-                                **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                           num_channels_latents),
-                                kv_cache=control_kv_cache_uncond,
-                                crossattn_cache=control_crossattn_cache_uncond,
-                                current_start=start_index * frame_seq_length,
-                                start_frame=start_index,
-                            )
-                            control_res_uncond = _scale_control_residual(
-                                control_res_uncond,
-                                scale=control_scale,
-                                target_dtype=latents.dtype,
-                            )
-                            cached_control_res_uncond = control_res_uncond
-                        elif control_scale > 0.0:
-                            control_res_uncond = cached_control_res_uncond
-                        else:
-                            control_res_uncond = None
-                            cached_control_res_uncond = None
+                        control_res_uncond = controlnet(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=negative_prompt_embeds_list,
+                            timestep=timestep,
+                            **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                       num_channels_latents),
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=start_index * frame_seq_length,
+                            start_frame=start_index,
+                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
@@ -1094,32 +1048,17 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     set_forward_context(current_timestep=0,
                                         attn_metadata=None,
                                         forward_batch=batch):
-                control_scale_ctx = _controlnet_scale_for_step(
-                    max(int(t_list.numel()) - 1, 0),
-                    int(t_list.numel()),
-                    controlnet_weight=float(controlnet_weight),
-                    guidance_start=float(controlnet_guidance_start),
-                    guidance_end=float(controlnet_guidance_end),
+                control_res_ctx = controlnet(
+                    hidden_states=context_bcfhw,
+                    encoder_hidden_states=prompt_embeds_list,
+                    timestep=context_timestep,
+                    **_build_controlnet_kwargs(controlnet, control_chunk,
+                                               num_channels_latents),
+                    kv_cache=control_kv_cache,
+                    crossattn_cache=control_crossattn_cache,
+                    current_start=start_index * frame_seq_length,
+                    start_frame=start_index,
                 )
-                if control_scale_ctx > 0.0:
-                    control_res_ctx = controlnet(
-                        hidden_states=context_bcfhw,
-                        encoder_hidden_states=prompt_embeds_list,
-                        timestep=context_timestep,
-                        **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                   num_channels_latents),
-                        kv_cache=control_kv_cache,
-                        crossattn_cache=control_crossattn_cache,
-                        current_start=start_index * frame_seq_length,
-                        start_frame=start_index,
-                    )
-                    control_res_ctx = _scale_control_residual(
-                        control_res_ctx,
-                        scale=control_scale_ctx,
-                        target_dtype=latents.dtype,
-                    )
-                else:
-                    control_res_ctx = None
                 _ = transformer(
                     context_bcfhw,
                     prompt_embeds_list,
@@ -1135,25 +1074,17 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         raise ValueError(
                             "guidance_scale != 1.0 requires negative_prompt_embeds_list."
                         )
-                    if control_scale_ctx > 0.0:
-                        control_res_ctx_uncond = controlnet(
-                            hidden_states=context_bcfhw,
-                            encoder_hidden_states=negative_prompt_embeds_list,
-                            timestep=context_timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache_uncond,
-                            crossattn_cache=control_crossattn_cache_uncond,
-                            current_start=start_index * frame_seq_length,
-                            start_frame=start_index,
-                        )
-                        control_res_ctx_uncond = _scale_control_residual(
-                            control_res_ctx_uncond,
-                            scale=control_scale_ctx,
-                            target_dtype=latents.dtype,
-                        )
-                    else:
-                        control_res_ctx_uncond = None
+                    control_res_ctx_uncond = controlnet(
+                        hidden_states=context_bcfhw,
+                        encoder_hidden_states=negative_prompt_embeds_list,
+                        timestep=context_timestep,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
+                        kv_cache=control_kv_cache_uncond,
+                        crossattn_cache=control_crossattn_cache_uncond,
+                        current_start=start_index * frame_seq_length,
+                        start_frame=start_index,
+                    )
                     _ = transformer(
                         context_bcfhw,
                         negative_prompt_embeds_list,
