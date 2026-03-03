@@ -192,13 +192,14 @@ def _load_depth_frames_from_folder(
     *,
     pmin: float,
     pmax: float,
+    invert_depth: bool,
 ) -> torch.Tensor:
     """
     Keep depth preprocessing consistent with preprocess_matrixcity_ti2v_controlnet_parquet.py:
       - center-crop to aspect, resize with NEAREST
       - heuristic unit scaling
       - clip-wise percentile normalization
-      - invert depth (near->1, far->0), invalid->-1
+      - optional invert depth (near->1, far->0), invalid->-1
     Returns: (T,3,H,W)
     """
     folder = _maybe_expand(control_dir)
@@ -250,7 +251,8 @@ def _load_depth_frames_from_folder(
     for d in depths:
         dn = (d - lo) / denom
         dn = np.clip(dn, 0.0, 1.0)
-        dn = 1.0 - dn
+        if invert_depth:
+            dn = 1.0 - dn
         dn = np.nan_to_num(dn, nan=-1.0)
         t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         frames.append(t)
@@ -420,6 +422,16 @@ def parse_args() -> argparse.Namespace:
                    type=float,
                    default=95.0,
                    help="Upper percentile for clip-wise depth normalization.")
+    depth_inv_group = p.add_mutually_exclusive_group()
+    depth_inv_group.add_argument("--depth_invert",
+                                 dest="depth_invert",
+                                 action="store_true",
+                                 default=True,
+                                 help="Use 1-depth mapping after normalization (near->1, far->0).")
+    depth_inv_group.add_argument("--no_depth_invert",
+                                 dest="depth_invert",
+                                 action="store_false",
+                                 help="Disable 1-depth mapping after normalization.")
     p.add_argument("--latent_repeat",
                    type=int,
                    default=0,
@@ -604,6 +616,7 @@ def main(args: argparse.Namespace) -> None:
             args.max_width,
             pmin=float(args.depth_percentile_min),
             pmax=float(args.depth_percentile_max),
+            invert_depth=bool(args.depth_invert),
         )  # T,3,H,W
         normal_dir = str(s.get("normal_path", "") or s.get("normal_dir", ""))
         if not normal_dir and args.normal_root:

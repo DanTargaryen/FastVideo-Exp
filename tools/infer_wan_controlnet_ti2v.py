@@ -175,6 +175,28 @@ def _scale_control_residual(
         return [x.to(dtype=target_dtype) * scale_f for x in control_res]
     return control_res.to(dtype=target_dtype) * scale_f
 
+
+def _tensor_or_list_l2(x) -> float:
+    if x is None:
+        return 0.0
+    if isinstance(x, (list, tuple)):
+        sq_sum = 0.0
+        for t in x:
+            if t is None:
+                continue
+            sq_sum += float((t.float() * t.float()).sum().item())
+        return float(max(sq_sum, 0.0)**0.5)
+    return float(torch.linalg.vector_norm(x.float()).item())
+
+
+def _append_trace_jsonl(path: str | None, record: dict) -> None:
+    if path is None or str(path).strip() == "":
+        return
+    p = Path(str(path))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 def _log_causal_attn_overrides(model: torch.nn.Module, *, name: str) -> None:
     count = 0
     sample = None
@@ -640,6 +662,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
     controlnet_weight: float,
     controlnet_guidance_start: float,
     controlnet_guidance_end: float,
+    controlnet_stride: int,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -806,8 +829,13 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         num_channels_latents = getattr(transformer, "num_channels_latents",
                                        control_chunk.shape[1] // 3)
+        stride = max(int(controlnet_stride), 1)
+        cached_control_scale: float | None = None
+        cached_control_res_cond = None
+        cached_control_res_uncond = None
 
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
+            nonlocal cached_control_scale, cached_control_res_cond, cached_control_res_uncond
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
             if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
@@ -847,10 +875,17 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     guidance_start=float(controlnet_guidance_start),
                     guidance_end=float(controlnet_guidance_end),
                 )
+                refresh_control = (
+                    control_scale > 0.0 and
+                    ((int(step_index) % stride) == 0 or
+                     cached_control_res_cond is None or
+                     cached_control_scale is None or
+                     abs(float(cached_control_scale) - float(control_scale)) > 1e-12)
+                )
                 with set_forward_context(current_timestep=int(step_index),
                                          attn_metadata=None,
                                          forward_batch=batch):
-                    if control_scale > 0.0:
+                    if control_scale > 0.0 and refresh_control:
                         control_res_cond = controlnet(
                             hidden_states=latent_model_input,
                             encoder_hidden_states=prompt_embeds_list,
@@ -867,8 +902,15 @@ def _causal_dmd_rollout_ti2v_controlnet(
                             scale=control_scale,
                             target_dtype=latents.dtype,
                         )
+                        cached_control_res_cond = control_res_cond
+                        cached_control_scale = float(control_scale)
+                    elif control_scale > 0.0:
+                        control_res_cond = cached_control_res_cond
                     else:
                         control_res_cond = None
+                        cached_control_res_cond = None
+                        cached_control_res_uncond = None
+                        cached_control_scale = None
                     pred_flow_cond_btchw = transformer(
                         latent_model_input,
                         prompt_embeds_list,
@@ -886,7 +928,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        if control_scale > 0.0:
+                        if control_scale > 0.0 and refresh_control:
                             control_res_uncond = controlnet(
                                 hidden_states=latent_model_input,
                                 encoder_hidden_states=negative_prompt_embeds_list,
@@ -903,8 +945,12 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                 scale=control_scale,
                                 target_dtype=latents.dtype,
                             )
+                            cached_control_res_uncond = control_res_uncond
+                        elif control_scale > 0.0:
+                            control_res_uncond = cached_control_res_uncond
                         else:
                             control_res_uncond = None
+                            cached_control_res_uncond = None
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
@@ -1150,6 +1196,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     controlnet_weight: float,
     controlnet_guidance_start: float,
     controlnet_guidance_end: float,
+    controlnet_stride: int,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -1164,6 +1211,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     full_schedule: bool,
     first_frame_timestep_zero: bool,
     expand_timesteps: bool,
+    trace_jsonl_path: str | None,
+    trace_sample_id: str,
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -1238,6 +1287,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     num_channels_latents = getattr(transformer, "num_channels_latents",
                                    control_latent_bcfhw.shape[1] // 3)
+    stride = max(int(controlnet_stride), 1)
+    cached_control_scale: float | None = None
+    cached_control_res_cond = None
+    cached_control_res_uncond = None
 
     for step_i, t_cur in enumerate(timesteps):
         if float(guidance_scale) != 1.0 and negative_prompt_embeds_list is None:
@@ -1255,11 +1308,18 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             guidance_start=float(controlnet_guidance_start),
             guidance_end=float(controlnet_guidance_end),
         )
+        refresh_control = (
+            control_scale > 0.0 and
+            ((int(step_i) % stride) == 0 or
+             cached_control_res_cond is None or
+             cached_control_scale is None or
+             abs(float(cached_control_scale) - float(control_scale)) > 1e-12)
+        )
 
         with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
                                  forward_batch=batch):
-            if control_scale > 0.0:
+            if control_scale > 0.0 and refresh_control:
                 control_res = controlnet(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds_list,
@@ -1272,8 +1332,15 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                     scale=control_scale,
                     target_dtype=latents.dtype,
                 )
+                cached_control_res_cond = control_res
+                cached_control_scale = float(control_scale)
+            elif control_scale > 0.0:
+                control_res = cached_control_res_cond
             else:
                 control_res = None
+                cached_control_res_cond = None
+                cached_control_res_uncond = None
+                cached_control_scale = None
 
             noise_pred = transformer(
                 latent_model_input,
@@ -1281,9 +1348,11 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 timestep,
                 block_controlnet_hidden_states=control_res,
             ).permute(0, 2, 1, 3, 4)
+            noise_pred_cond = noise_pred
 
+            noise_uncond = None
             if float(guidance_scale) != 1.0:
-                if control_scale > 0.0:
+                if control_scale > 0.0 and refresh_control:
                     control_res_uncond = controlnet(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=negative_prompt_embeds_list,
@@ -1296,8 +1365,12 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                         scale=control_scale,
                         target_dtype=latents.dtype,
                     )
+                    cached_control_res_uncond = control_res_uncond
+                elif control_scale > 0.0:
+                    control_res_uncond = cached_control_res_uncond
                 else:
                     control_res_uncond = None
+                    cached_control_res_uncond = None
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -1306,8 +1379,28 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 ).permute(0, 2, 1, 3, 4)
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
+        latent_l2_before = _tensor_or_list_l2(latents)
         noise_pred = noise_pred.permute(0, 2, 1, 3, 4).contiguous()
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
+        latent_l2_after = _tensor_or_list_l2(latents)
+        _append_trace_jsonl(
+            trace_jsonl_path,
+            {
+                "sample_id": str(trace_sample_id),
+                "attention_mode": "bidirectional",
+                "step_index": int(step_i),
+                "num_steps": int(timesteps.numel()),
+                "timestep": float(t_cur.detach().float().cpu().item()),
+                "control_scale": float(control_scale),
+                "latent_l2_before": float(latent_l2_before),
+                "control_cond_l2": float(_tensor_or_list_l2(control_res)),
+                "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond if float(guidance_scale) != 1.0 else None)),
+                "noise_cond_l2": float(_tensor_or_list_l2(noise_pred_cond)),
+                "noise_uncond_l2": float(_tensor_or_list_l2(noise_uncond)),
+                "noise_final_l2": float(_tensor_or_list_l2(noise_pred)),
+                "latent_l2_after": float(latent_l2_after),
+            },
+        )
 
     if expand_timesteps and image_latents is not None:
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
@@ -1619,6 +1712,17 @@ def main() -> None:
         help="Also save the decoded video as PNG frames under out_dir/frames/<sample_id>/",
     )
     parser.add_argument(
+        "--trace_rollout_jsonl",
+        type=str,
+        default="",
+        help="Optional path to write per-step rollout trace as JSONL (mainly for bidirectional alignment checks).",
+    )
+    parser.add_argument(
+        "--trace_rollout_overwrite",
+        action="store_true",
+        help="If set with --trace_rollout_jsonl, remove existing trace file before writing.",
+    )
+    parser.add_argument(
         "--control_depth_only",
         action="store_true",
         help=(
@@ -1627,6 +1731,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    trace_jsonl_path = str(args.trace_rollout_jsonl).strip()
+    if trace_jsonl_path and bool(args.trace_rollout_overwrite):
+        tp = Path(trace_jsonl_path)
+        if tp.exists():
+            tp.unlink()
 
     _ensure_single_process_dist_env()
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", "TORCH_SDPA")
@@ -1650,9 +1759,9 @@ def main() -> None:
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
     dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
     timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
-    if int(args.controlnet_stride) != 3:
-        logger.warning(
-            "controlnet_stride is currently not applied in this script (received=%s).",
+    if int(args.controlnet_stride) > 1:
+        logger.info(
+            "controlnet_stride enabled: refresh ControlNet residual every %s steps (reuse in-between).",
             int(args.controlnet_stride),
         )
     if bool(args.full_schedule):
@@ -1885,6 +1994,7 @@ def main() -> None:
                 controlnet_weight=float(args.controlnet_weight),
                 controlnet_guidance_start=float(args.controlnet_guidance_start),
                 controlnet_guidance_end=float(args.controlnet_guidance_end),
+                controlnet_stride=int(args.controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
@@ -1900,6 +2010,8 @@ def main() -> None:
                 first_frame_timestep_zero=effective_first_frame_timestep_zero,
                 expand_timesteps=bool(
                     getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
+                trace_jsonl_path=(trace_jsonl_path if trace_jsonl_path else None),
+                trace_sample_id=sample.sample_id,
                 seed=args.seed + i,
                 dtype=dtype,
             )
@@ -1914,6 +2026,7 @@ def main() -> None:
                 controlnet_weight=float(args.controlnet_weight),
                 controlnet_guidance_start=float(args.controlnet_guidance_start),
                 controlnet_guidance_end=float(args.controlnet_guidance_end),
+                controlnet_stride=int(args.controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
