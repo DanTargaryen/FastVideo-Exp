@@ -76,11 +76,6 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
 
-# Optional compatibility switch for run_wan_contorlnet_union.md typo:
-# When enabled and normal branch exists, feed normal into "depth" and drop
-# the normal branch (equivalent to `union_input.depth = controlnet_normal_frames`).
-MD_COMPAT_NORMAL_OVERWRITE_DEPTH = False
-
 
 def _is_union_controlnet(model) -> bool:
     return "union" in model.__class__.__name__.lower()
@@ -134,54 +129,11 @@ def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
         return {"controlnet_states": control_latent}
     depth, normal, masked, mask = _split_union_control_latent(
         control_latent, num_channels_latents)
-    if MD_COMPAT_NORMAL_OVERWRITE_DEPTH and normal is not None:
-        depth = normal
-        normal = None
     return {
         "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
         "mask": mask,
         "masked_latent": masked,
     }
-
-
-def _controlnet_scale_for_step(
-    step_index: int,
-    total_steps: int,
-    *,
-    controlnet_weight: float,
-    guidance_start: float,
-    guidance_end: float,
-) -> float:
-    """
-    Diffusers-style controlnet keep schedule:
-      keep = 1.0 - float(i/len(t) < start or (i+1)/len(t) > end)
-    then scale by controlnet_weight.
-    """
-    s = float(guidance_start)
-    e = float(guidance_end)
-    if s > e:
-        s, e = e, s
-    s = max(0.0, min(1.0, s))
-    e = max(0.0, min(1.0, e))
-    n = max(int(total_steps), 1)
-    i = max(0, min(int(step_index), n - 1))
-    keep = 1.0 - float((float(i) / float(n) < s) or
-                       (float(i + 1) / float(n) > e))
-    return float(controlnet_weight) if keep else 0.0
-
-
-def _scale_control_residual(
-    control_res,
-    *,
-    scale: float,
-    target_dtype: torch.dtype,
-):
-    if control_res is None:
-        return None
-    scale_f = float(scale)
-    if isinstance(control_res, (list, tuple)):
-        return [x.to(dtype=target_dtype) * scale_f for x in control_res]
-    return control_res.to(dtype=target_dtype) * scale_f
 
 
 def _tensor_or_list_l2(x) -> float:
@@ -667,10 +619,6 @@ def _causal_dmd_rollout_ti2v_controlnet(
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
-    controlnet_weight: float,
-    controlnet_guidance_start: float,
-    controlnet_guidance_end: float,
-    controlnet_stride: int,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -1132,10 +1080,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
-    controlnet_weight: float,
-    controlnet_guidance_start: float,
-    controlnet_guidance_end: float,
-    controlnet_stride: int,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -1226,10 +1170,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     num_channels_latents = getattr(transformer, "num_channels_latents",
                                    control_latent_bcfhw.shape[1] // 3)
-    # MD alignment: the reference run_wan_contorlnet_union flow does not pass
-    # controlnet_stride into pipeline call, so ControlNet residual is effectively
-    # refreshed every denoising step in bidirectional inference.
-    stride = 1
 
     for step_i, t_cur in enumerate(timesteps):
         if float(guidance_scale) != 1.0 and negative_prompt_embeds_list is None:
@@ -1240,33 +1180,17 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         latent_model_input = _build_latent_model_input().to(
             device=device, dtype=dtype)
         timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
-        control_scale = _controlnet_scale_for_step(
-            int(step_i),
-            int(timesteps.numel()),
-            controlnet_weight=float(controlnet_weight),
-            guidance_start=float(controlnet_guidance_start),
-            guidance_end=float(controlnet_guidance_end),
-        )
-        refresh_control = (control_scale > 0.0 and ((int(step_i) % stride) == 0))
 
         with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
                                  forward_batch=batch):
-            if control_scale > 0.0 and refresh_control:
-                control_res = controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds_list,
-                    timestep=timestep,
-                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
-                                               num_channels_latents),
-                )
-                control_res = _scale_control_residual(
-                    control_res,
-                    scale=control_scale,
-                    target_dtype=latents.dtype,
-                )
-            else:
-                control_res = None
+            control_res = controlnet(
+                hidden_states=latent_model_input,
+                encoder_hidden_states=prompt_embeds_list,
+                timestep=timestep,
+                **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                           num_channels_latents),
+            )
 
             noise_pred = transformer(
                 latent_model_input,
@@ -1278,26 +1202,11 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
             noise_uncond = None
             if float(guidance_scale) != 1.0:
-                if control_scale > 0.0 and refresh_control:
-                    control_res_uncond = controlnet(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=negative_prompt_embeds_list,
-                        timestep=timestep,
-                        **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
-                                                   num_channels_latents),
-                    )
-                    control_res_uncond = _scale_control_residual(
-                        control_res_uncond,
-                        scale=control_scale,
-                        target_dtype=latents.dtype,
-                    )
-                else:
-                    control_res_uncond = None
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
                     timestep,
-                    block_controlnet_hidden_states=control_res_uncond,
+                    block_controlnet_hidden_states=control_res,
                 ).permute(0, 2, 1, 3, 4)
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
@@ -1313,10 +1222,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "step_index": int(step_i),
                 "num_steps": int(timesteps.numel()),
                 "timestep": float(t_cur.detach().float().cpu().item()),
-                "control_scale": float(control_scale),
+                "control_scale": 1.0,
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
-                "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond if float(guidance_scale) != 1.0 else None)),
+                "control_uncond_l2": float(_tensor_or_list_l2(control_res if float(guidance_scale) != 1.0 else None)),
                 "noise_cond_l2": float(_tensor_or_list_l2(noise_pred_cond)),
                 "noise_uncond_l2": float(_tensor_or_list_l2(noise_uncond)),
                 "noise_final_l2": float(_tensor_or_list_l2(noise_pred)),
@@ -1414,7 +1323,6 @@ def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
 
 
 def main() -> None:
-    global MD_COMPAT_NORMAL_OVERWRITE_DEPTH
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
@@ -1434,22 +1342,6 @@ def main() -> None:
         "Diffusers-format folder used for ControlNet config (contains config.json + *.safetensors). "
         "Can be either (a) consolidated inference export dir, or (b) teacher ControlNet dir.",
     )
-    parser.add_argument("--controlnet_weight",
-                        type=float,
-                        default=0.8,
-                        help="ControlNet weight (Diff-Factory default: 0.8).")
-    parser.add_argument("--controlnet_guidance_start",
-                        type=float,
-                        default=0.0,
-                        help="ControlNet guidance start (Diff-Factory default: 0.0).")
-    parser.add_argument("--controlnet_guidance_end",
-                        type=float,
-                        default=0.8,
-                        help="ControlNet guidance end (Diff-Factory default: 0.8).")
-    parser.add_argument("--controlnet_stride",
-                        type=int,
-                        default=3,
-                        help="ControlNet stride (Diff-Factory default: 3).")
     parser.add_argument(
         "--attention_mode",
         type=str,
@@ -1653,20 +1545,7 @@ def main() -> None:
             "This is useful to debug mask-conditioned artifacts without regenerating parquet."
         ),
     )
-    parser.add_argument(
-        "--md_normal_overwrites_depth",
-        action="store_true",
-        help=(
-            "Mimic run_wan_contorlnet_union.md typo behavior: if normal exists, "
-            "overwrite union depth with normal and drop normal branch."
-        ),
-    )
     args = parser.parse_args()
-    MD_COMPAT_NORMAL_OVERWRITE_DEPTH = bool(args.md_normal_overwrites_depth)
-    if MD_COMPAT_NORMAL_OVERWRITE_DEPTH:
-        logger.warning(
-            "md typo compatibility enabled: normal branch will overwrite depth branch in union input."
-        )
     trace_jsonl_path = str(args.trace_rollout_jsonl).strip()
     if trace_jsonl_path and bool(args.trace_rollout_overwrite):
         tp = Path(trace_jsonl_path)
@@ -1695,17 +1574,6 @@ def main() -> None:
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
     dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
     timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
-    effective_controlnet_stride = int(args.controlnet_stride)
-    if args.attention_mode == "bidirectional" and effective_controlnet_stride != 1:
-        logger.info(
-            "bidir alignment: forcing controlnet_stride=1 (md behavior uses per-step ControlNet refresh)."
-        )
-        effective_controlnet_stride = 1
-    if int(effective_controlnet_stride) > 1:
-        logger.info(
-            "controlnet_stride enabled: refresh ControlNet residual every %s steps (reuse in-between).",
-            int(effective_controlnet_stride),
-        )
     if bool(args.full_schedule):
         dmd_steps_list = None
         timestep_indices_list = None
@@ -1955,10 +1823,6 @@ def main() -> None:
                 prompt_embeds_list=[prompt_embeds],
                 negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
                 guidance_scale=float(args.guidance_scale),
-                controlnet_weight=float(args.controlnet_weight),
-                controlnet_guidance_start=float(args.controlnet_guidance_start),
-                controlnet_guidance_end=float(args.controlnet_guidance_end),
-                controlnet_stride=int(effective_controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
@@ -1987,10 +1851,6 @@ def main() -> None:
                 prompt_embeds_list=[prompt_embeds],
                 negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
                 guidance_scale=float(args.guidance_scale),
-                controlnet_weight=float(args.controlnet_weight),
-                controlnet_guidance_start=float(args.controlnet_guidance_start),
-                controlnet_guidance_end=float(args.controlnet_guidance_end),
-                controlnet_stride=int(effective_controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
