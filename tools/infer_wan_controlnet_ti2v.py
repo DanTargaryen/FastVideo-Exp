@@ -1202,11 +1202,18 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
             noise_uncond = None
             if float(guidance_scale) != 1.0:
+                control_res_uncond = controlnet(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=negative_prompt_embeds_list,
+                    timestep=timestep,
+                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                               num_channels_latents),
+                )
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
                     timestep,
-                    block_controlnet_hidden_states=control_res,
+                    block_controlnet_hidden_states=control_res_uncond,
                 ).permute(0, 2, 1, 3, 4)
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
@@ -1225,7 +1232,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "control_scale": 1.0,
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
-                "control_uncond_l2": float(_tensor_or_list_l2(control_res if float(guidance_scale) != 1.0 else None)),
+                "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond if float(guidance_scale) != 1.0 else None)),
                 "noise_cond_l2": float(_tensor_or_list_l2(noise_pred_cond)),
                 "noise_uncond_l2": float(_tensor_or_list_l2(noise_uncond)),
                 "noise_final_l2": float(_tensor_or_list_l2(noise_pred)),
