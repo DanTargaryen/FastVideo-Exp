@@ -76,6 +76,11 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
 
+# Optional compatibility switch for run_wan_contorlnet_union.md typo:
+# When enabled and normal branch exists, feed normal into "depth" and drop
+# the normal branch (equivalent to `union_input.depth = controlnet_normal_frames`).
+MD_COMPAT_NORMAL_OVERWRITE_DEPTH = False
+
 
 def _is_union_controlnet(model) -> bool:
     return "union" in model.__class__.__name__.lower()
@@ -129,6 +134,9 @@ def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
         return {"controlnet_states": control_latent}
     depth, normal, masked, mask = _split_union_control_latent(
         control_latent, num_channels_latents)
+    if MD_COMPAT_NORMAL_OVERWRITE_DEPTH and normal is not None:
+        depth = normal
+        normal = None
     return {
         "controlnet_cond": WanControlNetUnionInput(depth=depth, normal=normal),
         "mask": mask,
@@ -1406,6 +1414,7 @@ def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
 
 
 def main() -> None:
+    global MD_COMPAT_NORMAL_OVERWRITE_DEPTH
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
@@ -1644,7 +1653,20 @@ def main() -> None:
             "This is useful to debug mask-conditioned artifacts without regenerating parquet."
         ),
     )
+    parser.add_argument(
+        "--md_normal_overwrites_depth",
+        action="store_true",
+        help=(
+            "Mimic run_wan_contorlnet_union.md typo behavior: if normal exists, "
+            "overwrite union depth with normal and drop normal branch."
+        ),
+    )
     args = parser.parse_args()
+    MD_COMPAT_NORMAL_OVERWRITE_DEPTH = bool(args.md_normal_overwrites_depth)
+    if MD_COMPAT_NORMAL_OVERWRITE_DEPTH:
+        logger.warning(
+            "md typo compatibility enabled: normal branch will overwrite depth branch in union input."
+        )
     trace_jsonl_path = str(args.trace_rollout_jsonl).strip()
     if trace_jsonl_path and bool(args.trace_rollout_overwrite):
         tp = Path(trace_jsonl_path)
