@@ -1666,13 +1666,6 @@ def main() -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }[args.dtype]
-    if args.attention_mode == "bidirectional" and args.dtype == "bf16":
-        # MD alignment: run_wan_contorlnet_union reference uses fp32 pipeline.
-        # If user leaves infer default bf16, promote to fp32 only for bidirectional.
-        logger.info(
-            "bidir alignment: promoting dtype from bf16 to fp32 to match md reference behavior."
-        )
-        dtype = torch.float32
     guidance_scale_value = float(args.guidance_scale)
     inference_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
 
@@ -1760,6 +1753,28 @@ def main() -> None:
             f"ControlNet load failed for {args.controlnet_dir}. "
             "Ensure the directory contains config.json and *.safetensors."
         )
+    # Keep runtime tensor dtype consistent with loaded model dtype to avoid
+    # conv3d type mismatch (e.g., input float32 vs bf16 bias).
+    try:
+        model_param = next(
+            p for p in transformer.parameters() if torch.is_floating_point(p))
+    except StopIteration:
+        model_param = None
+    if model_param is None:
+        try:
+            model_param = next(
+                p for p in controlnet.parameters() if torch.is_floating_point(p))
+        except StopIteration:
+            model_param = None
+    if model_param is not None:
+        model_dtype = model_param.dtype
+        if dtype != model_dtype:
+            logger.info(
+                "dtype alignment: overriding runtime dtype from %s to model dtype %s",
+                str(dtype),
+                str(model_dtype),
+            )
+            dtype = model_dtype
 
     # Auto-enable a safe sliding window for long videos when checkpoint config is missing/unstable.
     # This avoids exploding KV cache memory and also avoids the "kv_cache_size==0" crash when
