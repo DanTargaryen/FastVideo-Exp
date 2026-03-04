@@ -35,6 +35,51 @@ logger = init_logger(__name__)
 vsa_available = is_vsa_available()
 
 
+def _compute_negative_prompt_embeddings(
+    *,
+    tokenizer,
+    text_encoder,
+    negative_prompt: str,
+    max_sequence_length: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert negative_prompt, "Negative prompt must be provided for CFG."
+    encoder_device = next(text_encoder.parameters()).device
+    text_encoder.eval()
+    with torch.no_grad():
+        tokens = tokenizer(
+            [negative_prompt],
+            padding="max_length",
+            truncation=True,
+            max_length=max_sequence_length,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        prompt_embeds = text_encoder(
+            tokens.input_ids.to(encoder_device),
+            tokens.attention_mask.to(encoder_device),
+        ).last_hidden_state
+
+    attn_mask = tokens.attention_mask
+    seq_len = int(attn_mask.sum(dim=1)[0].item())
+    seq_len = min(seq_len, prompt_embeds.shape[1])
+    prompt_embeds = prompt_embeds[:, :seq_len, :]
+    attn_mask = attn_mask[:, :seq_len]
+
+    if prompt_embeds.shape[1] < max_sequence_length:
+        pad_len = max_sequence_length - prompt_embeds.shape[1]
+        pad_embed = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
+        prompt_embeds = torch.cat([prompt_embeds, pad_embed], dim=1)
+        pad_mask = attn_mask.new_zeros((1, pad_len))
+        attn_mask = torch.cat([attn_mask, pad_mask], dim=1)
+
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=target_device)
+    attn_mask = attn_mask.to(dtype=dtype, device=target_device)
+    return prompt_embeds, attn_mask
+
+
 class SelfForcingDistillationPipeline(DistillationPipeline):
     """
     A self-forcing distillation pipeline that alternates between training
@@ -126,51 +171,6 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         logger.info("RANK: %s, exiting initialize_training_pipeline",
                     self.global_rank,
                     local_main_process_only=False)
-
-
-def _compute_negative_prompt_embeddings(
-    *,
-    tokenizer,
-    text_encoder,
-    negative_prompt: str,
-    max_sequence_length: int,
-    dtype: torch.dtype,
-    target_device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert negative_prompt, "Negative prompt must be provided for CFG."
-    encoder_device = next(text_encoder.parameters()).device
-    text_encoder.eval()
-    with torch.no_grad():
-        tokens = tokenizer(
-            [negative_prompt],
-            padding="max_length",
-            truncation=True,
-            max_length=max_sequence_length,
-            add_special_tokens=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        prompt_embeds = text_encoder(
-            tokens.input_ids.to(encoder_device),
-            tokens.attention_mask.to(encoder_device),
-        ).last_hidden_state
-
-    attn_mask = tokens.attention_mask
-    seq_len = int(attn_mask.sum(dim=1)[0].item())
-    seq_len = min(seq_len, prompt_embeds.shape[1])
-    prompt_embeds = prompt_embeds[:, :seq_len, :]
-    attn_mask = attn_mask[:, :seq_len]
-
-    if prompt_embeds.shape[1] < max_sequence_length:
-        pad_len = max_sequence_length - prompt_embeds.shape[1]
-        pad_embed = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
-        prompt_embeds = torch.cat([prompt_embeds, pad_embed], dim=1)
-        pad_mask = attn_mask.new_zeros((1, pad_len))
-        attn_mask = torch.cat([attn_mask, pad_mask], dim=1)
-
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=target_device)
-    attn_mask = attn_mask.to(dtype=dtype, device=target_device)
-    return prompt_embeds, attn_mask
 
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int,
                                device: torch.device) -> list[int]:
@@ -1340,6 +1340,9 @@ def _compute_negative_prompt_embeddings(
                     if "dmd_timestep" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_timestep"] = training_batch.dmd_latent_vis_dict[
                             "dmd_timestep"].item()
+                    if "dmd_grad_normalizer" in training_batch.dmd_latent_vis_dict:
+                        log_data["dmd_grad_normalizer"] = training_batch.dmd_latent_vis_dict[
+                            "dmd_grad_normalizer"].item()
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":

@@ -434,9 +434,13 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 pred_real_video_cond -
                 pred_real_video_uncond) * self.real_score_guidance_scale
 
+            # Stabilize DMD normalization when student is close to teacher;
+            # tiny denominator here can cause early training collapse.
+            grad_normalizer = torch.abs(original_latent -
+                                        real_score_pred_video).mean()
+            grad_normalizer = grad_normalizer.clamp_min(1e-5)
             grad = (faker_score_pred_video -
-                    real_score_pred_video) / torch.abs(
-                        original_latent - real_score_pred_video).mean()
+                    real_score_pred_video) / grad_normalizer
             grad = torch.nan_to_num(grad)
 
         dmd_loss = 0.5 * F.mse_loss(original_latent.float(),
@@ -449,6 +453,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "real_score_pred_video": real_score_pred_video.detach(),
             "faker_score_pred_video": faker_score_pred_video.detach(),
             "dmd_timestep": timestep.detach(),
+            "dmd_grad_normalizer": grad_normalizer.detach(),
         })
         return dmd_loss
 

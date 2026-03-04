@@ -784,8 +784,14 @@ class DistillationPipeline(TrainingPipeline):
                 pred_real_video_cond -
                 pred_real_video_uncond) * self.real_score_guidance_scale
 
-            grad = (faker_score_pred_video - real_score_pred_video) / torch.abs(
-                original_latent - real_score_pred_video).mean()
+            # Stabilize DMD normalization when student is very close to teacher
+            # at early steps; otherwise denominator can become too small and
+            # cause oversized updates.
+            grad_normalizer = torch.abs(original_latent -
+                                        real_score_pred_video).mean()
+            grad_normalizer = grad_normalizer.clamp_min(1e-5)
+            grad = (faker_score_pred_video - real_score_pred_video
+                    ) / grad_normalizer
             grad = torch.nan_to_num(grad)
 
         dmd_loss = 0.5 * F.mse_loss(
@@ -803,6 +809,8 @@ class DistillationPipeline(TrainingPipeline):
             faker_score_pred_video.detach(),
             "dmd_timestep":
             timestep.detach(),
+            "dmd_grad_normalizer":
+            grad_normalizer.detach(),
         })
 
         return dmd_loss
@@ -1639,6 +1647,9 @@ class DistillationPipeline(TrainingPipeline):
                         training_batch.dmd_latent_vis_dict["dmd_timestep"].item(
                         ),
                     }
+                    if "dmd_grad_normalizer" in training_batch.dmd_latent_vis_dict:
+                        dmd_additional_logs["dmd_grad_normalizer"] = training_batch.dmd_latent_vis_dict[
+                            "dmd_grad_normalizer"].item()
                     log_data.update(dmd_additional_logs)
 
                 faker_score_additional_logs = {
