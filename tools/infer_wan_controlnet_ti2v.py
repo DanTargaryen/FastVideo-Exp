@@ -1218,10 +1218,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     num_channels_latents = getattr(transformer, "num_channels_latents",
                                    control_latent_bcfhw.shape[1] // 3)
-    stride = max(int(controlnet_stride), 1)
-    cached_control_scale: float | None = None
-    cached_control_res_cond = None
-    cached_control_res_uncond = None
+    # MD alignment: the reference run_wan_contorlnet_union flow does not pass
+    # controlnet_stride into pipeline call, so ControlNet residual is effectively
+    # refreshed every denoising step in bidirectional inference.
+    stride = 1
 
     for step_i, t_cur in enumerate(timesteps):
         if float(guidance_scale) != 1.0 and negative_prompt_embeds_list is None:
@@ -1239,13 +1239,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             guidance_start=float(controlnet_guidance_start),
             guidance_end=float(controlnet_guidance_end),
         )
-        refresh_control = (
-            control_scale > 0.0 and
-            ((int(step_i) % stride) == 0 or
-             cached_control_res_cond is None or
-             cached_control_scale is None or
-             abs(float(cached_control_scale) - float(control_scale)) > 1e-12)
-        )
+        refresh_control = (control_scale > 0.0 and ((int(step_i) % stride) == 0))
 
         with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
@@ -1263,15 +1257,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                     scale=control_scale,
                     target_dtype=latents.dtype,
                 )
-                cached_control_res_cond = control_res
-                cached_control_scale = float(control_scale)
-            elif control_scale > 0.0:
-                control_res = cached_control_res_cond
             else:
                 control_res = None
-                cached_control_res_cond = None
-                cached_control_res_uncond = None
-                cached_control_scale = None
 
             noise_pred = transformer(
                 latent_model_input,
@@ -1296,12 +1283,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                         scale=control_scale,
                         target_dtype=latents.dtype,
                     )
-                    cached_control_res_uncond = control_res_uncond
-                elif control_scale > 0.0:
-                    control_res_uncond = cached_control_res_uncond
                 else:
                     control_res_uncond = None
-                    cached_control_res_uncond = None
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -1690,10 +1673,16 @@ def main() -> None:
     dmd_steps = [int(x) for x in args.dmd_steps.split(",") if x.strip() != ""]
     dmd_steps_list: list[int] | None = dmd_steps if len(dmd_steps) > 0 else None
     timestep_indices_list: list[int] | None = timestep_indices if dmd_steps_list is None else None
-    if int(args.controlnet_stride) > 1:
+    effective_controlnet_stride = int(args.controlnet_stride)
+    if args.attention_mode == "bidirectional" and effective_controlnet_stride != 1:
+        logger.info(
+            "bidir alignment: forcing controlnet_stride=1 (md behavior uses per-step ControlNet refresh)."
+        )
+        effective_controlnet_stride = 1
+    if int(effective_controlnet_stride) > 1:
         logger.info(
             "controlnet_stride enabled: refresh ControlNet residual every %s steps (reuse in-between).",
-            int(args.controlnet_stride),
+            int(effective_controlnet_stride),
         )
     if bool(args.full_schedule):
         dmd_steps_list = None
@@ -1925,7 +1914,7 @@ def main() -> None:
                 controlnet_weight=float(args.controlnet_weight),
                 controlnet_guidance_start=float(args.controlnet_guidance_start),
                 controlnet_guidance_end=float(args.controlnet_guidance_end),
-                controlnet_stride=int(args.controlnet_stride),
+                controlnet_stride=int(effective_controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
@@ -1957,7 +1946,7 @@ def main() -> None:
                 controlnet_weight=float(args.controlnet_weight),
                 controlnet_guidance_start=float(args.controlnet_guidance_start),
                 controlnet_guidance_end=float(args.controlnet_guidance_end),
-                controlnet_stride=int(args.controlnet_stride),
+                controlnet_stride=int(effective_controlnet_stride),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,
