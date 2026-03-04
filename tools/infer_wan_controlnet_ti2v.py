@@ -1666,6 +1666,13 @@ def main() -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }[args.dtype]
+    if args.attention_mode == "bidirectional" and args.dtype == "bf16":
+        # MD alignment: run_wan_contorlnet_union reference uses fp32 pipeline.
+        # If user leaves infer default bf16, promote to fp32 only for bidirectional.
+        logger.info(
+            "bidir alignment: promoting dtype from bf16 to fp32 to match md reference behavior."
+        )
+        dtype = torch.float32
     guidance_scale_value = float(args.guidance_scale)
     inference_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
 

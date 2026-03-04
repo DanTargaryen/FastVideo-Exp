@@ -425,12 +425,14 @@ def parse_args() -> argparse.Namespace:
                    help="Invert mask after loading/binarization (1->0, 0->1).")
     p.add_argument("--depth_percentile_min",
                    type=float,
-                   default=5.0,
-                   help="Lower percentile for clip-wise depth normalization.")
+                   default=0.0,
+                   help="Lower percentile for clip-wise depth normalization. "
+                        "Use 0/100 to match md global min/max behavior.")
     p.add_argument("--depth_percentile_max",
                    type=float,
-                   default=95.0,
-                   help="Upper percentile for clip-wise depth normalization.")
+                   default=100.0,
+                   help="Upper percentile for clip-wise depth normalization. "
+                        "Use 0/100 to match md global min/max behavior.")
     depth_inv_group = p.add_mutually_exclusive_group()
     depth_inv_group.add_argument("--depth_invert",
                                  dest="depth_invert",
@@ -588,6 +590,8 @@ def main(args: argparse.Namespace) -> None:
         control_dir = _maybe_expand(str(s["control_path"]))  # .../<scene>/depth
         first_idx = int(frame_indices[0])
         first_rgb_path = os.path.join(video_dir, f"{first_idx:06d}.png")
+        image_cond_path = str(s.get("image_path", "") or
+                              s.get("first_frame_path", "")).strip()
 
         # ---- text embedding (store as float32 [L,D]) ----
         embeds_list = text_stage.encode_text(prompt,
@@ -603,8 +607,12 @@ def main(args: argparse.Namespace) -> None:
         text_emb = text_emb.detach().to("cpu", dtype=torch.float32).numpy()
 
         # ---- first-frame latent (store as float32 [F=1,C=16,H,W]) ----
-        first_rgb = _load_rgb_frame(first_rgb_path, args.max_height,
-                                    args.max_width)  # 3HW in [0,1]
+        if image_cond_path:
+            first_rgb = _load_rgb_frame(image_cond_path, args.max_height,
+                                        args.max_width)  # 3HW in [0,1]
+        else:
+            first_rgb = _load_rgb_frame(first_rgb_path, args.max_height,
+                                        args.max_width)  # 3HW in [0,1]
         first_bcthw = _to_vae_input(first_rgb[None, ...],
                                     normalize=True)  # 1,3,1,H,W
         first_bcthw = first_bcthw.to(device=device, dtype=torch.float32)
@@ -698,6 +706,15 @@ def main(args: argparse.Namespace) -> None:
             ],
                                   dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
+
+        # Match md behavior when first-frame conditioning is present:
+        # set first mask frame to all-ones and first masked_rgb frame to the
+        # conditioned first frame image.
+        if mask_tchw.shape[0] > 0 and masked_rgb_tchw.shape[0] > 0:
+            mask_tchw = mask_tchw.clone()
+            masked_rgb_tchw = masked_rgb_tchw.clone()
+            mask_tchw[0] = 1.0
+            masked_rgb_tchw[0] = first_rgb
 
         # Encode 3 or 4 sequences in a single batched call: (N,3,T,H,W)
         # Match md semantics:
