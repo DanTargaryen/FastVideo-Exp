@@ -158,11 +158,16 @@ def _load_mask_frame(path: str,
         Image.fromarray(arr_u8).resize((int(width), int(height)),
                                        resample=Image.NEAREST))
     arr = arr_u8.astype(np.float32) / 255.0  # HW in [0,1]
+    # Match md process_mask: binary mask by default (mask > 0 -> 1),
+    # while still allowing soft mask when threshold < 0.
     if threshold is not None:
         arr = (arr > float(threshold)).astype(np.float32)
+    else:
+        arr = (arr > 0.0).astype(np.float32)
     if invert:
         arr = 1.0 - arr
-    t = torch.from_numpy(arr)[None, ...].repeat(3, 1, 1).contiguous()  # 3HW
+    # Keep mask as 1-channel here; repeat to 3-channel right before VAE encode.
+    t = torch.from_numpy(arr)[None, ...].contiguous()  # 1HW
     return t
 
 
@@ -195,11 +200,13 @@ def _load_depth_frames_from_folder(
     invert_depth: bool,
 ) -> torch.Tensor:
     """
-    Keep depth preprocessing consistent with preprocess_matrixcity_ti2v_controlnet_parquet.py:
+    Match md process_depth semantics:
       - center-crop to aspect, resize with NEAREST
-      - heuristic unit scaling
-      - clip-wise percentile normalization
-      - optional invert depth (near->1, far->0), invalid->-1
+      - depth normalized to [0,1] range
+      - mark near/far invalid values as NaN
+      - clip-wise percentile normalization over valid pixels
+      - optional invert depth (default controlled by args)
+      - map to [-1,1] via (x*2-1), invalid -> +1
     Returns: (T,3,H,W)
     """
     folder = _maybe_expand(control_dir)
@@ -225,12 +232,13 @@ def _load_depth_frames_from_folder(
                                       resample=Image.NEAREST)).astype(np.float32)
 
         mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
-        if mx > 1000.0:
-            d = d / 1000.0
-        elif mx > 100.0:
-            d = d / 100.0
+        if mx > 1.5:
+            d = d / (65535.0 if mx > 255.0 else 255.0)
+        d = np.clip(d, 0.0, 1.0)
 
-        valid = np.isfinite(d) & (d > 1e-6)
+        near_mask = d < 0.0015
+        far_mask = d > (65500.0 / 65535.0)
+        valid = np.isfinite(d) & (~near_mask) & (~far_mask)
         d[~valid] = np.nan
         depths.append(d)
 
@@ -253,7 +261,8 @@ def _load_depth_frames_from_folder(
         dn = np.clip(dn, 0.0, 1.0)
         if invert_depth:
             dn = 1.0 - dn
-        dn = np.nan_to_num(dn, nan=-1.0)
+        dn = np.nan_to_num(dn, nan=1.0, posinf=1.0, neginf=1.0)
+        dn = dn * 2.0 - 1.0
         t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         frames.append(t)
 
@@ -691,13 +700,18 @@ def main(args: argparse.Namespace) -> None:
             masked_rgb_tchw = rgb_tchw * mask_tchw
 
         # Encode 3 or 4 sequences in a single batched call: (N,3,T,H,W)
-        # Match Diff-Factory: depth/mask in [0,1], masked_rgb in [-1,1], normal already in [-1,1].
+        # Match md semantics:
+        # - depth already in [-1,1]
+        # - normal in [-1,1]
+        # - masked_rgb in [0,1] then normalized by _to_vae_input(..., normalize=True)
+        # - mask is binary [0,1], expanded to 3 channels before VAE encode
+        mask_3ch_tchw = mask_tchw.repeat(1, 3, 1, 1)
         if normal_tchw is not None:
             video_n = torch.cat([
                 _to_vae_input(depth_tchw, normalize=False),
                 _to_vae_input(normal_tchw, normalize=False),
                 _to_vae_input(masked_rgb_tchw, normalize=True),
-                _to_vae_input(mask_tchw, normalize=False),
+                _to_vae_input(mask_3ch_tchw, normalize=False),
             ],
                                 dim=0).to(device=device, dtype=torch.float32)
             lat_n = _encode_video_latents(vae, video_n,
@@ -711,7 +725,7 @@ def main(args: argparse.Namespace) -> None:
             video_n = torch.cat([
                 _to_vae_input(depth_tchw, normalize=False),
                 _to_vae_input(masked_rgb_tchw, normalize=True),
-                _to_vae_input(mask_tchw, normalize=False),
+                _to_vae_input(mask_3ch_tchw, normalize=False),
             ],
                                 dim=0).to(device=device, dtype=torch.float32)
             lat_n = _encode_video_latents(vae, video_n,
