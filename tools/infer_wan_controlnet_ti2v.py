@@ -422,11 +422,15 @@ def _load_mask_frame(path: Path,
                                        resample=Image.NEAREST))
     denom = 1.0 if int(arr_u8.max()) <= 1 else 255.0
     arr = arr_u8.astype(np.float32) / float(denom)
-    if threshold is not None:
-        arr = (arr > float(threshold)).astype(np.float32)
+    # Match md process_mask:
+    # - default binary threshold: > 0
+    # - optional explicit threshold override if provided
+    thr = 0.0 if threshold is None else float(threshold)
+    arr = (arr > thr).astype(np.float32)
     if invert:
         arr = 1.0 - arr
-    return torch.from_numpy(arr)[None, ...].repeat(3, 1, 1).contiguous()
+    # Return 1xHxW to match md `process_mask`; caller can repeat to 3 channels if needed.
+    return torch.from_numpy(arr)[None, ...].contiguous()
 
 
 def _read_depth_any(path: Path) -> np.ndarray:
@@ -475,21 +479,7 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
     n = _read_normal_any(path)
     if n.ndim != 3 or n.shape[2] < 3:
         raise ValueError(f"Invalid normal shape from {path}: {tuple(n.shape)}")
-
-    finite = np.isfinite(n)
-    if not finite.any():
-        n = np.zeros_like(n, dtype=np.float32)
-    else:
-        vmin = float(np.nanmin(n))
-        vmax = float(np.nanmax(n))
-        if vmin >= -1.05 and vmax <= 1.05 and (vmin < -0.05 or vmax > 1.05):
-            n = (n + 1.0) * 0.5
-        elif vmin < -0.05:
-            n = (n + 1.0) * 0.5
-        elif vmax > 1.5:
-            n = n / (65535.0 if vmax > 255.0 else 255.0)
-    n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
-    n = np.clip(n[..., :3], 0.0, 1.0)
+    n = n[..., :3].astype(np.float32)
 
     h0, w0 = n.shape[:2]
     target_ratio = float(width) / float(height)
@@ -508,7 +498,14 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
                                         size=(int(height), int(width)),
                                         mode="bilinear",
                                         align_corners=False)
-    return t[0]
+    t = t[0]
+    # Match md process_normal:
+    # [0,255] -> [-1,1], then OpenCV->OpenGL style coordinate flip (y,z).
+    if float(t.max().item()) > 1.5:
+        t = t / 127.5 - 1.0
+    t[1] = -t[1]
+    t[2] = -t[2]
+    return t
 
 
 def _load_depth_sequence(
@@ -524,6 +521,8 @@ def _load_depth_sequence(
     depths: list[np.ndarray] = []
     for p in depth_paths:
         d = _read_depth_any(p)
+        if np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
+            d = d / 65535.0
         h0, w0 = d.shape
         current_ratio = float(w0) / float(h0)
         if current_ratio > target_ratio:
@@ -537,26 +536,21 @@ def _load_depth_sequence(
         d = np.array(
             Image.fromarray(d).resize((int(width), int(height)),
                                       resample=Image.NEAREST)).astype(np.float32)
-        mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
-        if mx > 1000.0:
-            d = d / 1000.0
-        elif mx > 100.0:
-            d = d / 100.0
-        valid = np.isfinite(d) & (d > 1e-6)
+        near_mask = d < 0.0015
+        far_mask = d > (65500.0 / 65535.0)
+        valid = np.isfinite(d) & (~near_mask) & (~far_mask)
         d[~valid] = np.nan
         depths.append(d)
 
+    # Match md process_depth: global min/max (not percentile) over valid pixels.
     stacked = np.stack(depths, axis=0)
     valid_vals = stacked[np.isfinite(stacked)]
     if valid_vals.size == 0:
         lo, hi = 0.0, 1.0
     else:
-        lo = float(np.percentile(valid_vals, pmin))
-        hi = float(np.percentile(valid_vals, pmax))
+        lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
         if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
-            lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
-            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
-                lo, hi = 0.0, 1.0
+            lo, hi = 0.0, 1.0
 
     out = []
     denom = max(hi - lo, 1e-6)
@@ -565,7 +559,9 @@ def _load_depth_sequence(
         dn = np.clip(dn, 0.0, 1.0)
         if invert_depth:
             dn = 1.0 - dn
-        dn = np.nan_to_num(dn, nan=-1.0)
+        # Match md: invalid/NaN -> far(1.0), then map to [-1,1].
+        dn = np.nan_to_num(dn, nan=1.0)
+        dn = dn * 2.0 - 1.0
         t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         out.append(t)
     return torch.stack(out, dim=0)
@@ -954,6 +950,7 @@ def _load_sample_raw(
         ],
         dim=0,
     )
+    mask3_tchw = mask_tchw.repeat(1, 3, 1, 1)
     if masked_rgb_paths is not None:
         masked_rgb_tchw = torch.stack(
             [_load_rgb_frame(p, int(args.height), int(args.width))
@@ -961,12 +958,11 @@ def _load_sample_raw(
             dim=0,
         )
     else:
-        rgb_tchw = torch.stack(
-            [_load_rgb_frame(p, int(args.height), int(args.width))
-             for p in rgb_paths],
-            dim=0,
+        # Match md behavior: if masked RGB is missing, use black frames.
+        masked_rgb_tchw = torch.zeros(
+            (int(args.num_frames), 3, int(args.height), int(args.width)),
+            dtype=torch.float32,
         )
-        masked_rgb_tchw = rgb_tchw * mask_tchw
 
     normal_tchw = None
     if normal_paths is not None:
@@ -982,7 +978,7 @@ def _load_sample_raw(
                 _to_vae_input(depth_tchw, normalize=False),
                 _to_vae_input(normal_tchw, normalize=False),
                 _to_vae_input(masked_rgb_tchw, normalize=True),
-                _to_vae_input(mask_tchw, normalize=False),
+                _to_vae_input(mask3_tchw, normalize=False),
             ],
             dim=0,
         ).to(device=inference_device, dtype=compute_dtype)
@@ -999,7 +995,7 @@ def _load_sample_raw(
             [
                 _to_vae_input(depth_tchw, normalize=False),
                 _to_vae_input(masked_rgb_tchw, normalize=True),
-                _to_vae_input(mask_tchw, normalize=False),
+                _to_vae_input(mask3_tchw, normalize=False),
             ],
             dim=0,
         ).to(device=inference_device, dtype=compute_dtype)
