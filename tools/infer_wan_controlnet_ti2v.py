@@ -909,19 +909,30 @@ def _load_sample_raw(
     )
 
     compute_dtype = dtype
-    first_source = str(args.raw_first_frame_source).strip().lower()
-    if first_source == "masked_rgb" and masked_rgb_paths is not None:
-        first_rgb = _load_rgb_frame(masked_rgb_paths[0], int(args.height),
-                                    int(args.width))
-    elif first_source == "masked_rgb" and masked_rgb_paths is None:
-        logger.warning(
-            "raw_first_frame_source=masked_rgb but masked_rgb is missing; fallback to rgb."
-        )
-        first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
+    # Raw mode alignment: prefer scene-level firstframe.png as TI2V image anchor.
+    # Fallback to previous behavior only when firstframe.png is absent.
+    firstframe_path = sample_root / "firstframe.png"
+    if firstframe_path.is_file():
+        first_rgb = _load_rgb_frame(firstframe_path, int(args.height),
                                     int(args.width))
     else:
-        first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
-                                    int(args.width))
+        first_source = str(args.raw_first_frame_source).strip().lower()
+        if first_source == "masked_rgb" and masked_rgb_paths is not None:
+            first_rgb = _load_rgb_frame(masked_rgb_paths[0], int(args.height),
+                                        int(args.width))
+        elif first_source == "masked_rgb" and masked_rgb_paths is None:
+            logger.warning(
+                "firstframe.png missing and raw_first_frame_source=masked_rgb but masked_rgb is missing; fallback to rgb."
+            )
+            first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
+                                        int(args.width))
+        else:
+            logger.warning(
+                "firstframe.png not found under %s; fallback to first rgb frame.",
+                str(sample_root),
+            )
+            first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
+                                        int(args.width))
 
     first_bcthw = _to_vae_input(first_rgb[None, ...], normalize=True).to(
         device=inference_device, dtype=compute_dtype)
