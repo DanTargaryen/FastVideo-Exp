@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 
 
@@ -80,7 +81,14 @@ def _pad_or_trim(seq: list[Path], target_len: int) -> list[Path]:
     return seq + [seq[-1]] * (target_len - len(seq))
 
 
-def _link_or_copy(src: Path, dst: Path, copy_mode: bool) -> None:
+def _link_or_copy(
+    src: Path,
+    dst: Path,
+    copy_mode: bool,
+    *,
+    allow_copy_fallback: bool,
+    stats: dict[str, int],
+) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() or dst.is_symlink():
         if dst.is_dir() and not dst.is_symlink():
@@ -89,14 +97,26 @@ def _link_or_copy(src: Path, dst: Path, copy_mode: bool) -> None:
             dst.unlink()
     if copy_mode:
         shutil.copy2(src, dst)
+        stats["file_copy"] += 1
         return
     try:
         os.symlink(src, dst)
+        stats["file_link"] += 1
     except OSError:
+        if not allow_copy_fallback:
+            raise
         shutil.copy2(src, dst)
+        stats["file_copy"] += 1
 
 
-def _copy_tree_or_link(src_dir: Path, dst_dir: Path, copy_mode: bool) -> None:
+def _copy_tree_or_link(
+    src_dir: Path,
+    dst_dir: Path,
+    copy_mode: bool,
+    *,
+    allow_copy_fallback: bool,
+    stats: dict[str, int],
+) -> None:
     if not src_dir.exists():
         return
     if dst_dir.exists() or dst_dir.is_symlink():
@@ -106,11 +126,16 @@ def _copy_tree_or_link(src_dir: Path, dst_dir: Path, copy_mode: bool) -> None:
             dst_dir.unlink()
     if copy_mode:
         shutil.copytree(src_dir, dst_dir)
+        stats["dir_copy"] += 1
         return
     try:
         os.symlink(src_dir, dst_dir, target_is_directory=True)
+        stats["dir_link"] += 1
     except OSError:
+        if not allow_copy_fallback:
+            raise
         shutil.copytree(src_dir, dst_dir)
+        stats["dir_copy"] += 1
 
 
 def _resolve_rgb_dir(rgb_root: Path, street_split: str, street_name: str, rgb_dir: str) -> Path:
@@ -190,6 +215,11 @@ def parse_args() -> argparse.Namespace:
         help="Default: <street_name>_f<num_frames>_start<start>",
     )
     p.add_argument("--copy", action="store_true", help="Copy files instead of symlink.")
+    p.add_argument(
+        "--no_copy_fallback",
+        action="store_true",
+        help="When symlink fails, raise error instead of silently copying.",
+    )
     return p.parse_args()
 
 
@@ -206,6 +236,9 @@ def main() -> None:
     street_name = str(args.street_name)
     start = int(args.start)
     end = start + num_frames - 1
+    allow_copy_fallback = not bool(args.no_copy_fallback)
+    stats = {"file_link": 0, "file_copy": 0, "dir_link": 0, "dir_copy": 0}
+    t0 = time.perf_counter()
 
     rgb_dir = _resolve_rgb_dir(rgb_root, street_split, street_name, str(args.rgb_dir))
     depth_dir = _resolve_depth_dir(depth_root, street_split, street_name, str(args.depth_dir))
@@ -221,6 +254,10 @@ def main() -> None:
     rgb_files = _sorted_files(rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
     depth_files = _sorted_files(depth_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
     normal_files = _sorted_files(normal_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
+    print(
+        f"[scan] rgb={len(rgb_files)} depth={len(depth_files)} normal={len(normal_files)} "
+        f"(elapsed={time.perf_counter() - t0:.2f}s)"
+    )
     if not rgb_files:
         raise RuntimeError(f"No RGB frames under: {rgb_dir}")
     if not depth_files:
@@ -252,22 +289,54 @@ def main() -> None:
     out_dir = out_root / out_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    t_write = time.perf_counter()
     for i, src in enumerate(rgb_sel):
-        _link_or_copy(src, out_dir / "rgb" / f"{i:06d}{src.suffix.lower()}", bool(args.copy))
+        _link_or_copy(
+            src,
+            out_dir / "rgb" / f"{i:06d}{src.suffix.lower()}",
+            bool(args.copy),
+            allow_copy_fallback=allow_copy_fallback,
+            stats=stats,
+        )
     for i, src in enumerate(depth_sel):
-        _link_or_copy(src, out_dir / "depth" / f"{i:06d}{src.suffix.lower()}", bool(args.copy))
+        _link_or_copy(
+            src,
+            out_dir / "depth" / f"{i:06d}{src.suffix.lower()}",
+            bool(args.copy),
+            allow_copy_fallback=allow_copy_fallback,
+            stats=stats,
+        )
     for i, src in enumerate(normal_sel):
-        _link_or_copy(src, out_dir / "normal" / f"{i:06d}{src.suffix.lower()}", bool(args.copy))
+        _link_or_copy(
+            src,
+            out_dir / "normal" / f"{i:06d}{src.suffix.lower()}",
+            bool(args.copy),
+            allow_copy_fallback=allow_copy_fallback,
+            stats=stats,
+        )
+    print(f"[write-frames] elapsed={time.perf_counter() - t_write:.2f}s")
 
     meta_scene_dir = Path(os.path.expanduser(os.path.expandvars(args.meta_scene_dir))) if str(args.meta_scene_dir).strip() else None
     if meta_scene_dir is not None and meta_scene_dir.exists():
         camera_dir = meta_scene_dir / "camera"
         if camera_dir.is_dir():
-            _copy_tree_or_link(camera_dir, out_dir / "camera", bool(args.copy))
+            _copy_tree_or_link(
+                camera_dir,
+                out_dir / "camera",
+                bool(args.copy),
+                allow_copy_fallback=allow_copy_fallback,
+                stats=stats,
+            )
 
         video_dir = meta_scene_dir / "video"
         if video_dir.is_dir():
-            _copy_tree_or_link(video_dir, out_dir / "video", bool(args.copy))
+            _copy_tree_or_link(
+                video_dir,
+                out_dir / "video",
+                bool(args.copy),
+                allow_copy_fallback=allow_copy_fallback,
+                stats=stats,
+            )
         else:
             video_file = _first_existing_file(
                 [
@@ -278,11 +347,23 @@ def main() -> None:
                 ]
             )
             if video_file is not None:
-                _link_or_copy(video_file, out_dir / video_file.name, bool(args.copy))
+                _link_or_copy(
+                    video_file,
+                    out_dir / video_file.name,
+                    bool(args.copy),
+                    allow_copy_fallback=allow_copy_fallback,
+                    stats=stats,
+                )
 
         text_file = _first_existing_file([meta_scene_dir / "text.txt", meta_scene_dir / "caption.txt"])
         if text_file is not None:
-            _link_or_copy(text_file, out_dir / "text.txt", bool(args.copy))
+            _link_or_copy(
+                text_file,
+                out_dir / "text.txt",
+                bool(args.copy),
+                allow_copy_fallback=allow_copy_fallback,
+                stats=stats,
+            )
 
     def _src_ids(paths: list[Path]) -> list[int | None]:
         return [_frame_index_from_stem(p.stem) for p in paths]
@@ -310,6 +391,12 @@ def main() -> None:
     print("OK")
     print(f"output_dir: {out_dir}")
     print(f"rgb_count: {len(rgb_sel)} depth_count: {len(depth_sel)} normal_count: {len(normal_sel)}")
+    print(
+        "link/copy stats:",
+        f"file_link={stats['file_link']}, file_copy={stats['file_copy']}, "
+        f"dir_link={stats['dir_link']}, dir_copy={stats['dir_copy']}",
+    )
+    print(f"total_elapsed={time.perf_counter() - t0:.2f}s")
     print("saved meta:", out_dir / "sample_meta.json")
 
 

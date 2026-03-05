@@ -33,6 +33,7 @@ from fastvideo.profiler import profile_region
 logger = init_logger(__name__)
 
 vsa_available = is_vsa_available()
+sync_list_verbose_log = bool(int(os.getenv("FASTVIDEO_SYNC_LIST_LOG", "0")))
 
 
 def _compute_negative_prompt_embeddings(
@@ -175,13 +176,14 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int,
                                device: torch.device) -> list[int]:
         """Generate and synchronize random exit flags across distributed processes."""
-        logger.info(
-            "RANK: %s, enter generate_and_sync_list blocks=%s steps=%s device=%s",
-            self.global_rank,
-            num_blocks,
-            num_denoising_steps,
-            str(device),
-            local_main_process_only=False)
+        if sync_list_verbose_log:
+            logger.info(
+                "RANK: %s, enter generate_and_sync_list blocks=%s steps=%s device=%s",
+                self.global_rank,
+                num_blocks,
+                num_denoising_steps,
+                str(device),
+                local_main_process_only=False)
         rank = dist.get_rank() if dist.is_initialized() else 0
 
         if rank == 0:
@@ -199,12 +201,13 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             dist.broadcast(indices,
                            src=0)  # Broadcast the random indices to all ranks
         flags = indices.tolist()
-        logger.info(
-            "RANK: %s, exit generate_and_sync_list flags_len=%s first=%s",
-            self.global_rank,
-            len(flags),
-            flags[0] if len(flags) > 0 else None,
-            local_main_process_only=False)
+        if sync_list_verbose_log:
+            logger.info(
+                "RANK: %s, exit generate_and_sync_list flags_len=%s first=%s",
+                self.global_rank,
+                len(flags),
+                flags[0] if len(flags) > 0 else None,
+                local_main_process_only=False)
         return flags
 
     def generator_loss(
