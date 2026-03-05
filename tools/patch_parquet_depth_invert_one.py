@@ -55,16 +55,16 @@ def _locate_row(data_path: str, index: int) -> tuple[str, int]:
 
 def _np_dtype(dtype_str: str | None) -> np.dtype:
     if dtype_str is None or dtype_str == "":
-        return np.float32
+        return np.dtype(np.float32)
     s = dtype_str.lower()
     if s in ("float", "float32", "fp32"):
-        return np.float32
+        return np.dtype(np.float32)
     if s in ("float16", "fp16"):
-        return np.float16
+        return np.dtype(np.float16)
     if s in ("int64", "long"):
-        return np.int64
+        return np.dtype(np.int64)
     if s in ("int32",):
-        return np.int32
+        return np.dtype(np.int32)
     raise ValueError(f"Unsupported dtype: {dtype_str}")
 
 
