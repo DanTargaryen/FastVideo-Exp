@@ -48,6 +48,10 @@ def _build_cmd(args, sid: str, train_dir: Path, mask_dir: Path, out_dir: Path) -
         "--update_rule",
         args.update_rule,
         "--warp_denoising_step",
+        "--local_attn_size",
+        str(args.local_attn_size),
+        "--sink_size",
+        str(args.sink_size),
         "--guidance_scale",
         str(args.guidance_scale),
         "--height",
@@ -106,11 +110,15 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--local_attn_size", type=int, default=21)
+    parser.add_argument("--sink_size", type=int, default=1)
     parser.add_argument("--dmd_steps", type=str, default="1000,750,500,250")
     parser.add_argument("--update_rule", type=str, default="renoise_x0", choices=["renoise_x0", "euler_dt"])
     parser.add_argument("--cuda_visible_devices", type=str, default="7")
     parser.add_argument("--master_addr", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="29631")
+    parser.add_argument("--start_idx", type=int, default=0, help="Inclusive start scene index in sorted list.")
+    parser.add_argument("--end_idx", type=int, default=-1, help="Inclusive end scene index in sorted list. -1 means last.")
     parser.add_argument("--resume", action="store_true", help="Skip scene if mp4 already exists.")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
@@ -128,8 +136,13 @@ def main() -> None:
     scenes = sorted([p for p in train_root.iterdir() if _is_sample_dir(p)], key=lambda p: p.name)
     if not scenes:
         raise RuntimeError(f"No valid scenes found under: {train_root}")
+    start_idx = max(0, int(args.start_idx))
+    end_idx = len(scenes) - 1 if int(args.end_idx) < 0 else min(int(args.end_idx), len(scenes) - 1)
+    if start_idx > end_idx:
+        raise ValueError(f"Invalid range: start_idx={start_idx}, end_idx={end_idx}, total={len(scenes)}")
+    scenes = scenes[start_idx:end_idx + 1]
 
-    print(f"[INFO] found {len(scenes)} scenes under {train_root}")
+    print(f"[INFO] selected {len(scenes)} scenes under {train_root} (range {start_idx}..{end_idx})")
     ok = 0
     skip = 0
     fail = 0
@@ -176,4 +189,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
