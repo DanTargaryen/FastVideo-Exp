@@ -57,6 +57,10 @@ dfake_gen_update_ratio: 5
 # ---- DMD / CFG ----
 real_score_guidance_scale: 5
 training_cfg_rate: 0.0
+dmd_grad_normalizer_min: 1.0e-3
+dmd_grad_normalizer_ema_decay: 0.99
+dmd_grad_normalizer_ema_floor_ratio: 0.1
+dmd_grad_value_clip: 10.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
 dmd_denoising_steps: "1000,750,500,250"
 warp_denoising_step: true
@@ -65,12 +69,19 @@ negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles,
 # ---- Training ----
 max_train_steps: 4000
 gradient_accumulation_steps: 4
-learning_rate: 2.0e-5
+learning_rate: 2.0e-6
 weight_decay: 0.01
-betas: "0.9,0.999"
+betas: "0.0,0.999"
 mixed_precision: bf16
 max_grad_norm: 1.0
 enable_gradient_checkpointing_type: full
+fake_score_learning_rate: 4.0e-7
+fake_score_betas: "0.0,0.999"
+
+# Match Causal-Forcing Stage-3 timestep range [0.02T, 0.98T]
+min_timestep_ratio: 0.02
+max_timestep_ratio: 0.98
+
 # Enable EMA to stabilize training (adds extra memory).
 ema_decay: 0.999
 ema_start_step: 200

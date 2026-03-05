@@ -149,6 +149,15 @@ def _tensor_or_list_l2(x) -> float:
     return float(torch.linalg.vector_norm(x.float()).item())
 
 
+def _scale_control_residual(control_res, scale: float):
+    if control_res is None:
+        return None
+    s = float(scale)
+    if isinstance(control_res, (list, tuple)):
+        return [x * s for x in control_res]
+    return control_res * s
+
+
 def _append_trace_jsonl(path: str | None, record: dict) -> None:
     if path is None or str(path).strip() == "":
         return
@@ -1080,6 +1089,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     prompt_embeds_list: list[torch.Tensor],
     negative_prompt_embeds_list: list[torch.Tensor] | None,
     guidance_scale: float,
+    controlnet_weight: float,
     first_frame_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
@@ -1191,6 +1201,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
                                            num_channels_latents),
             )
+            control_res = _scale_control_residual(control_res,
+                                                  scale=controlnet_weight)
 
             noise_pred = transformer(
                 latent_model_input,
@@ -1209,6 +1221,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                     **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
                                                num_channels_latents),
                 )
+                control_res_uncond = _scale_control_residual(
+                    control_res_uncond, scale=controlnet_weight)
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -1229,7 +1243,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "step_index": int(step_i),
                 "num_steps": int(timesteps.numel()),
                 "timestep": float(t_cur.detach().float().cpu().item()),
-                "control_scale": 1.0,
+                "control_scale": float(controlnet_weight),
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
                 "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond if float(guidance_scale) != 1.0 else None)),
@@ -1356,6 +1370,13 @@ def main() -> None:
         choices=["causal", "bidirectional"],
         help=
         "Use chunk-wise causal rollout (default) or full bidirectional rollout (no cache).",
+    )
+    parser.add_argument(
+        "--controlnet_weight",
+        type=float,
+        default=1.0,
+        help=
+        "Scale factor for ControlNet residuals in bidirectional mode only (causal mode unaffected).",
     )
     parser.add_argument(
         "--scheduler",
@@ -1830,6 +1851,7 @@ def main() -> None:
                 prompt_embeds_list=[prompt_embeds],
                 negative_prompt_embeds_list=([negative_prompt_embeds] if negative_prompt_embeds is not None else None),
                 guidance_scale=float(args.guidance_scale),
+                controlnet_weight=float(args.controlnet_weight),
                 first_frame_latent_bcfhw=first_frame_latent,
                 control_latent_bcfhw=control_latent,
                 height=args.height,

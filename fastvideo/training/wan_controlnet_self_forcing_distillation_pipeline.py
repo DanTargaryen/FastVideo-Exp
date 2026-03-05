@@ -434,14 +434,39 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 pred_real_video_cond -
                 pred_real_video_uncond) * self.real_score_guidance_scale
 
-            # Stabilize DMD normalization when student is close to teacher;
-            # tiny denominator here can cause early training collapse.
-            grad_normalizer = torch.abs(original_latent -
-                                        real_score_pred_video).mean()
-            grad_normalizer = grad_normalizer.clamp_min(1e-5)
+            # Stabilize DMD normalization when student is close to teacher.
+            # Use raw normalizer with EMA-based floor to prevent tiny early-step
+            # denominators from amplifying updates.
+            grad_normalizer_raw = torch.abs(original_latent -
+                                            real_score_pred_video).mean()
+            ema_decay = float(
+                getattr(self.training_args, "dmd_grad_normalizer_ema_decay",
+                        0.99))
+            ema_floor_ratio = float(
+                getattr(self.training_args,
+                        "dmd_grad_normalizer_ema_floor_ratio", 0.1))
+            normalizer_min = float(
+                getattr(self.training_args, "dmd_grad_normalizer_min", 1e-3))
+
+            prev_ema = getattr(self, "_dmd_grad_norm_ema", None)
+            if prev_ema is None:
+                grad_normalizer_ema = grad_normalizer_raw.detach()
+            else:
+                grad_normalizer_ema = prev_ema * ema_decay + grad_normalizer_raw.detach(
+                ) * (1.0 - ema_decay)
+            self._dmd_grad_norm_ema = grad_normalizer_ema
+
+            grad_normalizer = torch.maximum(
+                grad_normalizer_raw,
+                grad_normalizer_ema * ema_floor_ratio,
+            ).clamp_min(normalizer_min)
             grad = (faker_score_pred_video -
                     real_score_pred_video) / grad_normalizer
-            grad = torch.nan_to_num(grad)
+            grad_clip = float(
+                getattr(self.training_args, "dmd_grad_value_clip", 10.0))
+            if grad_clip > 0:
+                grad = grad.clamp(min=-grad_clip, max=grad_clip)
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
         dmd_loss = 0.5 * F.mse_loss(original_latent.float(),
                                     (original_latent.float() -
@@ -454,6 +479,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "faker_score_pred_video": faker_score_pred_video.detach(),
             "dmd_timestep": timestep.detach(),
             "dmd_grad_normalizer": grad_normalizer.detach(),
+            "dmd_grad_normalizer_raw": grad_normalizer_raw.detach(),
+            "dmd_grad_normalizer_ema": grad_normalizer_ema.detach(),
         })
         return dmd_loss
 

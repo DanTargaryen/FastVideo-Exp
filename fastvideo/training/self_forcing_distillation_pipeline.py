@@ -1343,6 +1343,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     if "dmd_grad_normalizer" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_grad_normalizer"] = training_batch.dmd_latent_vis_dict[
                             "dmd_grad_normalizer"].item()
+                    if "dmd_grad_normalizer_raw" in training_batch.dmd_latent_vis_dict:
+                        log_data["dmd_grad_normalizer_raw"] = training_batch.dmd_latent_vis_dict[
+                            "dmd_grad_normalizer_raw"].item()
+                    if "dmd_grad_normalizer_ema" in training_batch.dmd_latent_vis_dict:
+                        log_data["dmd_grad_normalizer_ema"] = training_batch.dmd_latent_vis_dict[
+                            "dmd_grad_normalizer_ema"].item()
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":

@@ -822,6 +822,11 @@ class TrainingArgs(FastVideoArgs):
     min_timestep_ratio: float = 0.2
     max_timestep_ratio: float = 0.98
     real_score_guidance_scale: float = 3.5
+    # DMD gradient stabilization
+    dmd_grad_normalizer_min: float = 1e-3
+    dmd_grad_normalizer_ema_decay: float = 0.99
+    dmd_grad_normalizer_ema_floor_ratio: float = 0.1
+    dmd_grad_value_clip: float = 10.0
     fake_score_learning_rate: float = 0.0  # separate learning rate for fake_score_transformer, if 0.0, use learning_rate
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
     fake_score_betas: str = "0.9,0.999"  # betas for fake score optimizer, format: "beta1,beta2"
@@ -1258,6 +1263,26 @@ class TrainingArgs(FastVideoArgs):
                             type=float,
                             default=TrainingArgs.real_score_guidance_scale,
                             help="Teacher guidance scale")
+        parser.add_argument(
+            "--dmd-grad-normalizer-min",
+            type=float,
+            default=TrainingArgs.dmd_grad_normalizer_min,
+            help="Lower bound for DMD gradient normalizer to avoid tiny denominators.")
+        parser.add_argument(
+            "--dmd-grad-normalizer-ema-decay",
+            type=float,
+            default=TrainingArgs.dmd_grad_normalizer_ema_decay,
+            help="EMA decay for DMD normalizer floor tracking.")
+        parser.add_argument(
+            "--dmd-grad-normalizer-ema-floor-ratio",
+            type=float,
+            default=TrainingArgs.dmd_grad_normalizer_ema_floor_ratio,
+            help="Use max(raw_normalizer, ema*ratio) before min clamp.")
+        parser.add_argument(
+            "--dmd-grad-value-clip",
+            type=float,
+            default=TrainingArgs.dmd_grad_value_clip,
+            help="Elementwise clip value for DMD target gradient (<=0 disables).")
         parser.add_argument("--fake-score-learning-rate",
                             type=float,
                             default=TrainingArgs.fake_score_learning_rate,
