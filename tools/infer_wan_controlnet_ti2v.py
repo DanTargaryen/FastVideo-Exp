@@ -50,13 +50,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import imageio.v2 as imageio
 import numpy as np
 import pyarrow.parquet as pq
 import torch
 from diffusers import UniPCMultistepScheduler as DiffusersUniPCMultistepScheduler
+from PIL import Image
 
 from fastvideo.distributed import maybe_init_distributed_environment_and_model_parallel
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -344,6 +347,304 @@ def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _frame_index_from_stem(stem: str) -> int | None:
+    if stem.isdigit():
+        return int(stem)
+    m = re.search(r"(\d+)$", stem)
+    if m is None:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _sorted_files(dir_path: Path, exts: tuple[str, ...]) -> list[Path]:
+    files = [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    if files:
+        parsed = [(_frame_index_from_stem(p.stem), p) for p in files]
+        if all(idx is not None for idx, _ in parsed):
+            return [p for _, p in sorted(parsed, key=lambda x: (int(x[0]), x[1].name))]
+    return sorted(files, key=lambda p: p.name)
+
+
+def _pad_or_trim_paths(paths: list[Path], target_len: int) -> list[Path]:
+    if target_len <= 0:
+        raise ValueError("target_len must be > 0")
+    if not paths:
+        raise ValueError("input path list is empty")
+    if len(paths) >= target_len:
+        return paths[:target_len]
+    return paths + [paths[-1]] * (target_len - len(paths))
+
+
+def _resize_for_crop_pil(img: Image.Image, crop_h: int, crop_w: int) -> Image.Image:
+    img_w, img_h = img.size
+    if (img_h >= crop_h and img_w >= crop_w) or (img_h <= crop_h and img_w <= crop_w):
+        coef = max(crop_h / img_h, crop_w / img_w)
+    else:
+        coef = crop_h / img_h if crop_h > img_h else crop_w / img_w
+    out_h, out_w = int(img_h * coef), int(img_w * coef)
+    img = img.resize((out_w, out_h), resample=Image.BICUBIC)
+    left = max(0, (out_w - crop_w) // 2)
+    top = max(0, (out_h - crop_h) // 2)
+    return img.crop((left, top, left + crop_w, top + crop_h))
+
+
+def _load_rgb_frame(path: Path, height: int, width: int) -> torch.Tensor:
+    img = Image.open(path).convert("RGB")
+    img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _load_mask_frame(path: Path,
+                     height: int,
+                     width: int,
+                     *,
+                     threshold: float | None,
+                     invert: bool = False) -> torch.Tensor:
+    img = Image.open(path).convert("L")
+    arr_u8 = np.asarray(img).astype(np.uint8)
+    h0, w0 = arr_u8.shape[:2]
+    target_ratio = float(width) / float(height)
+    current_ratio = float(w0) / float(h0)
+    if current_ratio > target_ratio:
+        new_w = int(h0 * target_ratio)
+        left = max(0, (w0 - new_w) // 2)
+        arr_u8 = arr_u8[:, left:left + new_w]
+    else:
+        new_h = int(w0 / target_ratio)
+        top = max(0, (h0 - new_h) // 2)
+        arr_u8 = arr_u8[top:top + new_h, :]
+    arr_u8 = np.array(
+        Image.fromarray(arr_u8).resize((int(width), int(height)),
+                                       resample=Image.NEAREST))
+    denom = 1.0 if int(arr_u8.max()) <= 1 else 255.0
+    arr = arr_u8.astype(np.float32) / float(denom)
+    if threshold is not None:
+        arr = (arr > float(threshold)).astype(np.float32)
+    if invert:
+        arr = 1.0 - arr
+    return torch.from_numpy(arr)[None, ...].repeat(3, 1, 1).contiguous()
+
+
+def _read_depth_any(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".exr":
+        try:
+            import cv2
+
+            arr = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if arr is None:
+                raise FileNotFoundError(path)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            return arr.astype(np.float32)
+        except Exception:
+            pass
+    arr = imageio.imread(path)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32)
+
+
+def _read_normal_any(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".exr":
+        try:
+            import cv2
+
+            arr = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if arr is None:
+                raise FileNotFoundError(path)
+            if arr.ndim == 3 and arr.shape[2] >= 3:
+                arr = arr[..., :3][..., ::-1]
+            elif arr.ndim == 2:
+                arr = np.repeat(arr[..., None], 3, axis=2)
+            return arr.astype(np.float32)
+        except Exception:
+            pass
+    arr = imageio.imread(path)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    elif arr.ndim == 3 and arr.shape[2] > 3:
+        arr = arr[..., :3]
+    return arr.astype(np.float32)
+
+
+def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
+    n = _read_normal_any(path)
+    if n.ndim != 3 or n.shape[2] < 3:
+        raise ValueError(f"Invalid normal shape from {path}: {tuple(n.shape)}")
+
+    finite = np.isfinite(n)
+    if not finite.any():
+        n = np.zeros_like(n, dtype=np.float32)
+    else:
+        vmin = float(np.nanmin(n))
+        vmax = float(np.nanmax(n))
+        if vmin >= -1.05 and vmax <= 1.05 and (vmin < -0.05 or vmax > 1.05):
+            n = (n + 1.0) * 0.5
+        elif vmin < -0.05:
+            n = (n + 1.0) * 0.5
+        elif vmax > 1.5:
+            n = n / (65535.0 if vmax > 255.0 else 255.0)
+    n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
+    n = np.clip(n[..., :3], 0.0, 1.0)
+
+    h0, w0 = n.shape[:2]
+    target_ratio = float(width) / float(height)
+    current_ratio = float(w0) / float(h0)
+    if current_ratio > target_ratio:
+        new_w = int(h0 * target_ratio)
+        left = max(0, (w0 - new_w) // 2)
+        n = n[:, left:left + new_w, :]
+    else:
+        new_h = int(w0 / target_ratio)
+        top = max(0, (h0 - new_h) // 2)
+        n = n[top:top + new_h, :, :]
+
+    t = torch.from_numpy(n).permute(2, 0, 1).contiguous().unsqueeze(0)
+    t = torch.nn.functional.interpolate(t,
+                                        size=(int(height), int(width)),
+                                        mode="bilinear",
+                                        align_corners=False)
+    return t[0]
+
+
+def _load_depth_sequence(
+    depth_paths: list[Path],
+    height: int,
+    width: int,
+    *,
+    pmin: float,
+    pmax: float,
+    invert_depth: bool,
+) -> torch.Tensor:
+    target_ratio = float(width) / float(height)
+    depths: list[np.ndarray] = []
+    for p in depth_paths:
+        d = _read_depth_any(p)
+        h0, w0 = d.shape
+        current_ratio = float(w0) / float(h0)
+        if current_ratio > target_ratio:
+            new_w = int(h0 * target_ratio)
+            left = max(0, (w0 - new_w) // 2)
+            d = d[:, left:left + new_w]
+        else:
+            new_h = int(w0 / target_ratio)
+            top = max(0, (h0 - new_h) // 2)
+            d = d[top:top + new_h, :]
+        d = np.array(
+            Image.fromarray(d).resize((int(width), int(height)),
+                                      resample=Image.NEAREST)).astype(np.float32)
+        mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+        if mx > 1000.0:
+            d = d / 1000.0
+        elif mx > 100.0:
+            d = d / 100.0
+        valid = np.isfinite(d) & (d > 1e-6)
+        d[~valid] = np.nan
+        depths.append(d)
+
+    stacked = np.stack(depths, axis=0)
+    valid_vals = stacked[np.isfinite(stacked)]
+    if valid_vals.size == 0:
+        lo, hi = 0.0, 1.0
+    else:
+        lo = float(np.percentile(valid_vals, pmin))
+        hi = float(np.percentile(valid_vals, pmax))
+        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+            lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
+            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                lo, hi = 0.0, 1.0
+
+    out = []
+    denom = max(hi - lo, 1e-6)
+    for d in depths:
+        dn = (d - lo) / denom
+        dn = np.clip(dn, 0.0, 1.0)
+        if invert_depth:
+            dn = 1.0 - dn
+        dn = np.nan_to_num(dn, nan=-1.0)
+        t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
+        out.append(t)
+    return torch.stack(out, dim=0)
+
+
+def _to_vae_input(video_tchw: torch.Tensor, *, normalize: bool) -> torch.Tensor:
+    x = video_tchw.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+    if normalize:
+        x = x * 2.0 - 1.0
+    return x
+
+
+def _postprocess_vae_latents(vae, latents: torch.Tensor) -> torch.Tensor:
+    if hasattr(vae, "shift_factor") and vae.shift_factor is not None:
+        shift = vae.shift_factor
+        if isinstance(shift, torch.Tensor):
+            shift = shift.to(latents.device, latents.dtype)
+        latents = latents - shift
+    scale = getattr(vae, "scaling_factor", None)
+    if scale is not None:
+        if isinstance(scale, torch.Tensor):
+            scale = scale.to(latents.device, latents.dtype)
+        latents = latents * scale
+    return latents
+
+
+@torch.no_grad()
+def _encode_video_latents(vae,
+                          video_bcthw: torch.Tensor,
+                          *,
+                          sample_mode: str,
+                          compute_dtype: torch.dtype = torch.float32
+                          ) -> torch.Tensor:
+    use_autocast = bool(torch.cuda.is_available() and video_bcthw.is_cuda
+                        and compute_dtype != torch.float32)
+    with torch.autocast(device_type="cuda",
+                        dtype=compute_dtype,
+                        enabled=use_autocast):
+        out = vae.encode(video_bcthw)
+    if sample_mode == "mode":
+        latents = out.mode()
+    elif sample_mode == "sample":
+        latents = out.sample()
+    else:
+        raise ValueError(f"Unsupported sample_mode: {sample_mode}")
+    return _postprocess_vae_latents(vae, latents)
+
+
+def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
+    if lat.ndim != 4:
+        raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
+    c = int(lat.shape[0])
+    target_c = int(target_c)
+    if c == target_c:
+        return lat
+    if c < target_c and target_c % c == 0:
+        k = target_c // c
+        logger.warning(
+            "%s channel mismatch: got C=%d, target C=%d; repeating channels by x%d",
+            name,
+            c,
+            target_c,
+            k,
+        )
+        return lat.repeat(k, 1, 1, 1)
+    if c > target_c and c % target_c == 0:
+        logger.warning(
+            "%s channel mismatch: got C=%d, target C=%d; truncating to first %d channels",
+            name,
+            c,
+            target_c,
+            target_c,
+        )
+        return lat[:target_c]
+    raise ValueError(
+        f"{name} channel mismatch: got C={c}, target C={target_c}, cannot auto-align"
+    )
+
+
 def _build_rollout_timesteps(
     *,
     scheduler: FlowMatchEulerDiscreteScheduler,
@@ -479,6 +780,260 @@ def _load_sample(data_path: str, index: int) -> Sample:
                   text_embedding_bld=text_embedding,
                   first_frame_latent_bcfhw=first_frame_latent,
                   control_latent_bcfhw=control_latent)
+
+
+def _read_caption_json(path: Path, caption_key: str) -> str:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(obj, dict) and "captions" in obj and isinstance(obj["captions"], dict):
+        caps = obj["captions"]
+    else:
+        caps = obj
+
+    if caption_key:
+        v = caps.get(caption_key, "")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    for k in ("Video_Caption", "Short_Caption", "PC_Caption", "caption", "text", "prompt", "description"):
+        v = caps.get(k, "")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _resolve_raw_sample_roots(raw_root: str) -> list[Path]:
+    root = Path(str(raw_root)).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"raw_root does not exist: {root}")
+    if (root / "rgb").is_dir():
+        return [root]
+    sample_roots = []
+    for p in sorted(root.iterdir(), key=lambda x: x.name):
+        if p.is_dir() and (p / "rgb").is_dir():
+            sample_roots.append(p)
+    if not sample_roots:
+        raise FileNotFoundError(
+            f"No raw samples found under {root}. Expected either <root>/rgb or <root>/*/rgb"
+        )
+    return sample_roots
+
+
+def _load_sample_raw(
+    *,
+    sample_root: Path,
+    sample_index: int,
+    args,
+    transformer,
+    vae,
+    tokenizer,
+    text_encoder,
+    inference_device: torch.device,
+    dtype: torch.dtype,
+) -> Sample:
+    rgb_dir = Path(str(args.raw_rgb_dir)).expanduser() if str(
+        args.raw_rgb_dir).strip() else (sample_root / "rgb")
+    depth_dir = Path(str(args.raw_depth_dir)).expanduser() if str(
+        args.raw_depth_dir).strip() else (sample_root / "depth")
+    normal_dir = Path(str(args.raw_normal_dir)).expanduser() if str(
+        args.raw_normal_dir).strip() else (sample_root / "normal")
+    mask_dir = Path(str(args.raw_mask_dir)).expanduser() if str(
+        args.raw_mask_dir).strip() else (sample_root / "mask")
+    masked_rgb_dir = Path(str(args.raw_masked_rgb_dir)).expanduser() if str(
+        args.raw_masked_rgb_dir).strip() else (sample_root / "masked_rgb")
+
+    if not rgb_dir.is_dir():
+        raise FileNotFoundError(f"raw rgb dir not found: {rgb_dir}")
+    if not depth_dir.is_dir():
+        raise FileNotFoundError(f"raw depth dir not found: {depth_dir}")
+    if not mask_dir.is_dir():
+        raise FileNotFoundError(f"raw mask dir not found: {mask_dir}")
+
+    rgb_paths = _pad_or_trim_paths(
+        _sorted_files(rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp")),
+        int(args.num_frames),
+    )
+    depth_paths = _pad_or_trim_paths(
+        _sorted_files(depth_dir,
+                      (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")),
+        int(args.num_frames),
+    )
+    mask_paths = _pad_or_trim_paths(
+        _sorted_files(mask_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp")),
+        int(args.num_frames),
+    )
+    normal_paths: list[Path] | None = None
+    if normal_dir.is_dir():
+        nfiles = _sorted_files(normal_dir,
+                               (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
+        if len(nfiles) > 0:
+            normal_paths = _pad_or_trim_paths(nfiles, int(args.num_frames))
+    if bool(args.raw_require_normal) and normal_paths is None:
+        raise FileNotFoundError(
+            f"--raw_require_normal is set but normal dir is missing/empty: {normal_dir}"
+        )
+
+    masked_rgb_paths: list[Path] | None = None
+    if masked_rgb_dir.is_dir():
+        mfiles = _sorted_files(masked_rgb_dir,
+                               (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+        if len(mfiles) > 0:
+            masked_rgb_paths = _pad_or_trim_paths(mfiles, int(args.num_frames))
+
+    prompt = str(args.raw_prompt or "").strip()
+    if not prompt:
+        caption_path = Path(str(args.raw_caption_path)).expanduser(
+        ) if str(args.raw_caption_path).strip() else None
+        if caption_path is not None and caption_path.exists():
+            if caption_path.suffix.lower() == ".json":
+                prompt = _read_caption_json(caption_path,
+                                            str(args.raw_caption_key))
+            else:
+                prompt = caption_path.read_text(encoding="utf-8").strip()
+        else:
+            text_txt = sample_root / "text.txt"
+            if text_txt.is_file():
+                prompt = text_txt.read_text(encoding="utf-8").strip()
+            else:
+                cap_jsons = sorted(sample_root.glob("caption*.json"),
+                                   key=lambda p: p.name)
+                if cap_jsons:
+                    prompt = _read_caption_json(cap_jsons[-1],
+                                                str(args.raw_caption_key))
+    if not prompt:
+        prompt = "A driving scene in city street."
+
+    max_text_len = int(getattr(transformer, "text_len", 226))
+    text_embedding = _compute_prompt_embeddings(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        prompt=prompt,
+        max_sequence_length=max_text_len,
+        dtype=dtype,
+        target_device=inference_device,
+    )
+
+    compute_dtype = dtype
+    first_source = str(args.raw_first_frame_source).strip().lower()
+    if first_source == "masked_rgb" and masked_rgb_paths is not None:
+        first_rgb = _load_rgb_frame(masked_rgb_paths[0], int(args.height),
+                                    int(args.width))
+    elif first_source == "masked_rgb" and masked_rgb_paths is None:
+        logger.warning(
+            "raw_first_frame_source=masked_rgb but masked_rgb is missing; fallback to rgb."
+        )
+        first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
+                                    int(args.width))
+    else:
+        first_rgb = _load_rgb_frame(rgb_paths[0], int(args.height),
+                                    int(args.width))
+
+    first_bcthw = _to_vae_input(first_rgb[None, ...], normalize=True).to(
+        device=inference_device, dtype=compute_dtype)
+    first_lat = _encode_video_latents(
+        vae, first_bcthw, sample_mode="mode",
+        compute_dtype=compute_dtype)  # [1,C,1,H,W]
+
+    depth_tchw = _load_depth_sequence(
+        depth_paths,
+        int(args.height),
+        int(args.width),
+        pmin=float(args.raw_depth_percentile_min),
+        pmax=float(args.raw_depth_percentile_max),
+        invert_depth=bool(args.raw_depth_invert),
+    )
+    mask_tchw = torch.stack(
+        [
+            _load_mask_frame(
+                p,
+                int(args.height),
+                int(args.width),
+                threshold=None if float(args.raw_mask_threshold) < 0 else
+                float(args.raw_mask_threshold),
+                invert=bool(args.raw_mask_invert),
+            ) for p in mask_paths
+        ],
+        dim=0,
+    )
+    if masked_rgb_paths is not None:
+        masked_rgb_tchw = torch.stack(
+            [_load_rgb_frame(p, int(args.height), int(args.width))
+             for p in masked_rgb_paths],
+            dim=0,
+        )
+    else:
+        rgb_tchw = torch.stack(
+            [_load_rgb_frame(p, int(args.height), int(args.width))
+             for p in rgb_paths],
+            dim=0,
+        )
+        masked_rgb_tchw = rgb_tchw * mask_tchw
+
+    normal_tchw = None
+    if normal_paths is not None:
+        normal_tchw = torch.stack(
+            [_load_normal_frame(p, int(args.height), int(args.width))
+             for p in normal_paths],
+            dim=0,
+        )
+
+    if normal_tchw is not None:
+        video_n = torch.cat(
+            [
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(normal_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask_tchw, normalize=False),
+            ],
+            dim=0,
+        ).to(device=inference_device, dtype=compute_dtype)
+        lat_n = _encode_video_latents(vae,
+                                      video_n,
+                                      sample_mode="mode",
+                                      compute_dtype=compute_dtype)
+        depth_lat = lat_n[0]
+        normal_lat = lat_n[1]
+        masked_lat = lat_n[2]
+        mask_lat = lat_n[3]
+    else:
+        video_n = torch.cat(
+            [
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask_tchw, normalize=False),
+            ],
+            dim=0,
+        ).to(device=inference_device, dtype=compute_dtype)
+        lat_n = _encode_video_latents(vae,
+                                      video_n,
+                                      sample_mode="mode",
+                                      compute_dtype=compute_dtype)
+        depth_lat = lat_n[0]
+        masked_lat = lat_n[1]
+        mask_lat = lat_n[2]
+
+    target_c = int(getattr(transformer, "num_channels_latents", first_lat.shape[1]))
+    first_lat_cf = _align_latent_channels(first_lat[0], target_c, "first_frame_lat")
+    first_lat_bcfhw = first_lat_cf.unsqueeze(0)
+
+    depth_lat = _align_latent_channels(depth_lat, target_c, "depth_lat")
+    masked_lat = _align_latent_channels(masked_lat, target_c, "masked_lat")
+    mask_lat = _align_latent_channels(mask_lat, target_c, "mask_lat")
+    if normal_tchw is not None:
+        normal_lat = _align_latent_channels(normal_lat, target_c, "normal_lat")
+        control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
+    else:
+        control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+    control_lat_bcfhw = control_lat.unsqueeze(0)
+
+    sample_id = f"{sample_root.name}_idx{sample_index:06d}"
+    return Sample(
+        sample_id=sample_id,
+        caption=prompt,
+        fps=int(args.raw_fps),
+        text_embedding_bld=text_embedding,
+        first_frame_latent_bcfhw=first_lat_bcfhw,
+        control_latent_bcfhw=control_lat_bcfhw,
+    )
 
 
 def _initialize_kv_cache(*,
@@ -1334,6 +1889,43 @@ def _compute_negative_prompt_embeddings(
     return prompt_embeds.to(dtype=dtype, device=target_device)
 
 
+def _compute_prompt_embeddings(
+    *,
+    tokenizer,
+    text_encoder,
+    prompt: str,
+    max_sequence_length: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+) -> torch.Tensor:
+    encoder_device = next(text_encoder.parameters()).device
+    text_encoder.eval()
+    with torch.no_grad():
+        tokens = tokenizer(
+            [prompt],
+            padding="max_length",
+            truncation=True,
+            max_length=max_sequence_length,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        prompt_embeds = text_encoder(
+            tokens.input_ids.to(encoder_device),
+            tokens.attention_mask.to(encoder_device),
+        ).last_hidden_state
+
+    seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())
+    seq_len = min(seq_len, prompt_embeds.shape[1])
+    prompt_embeds = prompt_embeds[:, :seq_len, :]
+    if prompt_embeds.shape[1] < max_sequence_length:
+        pad_len = max_sequence_length - prompt_embeds.shape[1]
+        pad = prompt_embeds.new_zeros((1, pad_len, prompt_embeds.shape[-1]))
+        prompt_embeds = torch.cat([prompt_embeds, pad], dim=1)
+
+    return prompt_embeds.to(dtype=dtype, device=target_device)
+
+
 def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
     import imageio
 
@@ -1346,7 +1938,54 @@ def _save_png(frame_chw: torch.Tensor, out_path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, required=True)
-    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument(
+        "--input_mode",
+        type=str,
+        default="parquet",
+        choices=["parquet", "raw"],
+        help="Input source mode: parquet dataset (default) or raw folders.",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="",
+        help=(
+            "For input_mode=parquet: parquet dataset root. "
+            "For input_mode=raw: optional raw sample root (if --raw_sample_root is not set)."
+        ),
+    )
+    parser.add_argument(
+        "--raw_sample_root",
+        type=str,
+        default="",
+        help="Raw mode root. Supports either <root>/rgb... or <root>/*/rgb...",
+    )
+    parser.add_argument("--raw_rgb_dir", type=str, default="")
+    parser.add_argument("--raw_depth_dir", type=str, default="")
+    parser.add_argument("--raw_normal_dir", type=str, default="")
+    parser.add_argument("--raw_mask_dir", type=str, default="")
+    parser.add_argument("--raw_masked_rgb_dir", type=str, default="")
+    parser.add_argument("--raw_caption_path", type=str, default="")
+    parser.add_argument("--raw_caption_key", type=str, default="Video_Caption")
+    parser.add_argument("--raw_prompt", type=str, default="")
+    parser.add_argument("--raw_fps", type=int, default=16)
+    parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
+    parser.add_argument("--raw_mask_invert", action="store_true")
+    parser.add_argument("--raw_require_normal", action="store_true")
+    parser.add_argument("--raw_depth_percentile_min", type=float, default=5.0)
+    parser.add_argument("--raw_depth_percentile_max", type=float, default=95.0)
+    raw_depth_group = parser.add_mutually_exclusive_group()
+    raw_depth_group.add_argument("--raw_depth_invert",
+                                 dest="raw_depth_invert",
+                                 action="store_true")
+    raw_depth_group.add_argument("--no_raw_depth_invert",
+                                 dest="raw_depth_invert",
+                                 action="store_false")
+    parser.set_defaults(raw_depth_invert=False)
+    parser.add_argument("--raw_first_frame_source",
+                        type=str,
+                        default="rgb",
+                        choices=["rgb", "masked_rgb"])
     parser.add_argument(
         "--transformer_dir",
         type=str,
@@ -1574,6 +2213,15 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if str(args.input_mode) == "parquet":
+        if not str(args.data_path).strip():
+            raise ValueError("--data_path is required when --input_mode parquet")
+    else:
+        if not str(args.raw_sample_root).strip() and not str(args.data_path).strip():
+            raise ValueError(
+                "For --input_mode raw, provide --raw_sample_root or --data_path"
+            )
+
     trace_jsonl_path = str(args.trace_rollout_jsonl).strip()
     if trace_jsonl_path and bool(args.trace_rollout_overwrite):
         tp = Path(trace_jsonl_path)
@@ -1722,14 +2370,19 @@ def main() -> None:
         "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
         )
     negative_prompt_embeds_global: torch.Tensor | None = None
+    tokenizer = None
+    text_encoder = None
     negative_prompt_text = str(args.negative_prompt or "").strip()
-    if negative_prompt_text and guidance_scale_value != 1.0:
+    need_text_encoder = (str(args.input_mode) == "raw") or (
+        negative_prompt_text and guidance_scale_value != 1.0)
+    if need_text_encoder:
         tokenizer = PipelineComponentLoader.load_module(
             "tokenizer", str(Path(args.base_model) / "tokenizer"), "transformers",
             fastvideo_args)
         text_encoder = PipelineComponentLoader.load_module(
             "text_encoder", str(Path(args.base_model) / "text_encoder"), "transformers",
             fastvideo_args)
+    if negative_prompt_text and guidance_scale_value != 1.0:
         max_text_len = int(getattr(transformer, "text_len", 226))
         negative_prompt_embeds_global = _compute_negative_prompt_embeddings(
             tokenizer=tokenizer,
@@ -1749,6 +2402,22 @@ def main() -> None:
         logger.warning(
             "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
         )
+    raw_sample_roots: list[Path] = []
+    if str(args.input_mode) == "raw":
+        if str(args.raw_rgb_dir).strip():
+            raw_root = str(args.raw_sample_root).strip() or str(
+                args.data_path).strip() or "."
+            raw_sample_roots = [Path(raw_root).expanduser().resolve()]
+            logger.info(
+                "raw input mode: using explicit raw_*_dir overrides (base root=%s)",
+                raw_root,
+            )
+        else:
+            raw_root = str(args.raw_sample_root).strip() or str(
+                args.data_path).strip()
+            raw_sample_roots = _resolve_raw_sample_roots(raw_root)
+            logger.info("raw input mode: found %s sample roots under %s",
+                        len(raw_sample_roots), raw_root)
     if args.scheduler == "unipc":
         if args.attention_mode == "bidirectional":
             scheduler = DiffusersUniPCMultistepScheduler.from_pretrained(
@@ -1769,7 +2438,24 @@ def main() -> None:
 
     for i in range(args.num_samples):
         sample_idx = args.index + i
-        sample = _load_sample(args.data_path, sample_idx)
+        if str(args.input_mode) == "raw":
+            if sample_idx < 0 or sample_idx >= len(raw_sample_roots):
+                raise IndexError(
+                    f"--index {sample_idx} out of range for raw samples (n={len(raw_sample_roots)})"
+                )
+            sample = _load_sample_raw(
+                sample_root=raw_sample_roots[sample_idx],
+                sample_index=sample_idx,
+                args=args,
+                transformer=transformer,
+                vae=vae,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                inference_device=inference_device,
+                dtype=dtype,
+            )
+        else:
+            sample = _load_sample(args.data_path, sample_idx)
         logger.info("sample=%s idx=%s caption=%s", sample.sample_id, sample_idx,
                     sample.caption)
 
@@ -1919,6 +2605,11 @@ def main() -> None:
             frames_dir = str(Path(args.out_dir) / "frames" / sample.sample_id)
             _save_frames_png(decoded, frames_dir, prefix=sample.sample_id)
         logger.info("saved: %s", out_path)
+
+    if tokenizer is not None:
+        del tokenizer
+    if text_encoder is not None:
+        del text_encoder
 
 
 if __name__ == "__main__":
