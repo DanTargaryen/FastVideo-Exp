@@ -2397,11 +2397,19 @@ def main() -> None:
             negative_prompt_text,
             tuple(negative_prompt_embeds_global.shape),
         )
-        del tokenizer, text_encoder
     elif guidance_scale_value != 1.0 and not negative_prompt_text:
         logger.warning(
             "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
         )
+    if str(args.input_mode) != "raw":
+        # Raw mode needs tokenizer/text_encoder to build prompt embeddings on the fly.
+        # Non-raw mode can release them immediately after negative prompt encoding.
+        if tokenizer is not None:
+            del tokenizer
+            tokenizer = None
+        if text_encoder is not None:
+            del text_encoder
+            text_encoder = None
     raw_sample_roots: list[Path] = []
     if str(args.input_mode) == "raw":
         if str(args.raw_rgb_dir).strip():
