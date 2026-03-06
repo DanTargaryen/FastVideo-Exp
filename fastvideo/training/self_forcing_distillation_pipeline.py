@@ -146,6 +146,20 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         self.kv_cache1: list[dict[str, Any]] | None = None
         self.crossattn_cache: list[dict[str, Any]] | None = None
 
+        if not self.same_step_across_blocks:
+            logger.info(
+                "Forcing same_step_across_blocks=True to align self-forcing DMD with Causal-Forcing."
+            )
+            self.same_step_across_blocks = True
+
+        if getattr(self, "boundary_timestep", None) is not None:
+            logger.info(
+                "Disabling boundary_timestep for self-forcing DMD to avoid mixed-expert updates within one train step."
+            )
+            self.boundary_timestep = None
+            self.train_transformer_2 = False
+            self.train_fake_score_transformer_2 = False
+
         neg_prompt = str(getattr(training_args, "negative_prompt", "") or "").strip()
         if neg_prompt:
             model_root = training_args.pretrained_model_name_or_path or training_args.model_path
@@ -194,14 +208,22 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 local_main_process_only=False)
         rank = dist.get_rank() if dist.is_initialized() else 0
 
+        forced_exit_index = getattr(self, "_forced_exit_index", None)
         if rank == 0:
-            # Generate random indices
-            indices = torch.randint(low=0,
-                                    high=num_denoising_steps,
-                                    size=(num_blocks, ),
-                                    device=device)
-            if self.last_step_only:
-                indices = torch.ones_like(indices) * (num_denoising_steps - 1)
+            if forced_exit_index is not None:
+                indices = torch.full((num_blocks, ),
+                                     int(forced_exit_index),
+                                     device=device,
+                                     dtype=torch.long)
+            else:
+                # Generate random indices
+                indices = torch.randint(low=0,
+                                        high=num_denoising_steps,
+                                        size=(num_blocks, ),
+                                        device=device)
+                if self.last_step_only:
+                    indices = torch.ones_like(indices) * (
+                        num_denoising_steps - 1)
         else:
             indices = torch.empty(num_blocks, dtype=torch.long, device=device)
 
@@ -217,6 +239,24 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 flags[0] if len(flags) > 0 else None,
                 local_main_process_only=False)
         return flags
+
+    def _sample_shared_exit_index(self, *, device: torch.device) -> int:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            if self.last_step_only:
+                index = torch.tensor([len(self.denoising_step_list) - 1],
+                                     dtype=torch.long,
+                                     device=device)
+            else:
+                index = torch.randint(low=0,
+                                      high=len(self.denoising_step_list),
+                                      size=(1, ),
+                                      device=device)
+        else:
+            index = torch.empty(1, dtype=torch.long, device=device)
+        if dist.is_initialized():
+            dist.broadcast(index, src=0)
+        return int(index.item())
 
     def generator_loss(
             self, training_batch: TrainingBatch
@@ -261,6 +301,11 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         log_dict: dict[str, Any] = {}
 
         return flow_matching_loss, log_dict
+
+    def _select_generator_model_for_timestep(self, timestep_value: float):
+        if self.boundary_timestep is not None and self.transformer_2 is not None and timestep_value < self.boundary_timestep:
+            return self.transformer_2
+        return self.transformer
 
     def _generator_multi_step_simulation_forward(
             self,
@@ -363,8 +408,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 training_batch_temp = self._build_distill_input_kwargs(
                     initial_latent, timestep * 0,
                     training_batch.conditional_dict, training_batch)
-                # we process the image latent with self.transformer_2 (low-noise expert)
-                current_model = self.transformer_2 if self.transformer_2 is not None else self.transformer
+                current_model = self._select_generator_model_for_timestep(0.0)
                 _ = self._simulation_model_forward_raw(
                     model=current_model,
                     training_batch_temp=training_batch_temp,
@@ -405,10 +449,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                       device=noise.device,
                                       dtype=torch.int64) * current_timestep
 
-                if self.boundary_timestep is not None and current_timestep < self.boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                else:
-                    current_model = self.transformer
+                current_model = self._select_generator_model_for_timestep(
+                    float(current_timestep))
 
                 if not exit_flag:
                     with torch.no_grad():
@@ -505,8 +547,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     denoised_pred, context_timestep,
                     training_batch.conditional_dict, training_batch)
 
-                # context_timestep is 0 so we use transformer_2
-                current_model = self.transformer_2 if self.transformer_2 is not None else self.transformer
+                current_model = self._select_generator_model_for_timestep(
+                    float(self.context_noise))
                 _ = self._simulation_model_forward_raw(
                     model=current_model,
                     training_batch_temp=training_batch_temp,
@@ -872,6 +914,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 self.optimizer_2.zero_grad()
             total_generator_loss = 0.0
             generator_log_dict = {}
+            self._forced_exit_index = self._sample_shared_exit_index(
+                device=self.device)
 
             for batch in batches:
                 # Create a new batch with detached tensors
@@ -901,10 +945,21 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     training_batch.dmd_latent_vis_dict.update(
                         batch_gen.dmd_latent_vis_dict)
 
+            generator_timestep = training_batch.dmd_latent_vis_dict.get(
+                "generator_timestep", None)
+            train_generator_expert_2 = bool(
+                self.transformer_2 is not None and self.boundary_timestep is not None
+                and generator_timestep is not None
+                and float(torch.as_tensor(generator_timestep).float().mean().item())
+                < float(self.boundary_timestep))
+            training_batch.dmd_latent_vis_dict[
+                "train_generator_expert_2"] = torch.tensor(
+                    1.0 if train_generator_expert_2 else 0.0,
+                    device=self.device)
+            del self._forced_exit_index
+
             # Only clip gradients and step optimizer for the model that is currently training
-            if hasattr(
-                    self, 'train_transformer_2'
-            ) and self.train_transformer_2 and self.transformer_2 is not None:
+            if train_generator_expert_2 and self.transformer_2 is not None:
                 self._clip_model_grad_norm_(batch_gen, self.transformer_2)
                 self.optimizer_2.step()
                 self.lr_scheduler_2.step()
@@ -914,9 +969,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 self.lr_scheduler.step()
 
             if self.generator_ema is not None:
-                if hasattr(
-                        self, 'train_transformer_2'
-                ) and self.train_transformer_2 and self.transformer_2 is not None:
+                if train_generator_expert_2 and self.transformer_2 is not None:
                     # Update EMA for transformer_2 when training it
                     if self.generator_ema_2 is not None:
                         self.generator_ema_2.update(self.transformer_2)
