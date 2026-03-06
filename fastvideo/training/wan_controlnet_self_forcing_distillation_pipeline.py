@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import math
 import sys
 from copy import deepcopy
 from typing import Any, cast
@@ -17,7 +18,10 @@ from fastvideo.training.self_forcing_distillation_pipeline import (
     SelfForcingDistillationPipeline,
 )
 from fastvideo.training.activation_checkpoint import apply_activation_checkpointing
-from fastvideo.training.training_utils import get_scheduler
+from fastvideo.training.training_utils import (
+    clip_grad_norm_while_handling_failing_dtensor_cases,
+    get_scheduler,
+)
 from fastvideo.utils import is_vsa_available
 from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
 
@@ -581,6 +585,35 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         }
         return training_batch, flow_matching_loss
 
+    def _clip_model_grad_norm_(self, training_batch, transformer):
+        max_grad_norm = self.training_args.max_grad_norm
+        if max_grad_norm is None:
+            training_batch.grad_norm = 0.0
+            return training_batch
+
+        model_parts = [transformer]
+        if transformer is self.transformer or transformer is getattr(
+                self, "transformer_2", None):
+            controlnet = getattr(self, "controlnet", None)
+            if controlnet is not None:
+                model_parts.append(controlnet)
+        elif transformer is self.fake_score_transformer or transformer is getattr(
+                self, "fake_score_transformer_2", None):
+            fake_score_controlnet = getattr(self, "fake_score_controlnet", None)
+            if fake_score_controlnet is not None:
+                model_parts.append(fake_score_controlnet)
+
+        grad_norm = clip_grad_norm_while_handling_failing_dtensor_cases(
+            [p for m in model_parts for p in m.parameters() if p.requires_grad],
+            max_grad_norm,
+            foreach=None,
+        )
+        grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+        if not math.isfinite(grad_norm):
+            raise ValueError(f"Detected non-finite gradient norm: {grad_norm}")
+        training_batch.grad_norm = grad_norm
+        return training_batch
+
     def initialize_training_pipeline(self, training_args: TrainingArgs):
         super().initialize_training_pipeline(training_args)
 
@@ -653,6 +686,28 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 min_lr_ratio=training_args.min_lr_ratio,
                 last_epoch=self.init_steps - 1,
             )
+            if self.transformer_2 is not None:
+                gen_params_2 = list(
+                    filter(lambda p: p.requires_grad,
+                           list(self.transformer_2.parameters()) +
+                           list(self.controlnet.parameters())))
+                self.optimizer_2 = torch.optim.AdamW(
+                    gen_params_2,
+                    lr=training_args.learning_rate,
+                    betas=betas,
+                    weight_decay=training_args.weight_decay,
+                    eps=1e-8,
+                )
+                self.lr_scheduler_2 = get_scheduler(
+                    training_args.lr_scheduler,
+                    optimizer=self.optimizer_2,
+                    num_warmup_steps=training_args.lr_warmup_steps,
+                    num_training_steps=training_args.max_train_steps,
+                    num_cycles=training_args.lr_num_cycles,
+                    power=training_args.lr_power,
+                    min_lr_ratio=training_args.min_lr_ratio,
+                    last_epoch=self.init_steps - 1,
+                )
 
         # Rebuild critic optimizer to include critic controlnet params
         if getattr(self, "fake_score_controlnet", None) is not None:
@@ -684,6 +739,30 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 min_lr_ratio=training_args.min_lr_ratio,
                 last_epoch=self.init_steps - 1,
             )
+            if self.fake_score_transformer_2 is not None:
+                critic_params_2 = list(
+                    filter(
+                        lambda p: p.requires_grad,
+                        list(self.fake_score_transformer_2.parameters()) +
+                        list(self.fake_score_controlnet.parameters()),
+                    ))
+                self.fake_score_optimizer_2 = torch.optim.AdamW(
+                    critic_params_2,
+                    lr=fake_score_lr,
+                    betas=betas,
+                    weight_decay=training_args.weight_decay,
+                    eps=1e-8,
+                )
+                self.fake_score_lr_scheduler_2 = get_scheduler(
+                    training_args.fake_score_lr_scheduler,
+                    optimizer=self.fake_score_optimizer_2,
+                    num_warmup_steps=training_args.lr_warmup_steps,
+                    num_training_steps=training_args.max_train_steps,
+                    num_cycles=training_args.lr_num_cycles,
+                    power=training_args.lr_power,
+                    min_lr_ratio=training_args.min_lr_ratio,
+                    last_epoch=self.init_steps - 1,
+                )
 
     def _get_next_batch(self, training_batch):
         batch = next(self.train_loader_iter, None)  # type: ignore

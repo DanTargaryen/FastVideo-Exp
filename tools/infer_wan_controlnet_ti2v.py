@@ -1705,27 +1705,65 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     if first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         first_frame_mask[:, :, 0] = 0
-        if not expand_timesteps and int(image_latents.shape[2]) == 1 and latent_t > 1:
-            # Diff-Factory non-expanded TI2V expects a full-length image-conditioning latent.
-            # Our parquet/raw path only stores the first latent frame, so approximate the
-            # original video-conditioned encode with zeros on later latent frames.
-            image_latents_full = torch.zeros(
-                (image_latents.shape[0], image_latents.shape[1], latent_t,
-                 image_latents.shape[3], image_latents.shape[4]),
-                device=device,
-                dtype=dtype,
-            )
-            image_latents_full[:, :, :1] = image_latents
-            image_latents = image_latents_full
-            logger.info(
-                "bidir alignment: expanded first_frame_latent from F=1 to F=%s with zero tail for non-expanded TI2V input.",
-                latent_t,
-            )
 
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
                          "patch_size", (2, 2))
     patch_h = int(patch_size[-2])
     patch_w = int(patch_size[-1])
+    expected_hidden_channels = int(
+        getattr(transformer, "in_channels",
+                getattr(transformer, "num_channels_latents", latents.shape[1])))
+    if _is_union_controlnet(controlnet):
+        expected_hidden_channels = int(
+            getattr(controlnet, "in_channels",
+                    expected_hidden_channels * 3) // 3)
+
+    latent_input_mode = "latents_only"
+    image_latents_concat = None
+    if not expand_timesteps and image_latents is not None:
+        latent_channels = int(latents.shape[1])
+        image_channels = int(image_latents.shape[1])
+        concat_channels = latent_channels + image_channels
+        if latent_channels == expected_hidden_channels:
+            latent_input_mode = "overwrite_first_frame"
+            logger.info(
+                "bidir alignment: using first-frame overwrite for non-expanded TI2V input "
+                "(latent_channels=%s, expected_hidden_channels=%s).",
+                latent_channels,
+                expected_hidden_channels,
+            )
+        elif concat_channels == expected_hidden_channels:
+            latent_input_mode = "concat_channels"
+            image_latents_concat = image_latents
+            if int(image_latents_concat.shape[2]) == 1 and latent_t > 1:
+                # Diff-Factory non-expanded TI2V expects a full-length image-conditioning latent.
+                # Our parquet/raw path only stores the first latent frame, so approximate the
+                # original video-conditioned encode with zeros on later latent frames.
+                image_latents_full = torch.zeros(
+                    (image_latents_concat.shape[0], image_latents_concat.shape[1],
+                     latent_t, image_latents_concat.shape[3], image_latents_concat.shape[4]),
+                    device=device,
+                    dtype=dtype,
+                )
+                image_latents_full[:, :, :1] = image_latents_concat
+                image_latents_concat = image_latents_full
+                logger.info(
+                    "bidir alignment: expanded first_frame_latent from F=1 to F=%s with zero tail for "
+                    "non-expanded TI2V concat input.",
+                    latent_t,
+                )
+            logger.info(
+                "bidir alignment: using channel concat for non-expanded TI2V input "
+                "(latent_channels=%s, image_channels=%s, expected_hidden_channels=%s).",
+                latent_channels,
+                image_channels,
+                expected_hidden_channels,
+            )
+        else:
+            raise RuntimeError(
+                "Unsupported bidirectional TI2V hidden-state channels: "
+                f"latent_channels={latent_channels}, image_channels={image_channels}, "
+                f"expected_hidden_channels={expected_hidden_channels}.")
 
     def _build_latent_model_input() -> torch.Tensor:
         if expand_timesteps:
@@ -1734,7 +1772,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             return (1 - first_frame_mask) * image_latents + first_frame_mask * latents
         if image_latents is None:
             return latents
-        return torch.cat([latents, image_latents], dim=1)
+        if latent_input_mode == "overwrite_first_frame":
+            latent_model_input = latents.clone()
+            latent_model_input[:, :, :1] = image_latents[:, :, :1]
+            return latent_model_input
+        if latent_input_mode == "concat_channels":
+            return torch.cat([latents, image_latents_concat], dim=1)
+        return latents
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
@@ -1833,7 +1877,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
     elif first_frame_latent_bcfhw is not None:
         latents = latents.clone()
-        latents[:, :, :1] = image_latents
+        latents[:, :, :1] = image_latents[:, :, :1]
 
     return latents
 
