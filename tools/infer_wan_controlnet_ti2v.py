@@ -1705,6 +1705,22 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     if first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         first_frame_mask[:, :, 0] = 0
+        if not expand_timesteps and int(image_latents.shape[2]) == 1 and latent_t > 1:
+            # Diff-Factory non-expanded TI2V expects a full-length image-conditioning latent.
+            # Our parquet/raw path only stores the first latent frame, so approximate the
+            # original video-conditioned encode with zeros on later latent frames.
+            image_latents_full = torch.zeros(
+                (image_latents.shape[0], image_latents.shape[1], latent_t,
+                 image_latents.shape[3], image_latents.shape[4]),
+                device=device,
+                dtype=dtype,
+            )
+            image_latents_full[:, :, :1] = image_latents
+            image_latents = image_latents_full
+            logger.info(
+                "bidir alignment: expanded first_frame_latent from F=1 to F=%s with zero tail for non-expanded TI2V input.",
+                latent_t,
+            )
 
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
                          "patch_size", (2, 2))
