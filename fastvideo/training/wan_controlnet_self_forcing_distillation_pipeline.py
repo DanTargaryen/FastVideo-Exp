@@ -21,6 +21,7 @@ from fastvideo.training.activation_checkpoint import apply_activation_checkpoint
 from fastvideo.training.training_utils import (
     clip_grad_norm_while_handling_failing_dtensor_cases,
     get_scheduler,
+    normalize_dit_input,
 )
 from fastvideo.utils import is_vsa_available
 from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
@@ -66,6 +67,31 @@ def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
         "mask": mask,
         "masked_latent": masked,
     }
+
+
+def _normalize_first_frame_latent(first_frame_latent: torch.Tensor,
+                                  vae) -> torch.Tensor:
+    if first_frame_latent.ndim != 5:
+        return first_frame_latent
+    latent_bcfhw = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
+    latent_bcfhw = normalize_dit_input("wan", latent_bcfhw, vae)
+    return latent_bcfhw.permute(0, 2, 1, 3, 4).contiguous()
+
+
+def _normalize_control_latent(control_latent: torch.Tensor, vae,
+                              num_channels_latents: int) -> torch.Tensor:
+    if control_latent.ndim != 5:
+        return control_latent
+    chunks = []
+    total_channels = control_latent.shape[1]
+    if total_channels % num_channels_latents != 0:
+        raise ValueError(
+            f"control_latent channels {total_channels} not divisible by latent channels {num_channels_latents}"
+        )
+    for start in range(0, total_channels, num_channels_latents):
+        chunk = control_latent[:, start:start + num_channels_latents]
+        chunks.append(normalize_dit_input("wan", chunk, vae))
+    return torch.cat(chunks, dim=1)
 
 
 class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeline):
@@ -803,14 +829,21 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         training_batch.infos = infos
 
         # Required fields for TI2V + ControlNet
-        training_batch.control_latent = batch["control_latent"].to(device,
-                                                                   dtype=dtype)
+        control_latent = batch["control_latent"].to(device, dtype=dtype)
         first_frame_latent = batch["first_frame_latent"].to(device, dtype=dtype)
         # Store separately: we keep TI2V first-frame as an in-chunk constraint (chunk 0, frame 0),
         # instead of treating it as an extra "context frame" (which would require 1+3k frames).
         # Expected shape: BFCHW (B,1,16,H,W). Also allow BCFHW (B,16,1,H,W).
         if first_frame_latent.ndim == 5 and first_frame_latent.shape[1] == 16 and first_frame_latent.shape[2] == 1:
             first_frame_latent = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
+        first_frame_latent = _normalize_first_frame_latent(first_frame_latent,
+                                                           self.vae)
+
+        num_channels = int(self.training_args.pipeline_config.vae_config.arch_config.z_dim)
+        control_latent = _normalize_control_latent(control_latent, self.vae,
+                                                   num_channels)
+
+        training_batch.control_latent = control_latent
         training_batch.first_frame_latent = first_frame_latent
 
         return training_batch

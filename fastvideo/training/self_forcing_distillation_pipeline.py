@@ -26,6 +26,7 @@ from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.training.distillation_pipeline import DistillationPipeline
 from fastvideo.training.training_utils import (EMA_FSDP,
+                                               normalize_dit_input,
                                                save_distillation_checkpoint)
 from fastvideo.utils import is_vsa_available, set_random_seed
 from fastvideo.profiler import profile_region
@@ -42,6 +43,16 @@ def _to_log_scalar(value: Any) -> float:
             return float(value.item())
         return float(value.float().mean().item())
     return float(value)
+
+
+def _wan_denormalize_dit_latents(latents: torch.Tensor, vae) -> torch.Tensor:
+    latents_mean = torch.tensor(vae.latents_mean,
+                                device=latents.device,
+                                dtype=latents.dtype).view(1, -1, 1, 1, 1)
+    latents_std = torch.tensor(vae.latents_std,
+                               device=latents.device,
+                               dtype=latents.dtype).view(1, -1, 1, 1, 1)
+    return latents * latents_std + latents_mean
 
 
 def _compute_negative_prompt_embeddings(
@@ -306,6 +317,48 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         if self.boundary_timestep is not None and self.transformer_2 is not None and timestep_value < self.boundary_timestep:
             return self.transformer_2
         return self.transformer
+
+    def _decode_dit_latents_to_pixels(self, latents_bfchw: torch.Tensor,
+                                      dtype: torch.dtype) -> torch.Tensor:
+        latents = latents_bfchw.permute(0, 2, 1, 3, 4).contiguous()
+        if hasattr(self.vae, "latents_mean") and hasattr(self.vae, "latents_std"):
+            latents = _wan_denormalize_dit_latents(latents, self.vae)
+        if isinstance(self.vae.scaling_factor, torch.Tensor):
+            latents = latents / self.vae.scaling_factor.to(
+                latents.device, latents.dtype)
+        else:
+            latents = latents / self.vae.scaling_factor
+        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
+            if isinstance(self.vae.shift_factor, torch.Tensor):
+                latents = latents + self.vae.shift_factor.to(
+                    latents.device, latents.dtype)
+            else:
+                latents = latents + self.vae.shift_factor
+        return self.vae.decode(latents).to(dtype)
+
+    def _encode_pixels_to_dit_latents(self, pixels_bcfhw: torch.Tensor,
+                                      dtype: torch.dtype) -> torch.Tensor:
+        posterior = self.vae.encode(pixels_bcfhw)
+        if hasattr(posterior, "mean"):
+            latents = posterior.mean
+        elif hasattr(posterior, "mode"):
+            latents = posterior.mode()
+        else:
+            latents = posterior
+        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
+            if isinstance(self.vae.shift_factor, torch.Tensor):
+                latents = latents - self.vae.shift_factor.to(
+                    latents.device, latents.dtype)
+            else:
+                latents = latents - self.vae.shift_factor
+        if getattr(self.vae, "scaling_factor", None) is not None:
+            if isinstance(self.vae.scaling_factor, torch.Tensor):
+                latents = latents * self.vae.scaling_factor.to(
+                    latents.device, latents.dtype)
+            else:
+                latents = latents * self.vae.scaling_factor
+        latents = normalize_dit_input("wan", latents, self.vae).to(dtype)
+        return latents.permute(0, 2, 1, 3, 4).contiguous()
 
     def _generator_multi_step_simulation_forward(
             self,
@@ -577,35 +630,11 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 # then re-encoding.
                 keep_last = max(0, grad_last_n_frames - 1)
                 latent_to_decode = pred_image_or_video[:, :-keep_last, ...] if keep_last > 0 else pred_image_or_video
-                # Decode to video
-                latent_to_decode = latent_to_decode.permute(
-                    0, 2, 1, 3, 4)  # [B, C, F, H, W]
-
-                # Apply VAE scaling and shift factors
-                if isinstance(self.vae.scaling_factor, torch.Tensor):
-                    latent_to_decode = latent_to_decode / self.vae.scaling_factor.to(
-                        latent_to_decode.device, latent_to_decode.dtype)
-                else:
-                    latent_to_decode = latent_to_decode / self.vae.scaling_factor
-
-                if hasattr(
-                        self.vae,
-                        "shift_factor") and self.vae.shift_factor is not None:
-                    if isinstance(self.vae.shift_factor, torch.Tensor):
-                        latent_to_decode += self.vae.shift_factor.to(
-                            latent_to_decode.device, latent_to_decode.dtype)
-                    else:
-                        latent_to_decode += self.vae.shift_factor
-
-                # Decode to pixels
-                pixels = self.vae.decode(latent_to_decode)
+                pixels = self._decode_dit_latents_to_pixels(latent_to_decode,
+                                                            dtype)
                 frame = pixels[:, :, -1:, :, :].to(
                     dtype)  # Last frame [B, C, 1, H, W]
-
-                # Encode frame back to get image latent
-                image_latent = self.vae.encode(frame).to(dtype)
-                image_latent = image_latent.permute(0, 2, 1, 3,
-                                                    4)  # [B, F, C, H, W]
+                image_latent = self._encode_pixels_to_dit_latents(frame, dtype)
 
             suffix = pred_image_or_video[:, -keep_last:, ...] if keep_last > 0 else pred_image_or_video[:, :0, ...]
             pred_image_or_video_last_n = torch.cat([image_latent, suffix], dim=1)
