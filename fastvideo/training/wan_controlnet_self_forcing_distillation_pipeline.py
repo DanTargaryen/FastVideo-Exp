@@ -4,15 +4,18 @@ import sys
 from copy import deepcopy
 from typing import Any, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
+from fastvideo.configs.sample.base import SamplingParam
 from fastvideo.dataset.dataloader.schema import pyarrow_schema_ti2v_controlnet
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs, TrainingArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.utils import pred_noise_to_pred_video
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
+from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.forward_context import set_forward_context
 from fastvideo.training.self_forcing_distillation_pipeline import (
     SelfForcingDistillationPipeline,
@@ -23,7 +26,7 @@ from fastvideo.training.training_utils import (
     get_scheduler,
     normalize_dit_input,
 )
-from fastvideo.utils import is_vsa_available
+from fastvideo.utils import is_vsa_available, shallow_asdict
 from fastvideo.models.dits.controlnet_union_components import WanControlNetUnionInput
 
 vsa_available = is_vsa_available()
@@ -109,6 +112,64 @@ def _apply_first_frame_latent(
     conditioned = hidden_states.clone()
     conditioned[:, :, :1] = image_latent[:, :, :1]
     return conditioned
+
+
+def _np_dtype(dtype_str: str | None) -> np.dtype:
+    if dtype_str is None or dtype_str == "":
+        return np.float32
+    s = dtype_str.lower()
+    if s in ("float", "float32", "fp32"):
+        return np.float32
+    if s in ("float16", "fp16"):
+        return np.float16
+    if s in ("int64", "long"):
+        return np.int64
+    if s in ("int32",):
+        return np.int32
+    raise ValueError(f"Unsupported dtype in validation row: {dtype_str}")
+
+
+def _decode_validation_tensor(row: dict[str, Any], prefix: str) -> torch.Tensor:
+    shape = row.get(f"{prefix}_shape")
+    blob = row.get(f"{prefix}_bytes")
+    dtype_str = row.get(f"{prefix}_dtype")
+    if blob is None or shape is None:
+        raise KeyError(
+            f"Missing {prefix}_bytes/{prefix}_shape in validation sample")
+    array = np.frombuffer(blob, dtype=_np_dtype(dtype_str)).reshape(shape).copy()
+    return torch.from_numpy(array)
+
+
+def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 3:
+        x = x.unsqueeze(0).unsqueeze(2)
+    elif x.dim() == 4:
+        x = x.unsqueeze(2)
+    elif x.dim() == 5 and x.shape[1] in (1, 3) and x.shape[2] >= 8:
+        x = x.permute(0, 2, 1, 3, 4).contiguous()
+    if x.dim() != 5 or x.shape[2] != 1:
+        raise ValueError(
+            f"first_frame_latent must be [B,C,1,H,W], got {tuple(x.shape)}")
+    return x
+
+
+def _ensure_control_latent_bcfhw(x: torch.Tensor, *,
+                                 latent_channels: int) -> torch.Tensor:
+    valid_channels = (3 * int(latent_channels), 4 * int(latent_channels))
+    if x.dim() == 4:
+        if int(x.shape[0]) not in valid_channels:
+            raise ValueError(
+                f"control_latent 4D shape must be [C_total,F,H,W], got {tuple(x.shape)}"
+            )
+        return x.unsqueeze(0)
+    if x.dim() == 5:
+        if int(x.shape[1]) in valid_channels:
+            return x
+        if int(x.shape[2]) in valid_channels:
+            return x.permute(0, 2, 1, 3, 4).contiguous()
+    raise ValueError(
+        f"control_latent must be [B,C_total,F,H,W] or [B,F,C_total,H,W], got {tuple(x.shape)}"
+    )
 
 
 class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeline):
@@ -878,26 +939,100 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
         return training_batch
 
+    def _prepare_validation_batch(self, sampling_param: SamplingParam,
+                                  training_args: TrainingArgs,
+                                  validation_batch: dict[str, Any],
+                                  num_inference_steps: int) -> ForwardBatch:
+        required_columns = (
+            "first_frame_latent_bytes",
+            "first_frame_latent_shape",
+            "control_latent_bytes",
+            "control_latent_shape",
+        )
+        missing_columns = [
+            key for key in required_columns if validation_batch.get(key) is None
+        ]
+        if missing_columns:
+            raise ValueError(
+                "ControlNet validation requires parquet/arrow validation rows with "
+                f"{missing_columns}. Current validation sample keys: {sorted(validation_batch.keys())}"
+            )
+
+        sampling_param.prompt = validation_batch["prompt"]
+        sampling_param.height = training_args.num_height
+        sampling_param.width = training_args.num_width
+        sampling_param.num_inference_steps = num_inference_steps
+        sampling_param.data_type = "ti2v_controlnet"
+        if training_args.validation_guidance_scale:
+            sampling_param.guidance_scale = float(
+                training_args.validation_guidance_scale)
+        assert self.seed is not None
+        sampling_param.seed = self.seed
+
+        temporal_compression_factor = training_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+        spatial_compression_factor = training_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
+        sampling_param.num_frames = ((training_args.num_latent_t - 1) *
+                                     temporal_compression_factor + 1)
+        latents_size = [(sampling_param.num_frames - 1) // temporal_compression_factor + 1,
+                        sampling_param.height // spatial_compression_factor,
+                        sampling_param.width // spatial_compression_factor]
+        n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
+
+        first_frame_latent = _ensure_first_frame_bcfhw(
+            _decode_validation_tensor(validation_batch, "first_frame_latent"))
+        control_latent = _ensure_control_latent_bcfhw(
+            _decode_validation_tensor(validation_batch, "control_latent"),
+            latent_channels=int(first_frame_latent.shape[1]))
+        if int(control_latent.shape[2]) != int(training_args.num_latent_t):
+            raise ValueError(
+                "Validation control_latent temporal length does not match num_latent_t: "
+                f"control_latent.shape[2]={int(control_latent.shape[2])}, "
+                f"num_latent_t={int(training_args.num_latent_t)}")
+
+        device = get_local_torch_device()
+        dtype = torch.bfloat16
+        first_frame_latent = _normalize_first_frame_latent(
+            first_frame_latent.to(device=device, dtype=dtype), self.vae)
+        control_latent = _normalize_control_latent(
+            control_latent.to(device=device, dtype=dtype), self.vae,
+            int(training_args.pipeline_config.vae_config.arch_config.z_dim))
+
+        batch = ForwardBatch(
+            **shallow_asdict(sampling_param),
+            latents=None,
+            generator=self.validation_random_generator,
+            n_tokens=n_tokens,
+            eta=0.0,
+            VSA_sparsity=training_args.VSA_sparsity,
+            first_frame_latent=first_frame_latent,
+            control_latent=control_latent,
+        )
+        fps = validation_batch.get("fps")
+        if fps is not None:
+            batch.fps = int(fps)
+        return batch
+
     def initialize_validation_pipeline(self, training_args: TrainingArgs):
         # Keep same validation pipeline as WanSelfForcingDistillationPipeline
         logger.info("Initializing validation pipeline...")
-        if getattr(self, "controlnet", None) is not None:
-            logger.warning(
-                "Validation pipeline is not ControlNet-aware yet. "
-                "Checkpoint-step validation samples do not include student controlnet conditioning."
-            )
         args_copy = deepcopy(training_args)
         args_copy.inference_mode = True
-        from fastvideo.pipelines.basic.wan.wan_causal_dmd_pipeline import (
-            WanCausalDMDPipeline)
+        if (hasattr(args_copy, "pipeline_config")
+                and hasattr(args_copy.pipeline_config, "dit_config")
+                and hasattr(args_copy.pipeline_config.dit_config,
+                            "boundary_ratio")):
+            args_copy.pipeline_config.dit_config.boundary_ratio = None
+        from fastvideo.pipelines.basic.wan.wan_controlnet_causal_dmd_pipeline import (
+            WanControlnetCausalDMDPipeline)
 
-        validation_pipeline = WanCausalDMDPipeline.from_pretrained(
+        validation_pipeline = WanControlnetCausalDMDPipeline.from_pretrained(
             training_args.model_path,
             args=args_copy,  # type: ignore
             inference_mode=True,
             loaded_modules={
                 "transformer": self.get_module("transformer"),
                 "transformer_2": self.get_module("transformer_2", None),
+                "controlnet": self.get_module("controlnet"),
             },
             tp_size=training_args.tp_size,
             sp_size=training_args.sp_size,

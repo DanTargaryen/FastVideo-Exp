@@ -126,6 +126,8 @@ class ForwardBatch:
     raw_latent_shape: tuple[int, ...] | None = None
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None
+    first_frame_latent: torch.Tensor | None = None
+    control_latent: torch.Tensor | None = None
 
     # Action control inputs (Matrix-Game)
     mouse_cond: torch.Tensor | None = None  # Shape: (B, T, 2)
