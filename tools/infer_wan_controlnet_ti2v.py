@@ -347,6 +347,34 @@ def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _ensure_control_latent_bcfhw(x: torch.Tensor, *,
+                                 latent_channels: int,
+                                 name: str) -> torch.Tensor:
+    """
+    Ensure control latent is [B, C_total, F, H, W] where C_total is 3*C_lat or 4*C_lat.
+    Accepts:
+      - [C_total, F, H, W]
+      - [B, C_total, F, H, W]
+      - [B, F, C_total, H, W]
+    """
+    c3 = 3 * int(latent_channels)
+    c4 = 4 * int(latent_channels)
+    valid = (c3, c4)
+    if x.dim() == 4:
+        if int(x.shape[0]) not in valid:
+            raise ValueError(
+                f"{name} 4D shape must be [C_total,F,H,W] with C_total in {valid}, "
+                f"got shape={tuple(x.shape)}")
+        return x.unsqueeze(0)
+    if x.dim() == 5:
+        if int(x.shape[1]) in valid:
+            return x
+        if int(x.shape[2]) in valid:
+            return x.permute(0, 2, 1, 3, 4).contiguous()
+    raise ValueError(
+        f"Unsupported {name} shape={tuple(x.shape)} for latent_channels={int(latent_channels)}")
+
+
 def _frame_index_from_stem(stem: str) -> int | None:
     if stem.isdigit():
         return int(stem)
@@ -764,8 +792,11 @@ def _load_sample(data_path: str, index: int) -> Sample:
                                                                "text_embedding"))
     first_frame_latent = _ensure_first_frame_bcfhw(
         _decode_tensor(row, "first_frame_latent"))
-    control_latent = _ensure_bcfhw(_decode_tensor(row, "control_latent"),
-                                   name="control_latent")
+    control_latent = _ensure_control_latent_bcfhw(
+        _decode_tensor(row, "control_latent"),
+        latent_channels=int(first_frame_latent.shape[1]),
+        name="control_latent",
+    )
 
     sample_id = str(row.get("id", f"index_{index:06d}"))
     caption = str(row.get("caption", ""))
@@ -1808,6 +1839,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
         latent_model_input = _build_latent_model_input().to(
             device=device, dtype=dtype)
+        if int(latent_model_input.shape[1]) != expected_hidden_channels:
+            raise RuntimeError(
+                "Bidirectional latent_model_input channel mismatch: "
+                f"got {int(latent_model_input.shape[1])}, expected {expected_hidden_channels}.")
         timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
 
         with set_forward_context(current_timestep=int(step_i),
@@ -1828,30 +1863,20 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 prompt_embeds_list,
                 timestep,
                 block_controlnet_hidden_states=control_res,
-            ).permute(0, 2, 1, 3, 4)
+            )
             noise_pred_cond = noise_pred
 
             noise_uncond = None
             if float(guidance_scale) != 1.0:
-                control_res_uncond = controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=negative_prompt_embeds_list,
-                    timestep=timestep,
-                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
-                                               num_channels_latents),
-                )
-                control_res_uncond = _scale_control_residual(
-                    control_res_uncond, scale=controlnet_weight)
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
                     timestep,
-                    block_controlnet_hidden_states=control_res_uncond,
-                ).permute(0, 2, 1, 3, 4)
+                    block_controlnet_hidden_states=control_res,
+                )
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
         latent_l2_before = _tensor_or_list_l2(latents)
-        noise_pred = noise_pred.permute(0, 2, 1, 3, 4).contiguous()
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
@@ -1865,7 +1890,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "control_scale": float(controlnet_weight),
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
-                "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond if float(guidance_scale) != 1.0 else None)),
+                "control_uncond_l2": float(_tensor_or_list_l2(control_res if float(guidance_scale) != 1.0 else None)),
                 "noise_cond_l2": float(_tensor_or_list_l2(noise_pred_cond)),
                 "noise_uncond_l2": float(_tensor_or_list_l2(noise_uncond)),
                 "noise_final_l2": float(_tensor_or_list_l2(noise_pred)),
