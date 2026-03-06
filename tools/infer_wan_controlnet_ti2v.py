@@ -1778,6 +1778,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     trace_sample_id: str,
     seed: int,
     dtype: torch.dtype,
+    force_first_frame_anchor: bool,
 ) -> torch.Tensor:
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     torch.manual_seed(int(seed))
@@ -1818,6 +1819,15 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     elif first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         first_frame_mask[:, :, 0] = 0
+
+    anchor_first_frame = bool(force_first_frame_anchor and not expand_timesteps
+                              and image_latent_bcfhw is None
+                              and first_frame_latent_bcfhw is not None)
+    if anchor_first_frame:
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        logger.info(
+            "bidir parquet mode: forcing first-frame anchor with timestep[0]=0 at every denoising step."
+        )
 
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
                          "patch_size", (2, 2))
@@ -1895,7 +1905,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
-            if first_frame_timestep_zero and image_latents is not None:
+            if (first_frame_timestep_zero and image_latents is not None) or anchor_first_frame:
                 timestep = torch.ones((latents.shape[0], latent_t),
                                       device=device,
                                       dtype=torch.float32) * t_cur.to(
@@ -1960,6 +1970,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
         latent_l2_before = _tensor_or_list_l2(latents)
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
+        if anchor_first_frame:
+            latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                            dtype=dtype)
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
             trace_jsonl_path,
@@ -2740,7 +2753,19 @@ def main() -> None:
                 total_c - base_c,
             )
         effective_first_frame_timestep_zero = bool(args.first_frame_timestep_zero)
-        if args.attention_mode == "bidirectional" and effective_first_frame_timestep_zero:
+        force_first_frame_anchor = bool(
+            str(args.input_mode) == "parquet"
+            and args.attention_mode == "bidirectional"
+            and image_latent is None
+            and first_frame_latent is not None)
+        if force_first_frame_anchor:
+            effective_first_frame_timestep_zero = True
+            logger.info(
+                "bidir parquet mode: no image_latent/image RGB available; enabling hard first-frame anchor and timestep[0]=0."
+            )
+        if (args.attention_mode == "bidirectional"
+                and effective_first_frame_timestep_zero
+                and not force_first_frame_anchor):
             logger.info(
                 "bidir alignment: first_frame_timestep_zero=True was requested explicitly."
             )
@@ -2810,6 +2835,7 @@ def main() -> None:
                 trace_sample_id=sample.sample_id,
                 seed=args.seed + i,
                 dtype=dtype,
+                force_first_frame_anchor=force_first_frame_anchor,
             )
         else:
             latents = _causal_dmd_rollout_ti2v_controlnet(
