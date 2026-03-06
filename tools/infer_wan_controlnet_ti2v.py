@@ -667,43 +667,7 @@ def _build_online_image_latent_from_rgb(
     )
     latent_condition_cf = _align_latent_channels(latent_condition[0], target_c,
                                                  "image_latent_condition")
-    latent_condition = latent_condition_cf.unsqueeze(0)
-
-    latent_t = int(latent_condition.shape[2])
-    latent_h = int(latent_condition.shape[3])
-    latent_w = int(latent_condition.shape[4])
-    temporal_ratio = int(getattr(vae, "temporal_compression_ratio", 4))
-
-    mask_lat_size = torch.ones(
-        1,
-        1,
-        max(int(num_frames), 1),
-        latent_h,
-        latent_w,
-        device=latent_condition.device,
-        dtype=latent_condition.dtype,
-    )
-    if int(num_frames) > 1:
-        mask_lat_size[:, :, 1:] = 0
-    first_frame_mask = mask_lat_size[:, :, 0:1]
-    first_frame_mask = torch.repeat_interleave(first_frame_mask,
-                                               dim=2,
-                                               repeats=temporal_ratio)
-    mask_lat_size = torch.cat([first_frame_mask, mask_lat_size[:, :, 1:]], dim=2)
-
-    required_steps = latent_t * temporal_ratio
-    current_steps = int(mask_lat_size.shape[2])
-    if current_steps < required_steps:
-        pad = mask_lat_size.new_zeros(1, 1, required_steps - current_steps,
-                                      latent_h, latent_w)
-        mask_lat_size = torch.cat([mask_lat_size, pad], dim=2)
-    elif current_steps > required_steps:
-        mask_lat_size = mask_lat_size[:, :, :required_steps]
-
-    mask_lat_size = mask_lat_size.view(1, latent_t, temporal_ratio, latent_h,
-                                       latent_w)
-    mask_lat_size = mask_lat_size.transpose(1, 2).contiguous()
-    return torch.cat([mask_lat_size, latent_condition], dim=1)
+    return latent_condition_cf.unsqueeze(0)
 
 
 def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
