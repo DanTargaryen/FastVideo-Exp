@@ -2188,6 +2188,14 @@ def main() -> None:
         "Use chunk-wise causal rollout (default) or full bidirectional rollout (no cache).",
     )
     parser.add_argument(
+        "--align_run_wan_controlnet_union_md",
+        action="store_true",
+        help=(
+            "Force the bidirectional inference recipe to match FastVideo/run_wan_contorlnet_union.md: "
+            "bidirectional + UniPC + full 50-step schedule + fp32 + CFG + controlnet_weight=0.8."
+        ),
+    )
+    parser.add_argument(
         "--controlnet_weight",
         type=float,
         default=1.0,
@@ -2390,9 +2398,25 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if bool(args.align_run_wan_controlnet_union_md):
+        args.attention_mode = "bidirectional"
+        args.scheduler = "unipc"
+        args.full_schedule = True
+        args.schedule_num_inference_steps = 50
+        args.guidance_scale = 6.0
+        args.controlnet_weight = 0.8
+        args.dtype = "fp32"
+        if not str(args.negative_prompt or "").strip():
+            args.negative_prompt = "bad quality, worst quality"
     if str(args.input_mode) == "parquet":
         if not str(args.data_path).strip():
             raise ValueError("--data_path is required when --input_mode parquet")
+        if bool(args.align_run_wan_controlnet_union_md) and not str(
+                args.conditioning_image_path).strip():
+            logger.warning(
+                "run_wan_contorlnet_union.md alignment is enabled, but --conditioning_image_path is empty. "
+                "Parquet mode will fall back to first_frame_latent instead of a rebuilt full image_latent."
+            )
     else:
         if not str(args.raw_sample_root).strip() and not str(args.data_path).strip():
             raise ValueError(
