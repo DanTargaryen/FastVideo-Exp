@@ -141,6 +141,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                         training_args.real_score_controlnet_model_path)
             # Prevent student custom init weights from being applied to teacher.
             setattr(training_args, "_loading_teacher_critic_model", True)
+            prev_cn_override = getattr(training_args,
+                                       "override_controlnet_cls_name", None)
+            training_args.override_controlnet_cls_name = "WanControlnetUnion3DModel"
             try:
                 self.real_score_controlnet = PipelineComponentLoader.load_module(
                     module_name="controlnet",
@@ -149,6 +152,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     fastvideo_args=training_args,
                 )
             finally:
+                training_args.override_controlnet_cls_name = prev_cn_override
                 if hasattr(training_args, "_loading_teacher_critic_model"):
                     delattr(training_args, "_loading_teacher_critic_model")
             if not _is_union_controlnet(self.real_score_controlnet):
@@ -165,6 +169,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                         training_args.fake_score_controlnet_model_path)
             # Prevent student custom init weights from being applied to critic.
             setattr(training_args, "_loading_teacher_critic_model", True)
+            prev_cn_override = getattr(training_args,
+                                       "override_controlnet_cls_name", None)
+            training_args.override_controlnet_cls_name = "WanControlnetUnion3DModel"
             try:
                 self.fake_score_controlnet = PipelineComponentLoader.load_module(
                     module_name="controlnet",
@@ -173,6 +180,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     fastvideo_args=training_args,
                 )
             finally:
+                training_args.override_controlnet_cls_name = prev_cn_override
                 if hasattr(training_args, "_loading_teacher_critic_model"):
                     delattr(training_args, "_loading_teacher_critic_model")
             if not _is_union_controlnet(self.fake_score_controlnet):
@@ -346,6 +354,22 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         return transformer(
             **input_kwargs, block_controlnet_hidden_states=control_res)
 
+    def _score_context_timestep(self, timestep: torch.Tensor) -> int:
+        return int(timestep.reshape(-1)[0].item())
+
+    def _build_score_attn_metadata(self, training_batch, timestep: torch.Tensor):
+        if getattr(training_batch, "raw_latent_shape", None) is None:
+            return getattr(training_batch, "attn_metadata", None)
+        original_timesteps = getattr(training_batch, "timesteps", None)
+        original_attn_metadata = getattr(training_batch, "attn_metadata", None)
+        try:
+            training_batch.timesteps = timestep
+            self._build_attention_metadata(training_batch)
+            return training_batch.attn_metadata
+        finally:
+            training_batch.timesteps = original_timesteps
+            training_batch.attn_metadata = original_attn_metadata
+
     def _dmd_forward(self, generator_pred_video: torch.Tensor,
                      training_batch) -> torch.Tensor:
         original_latent = generator_pred_video
@@ -364,6 +388,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                                       self.num_train_timestep)
             timestep = timestep.clamp(self.min_timestep, self.max_timestep)
             timestep_for_noise = timestep.repeat_interleave(num_frames)
+            score_attn_metadata = self._build_score_attn_metadata(
+                training_batch, timestep)
+            score_context_timestep = self._score_context_timestep(timestep)
 
             noise = torch.randn_like(generator_pred_video)
 
@@ -378,12 +405,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 training_batch)
             current_fake_score_transformer = self._get_fake_score_transformer(
                 timestep)
-            fake_score_pred_noise = self._predict_noise_with_controlnet(
-                transformer=current_fake_score_transformer,
-                controlnet=getattr(self, "fake_score_controlnet", None),
-                input_kwargs=training_batch.input_kwargs,
-                control_latent=control_latent,
-            ).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                fake_score_pred_noise = self._predict_noise_with_controlnet(
+                    transformer=current_fake_score_transformer,
+                    controlnet=getattr(self, "fake_score_controlnet", None),
+                    input_kwargs=training_batch.input_kwargs,
+                    control_latent=control_latent,
+                ).permute(0, 2, 1, 3, 4)
 
             faker_score_pred_video = pred_noise_to_pred_video(
                 pred_noise=fake_score_pred_noise.flatten(0, 1),
@@ -398,12 +427,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 training_batch)
             current_real_score_transformer = self._get_real_score_transformer(
                 timestep)
-            real_score_pred_noise_cond = self._predict_noise_with_controlnet(
-                transformer=current_real_score_transformer,
-                controlnet=getattr(self, "real_score_controlnet", None),
-                input_kwargs=training_batch.input_kwargs,
-                control_latent=control_latent,
-            ).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                real_score_pred_noise_cond = self._predict_noise_with_controlnet(
+                    transformer=current_real_score_transformer,
+                    controlnet=getattr(self, "real_score_controlnet", None),
+                    input_kwargs=training_batch.input_kwargs,
+                    control_latent=control_latent,
+                ).permute(0, 2, 1, 3, 4)
 
             pred_real_video_cond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_cond.flatten(0, 1),
@@ -416,12 +447,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             training_batch = self._build_distill_input_kwargs(
                 noisy_latent, timestep, training_batch.unconditional_dict,
                 training_batch)
-            real_score_pred_noise_uncond = self._predict_noise_with_controlnet(
-                transformer=current_real_score_transformer,
-                controlnet=getattr(self, "real_score_controlnet", None),
-                input_kwargs=training_batch.input_kwargs,
-                control_latent=control_latent,
-            ).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                real_score_pred_noise_uncond = self._predict_noise_with_controlnet(
+                    transformer=current_real_score_transformer,
+                    controlnet=getattr(self, "real_score_controlnet", None),
+                    input_kwargs=training_batch.input_kwargs,
+                    control_latent=control_latent,
+                ).permute(0, 2, 1, 3, 4)
 
             pred_real_video_uncond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_uncond.flatten(0, 1),
@@ -513,6 +546,10 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                                                         self.max_timestep)
         fake_score_timestep_for_noise = fake_score_timestep.repeat_interleave(
             num_frames)
+        score_attn_metadata = self._build_score_attn_metadata(
+            training_batch, fake_score_timestep)
+        score_context_timestep = self._score_context_timestep(
+            fake_score_timestep)
 
         fake_score_noise = torch.randn_like(generator_pred_video)
         noisy_generator_pred_video = self.noise_scheduler.add_noise(
@@ -524,8 +561,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             noisy_generator_pred_video, fake_score_timestep,
             training_batch.conditional_dict, training_batch)
 
-        with set_forward_context(current_timestep=training_batch.timesteps,
-                                 attn_metadata=training_batch.attn_metadata):
+        with set_forward_context(current_timestep=score_context_timestep,
+                                 attn_metadata=score_attn_metadata):
             current_fake_score_transformer = self._get_fake_score_transformer(
                 fake_score_timestep)
             fake_score_pred_noise = self._predict_noise_with_controlnet(

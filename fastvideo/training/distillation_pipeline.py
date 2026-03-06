@@ -599,6 +599,23 @@ class DistillationPipeline(TrainingPipeline):
 
         return training_batch
 
+    def _score_context_timestep(self, timestep: torch.Tensor) -> int:
+        return int(timestep.reshape(-1)[0].item())
+
+    def _build_score_attn_metadata(self, training_batch: TrainingBatch,
+                                   timestep: torch.Tensor):
+        if getattr(training_batch, "raw_latent_shape", None) is None:
+            return getattr(training_batch, "attn_metadata", None)
+        original_timesteps = getattr(training_batch, "timesteps", None)
+        original_attn_metadata = getattr(training_batch, "attn_metadata", None)
+        try:
+            training_batch.timesteps = timestep
+            self._build_attention_metadata(training_batch)
+            return training_batch.attn_metadata
+        finally:
+            training_batch.timesteps = original_timesteps
+            training_batch.attn_metadata = original_attn_metadata
+
     def _generator_forward(self, training_batch: TrainingBatch) -> torch.Tensor:
 
         latents = training_batch.latents
@@ -736,6 +753,9 @@ class DistillationPipeline(TrainingPipeline):
                 self.num_train_timestep)
 
             timestep = timestep.clamp(self.min_timestep, self.max_timestep)
+            score_attn_metadata = self._build_score_attn_metadata(
+                training_batch, timestep)
+            score_context_timestep = self._score_context_timestep(timestep)
 
             noise = torch.randn_like(generator_pred_video)
 
@@ -750,8 +770,10 @@ class DistillationPipeline(TrainingPipeline):
                 training_batch)
             current_fake_score_transformer = self._get_fake_score_transformer(
                 timestep)
-            fake_score_pred_noise = current_fake_score_transformer(
-                **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                fake_score_pred_noise = current_fake_score_transformer(
+                    **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
 
             faker_score_pred_video = pred_noise_to_pred_video(
                 pred_noise=fake_score_pred_noise.flatten(0, 1),
@@ -766,8 +788,10 @@ class DistillationPipeline(TrainingPipeline):
                 training_batch)
             current_real_score_transformer = self._get_real_score_transformer(
                 timestep)
-            real_score_pred_noise_cond = current_real_score_transformer(
-                **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                real_score_pred_noise_cond = current_real_score_transformer(
+                    **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
 
             pred_real_video_cond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_cond.flatten(0, 1),
@@ -781,8 +805,10 @@ class DistillationPipeline(TrainingPipeline):
                 noisy_latent, timestep, training_batch.unconditional_dict,
                 training_batch)
             # Use same transformer as conditional forward for consistency
-            real_score_pred_noise_uncond = current_real_score_transformer(
-                **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
+            with set_forward_context(current_timestep=score_context_timestep,
+                                     attn_metadata=score_attn_metadata):
+                real_score_pred_noise_uncond = current_real_score_transformer(
+                    **training_batch.input_kwargs).permute(0, 2, 1, 3, 4)
 
             pred_real_video_uncond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_uncond.flatten(0, 1),
@@ -882,6 +908,10 @@ class DistillationPipeline(TrainingPipeline):
 
         fake_score_timestep = fake_score_timestep.clamp(self.min_timestep,
                                                         self.max_timestep)
+        score_attn_metadata = self._build_score_attn_metadata(
+            training_batch, fake_score_timestep)
+        score_context_timestep = self._score_context_timestep(
+            fake_score_timestep)
 
         fake_score_noise = torch.randn_like(generator_pred_video)
 
@@ -890,8 +920,8 @@ class DistillationPipeline(TrainingPipeline):
             fake_score_timestep.flatten(0, 1)).unflatten(0,
                                            (1, generator_pred_video.shape[1]))
 
-        with set_forward_context(current_timestep=training_batch.timesteps,
-                                 attn_metadata=training_batch.attn_metadata):
+        with set_forward_context(current_timestep=score_context_timestep,
+                                 attn_metadata=score_attn_metadata):
             training_batch = self._build_distill_input_kwargs(
                 noisy_generator_pred_video, fake_score_timestep,
                 training_batch.conditional_dict, training_batch)
