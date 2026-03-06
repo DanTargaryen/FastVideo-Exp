@@ -1779,6 +1779,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     seed: int,
     dtype: torch.dtype,
     force_first_frame_anchor: bool,
+    parquet_anchor_fraction: float,
 ) -> torch.Tensor:
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     torch.manual_seed(int(seed))
@@ -1825,8 +1826,16 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                               and first_frame_latent_bcfhw is not None)
     if anchor_first_frame:
         latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        anchor_steps = max(
+            1,
+            int(round(float(parquet_anchor_fraction) * float(timesteps.numel()))),
+        )
         logger.info(
-            "bidir parquet mode: forcing first-frame anchor with timestep[0]=0 at every denoising step."
+            "bidir parquet mode: enabling conservative first-frame anchor with timestep[0]=0 "
+            "(anchor_fraction=%s, anchor_steps=%s/%s).",
+            float(parquet_anchor_fraction),
+            int(anchor_steps),
+            int(timesteps.numel()),
         )
 
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
@@ -1975,8 +1984,14 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         latent_l2_before = _tensor_or_list_l2(latents)
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
         if anchor_first_frame:
-            latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+            if step_i < anchor_steps:
+                anchor_weight = 1.0 - (float(step_i + 1) / float(anchor_steps))
+                anchor_latent = first_frame_latent_bcfhw.to(device=device,
                                                             dtype=dtype)
+                latents[:, :, :1] = (
+                    float(anchor_weight) * anchor_latent +
+                    float(1.0 - anchor_weight) * latents[:, :, :1]
+                )
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
             trace_jsonl_path,
@@ -2321,6 +2336,15 @@ def main() -> None:
         help=(
             "Force the first latent frame's timestep to 0 (Diff-Factory expand_timesteps behavior). "
             "Default OFF to match FastVideo self-forcing training."
+        ),
+    )
+    parser.add_argument(
+        "--parquet_anchor_fraction",
+        type=float,
+        default=0.35,
+        help=(
+            "For parquet bidirectional mode without image_latent, apply first-frame anchor only over the "
+            "first fraction of denoising steps, with linearly decaying strength."
         ),
     )
     parser.add_argument(
@@ -2765,7 +2789,7 @@ def main() -> None:
         if force_first_frame_anchor:
             effective_first_frame_timestep_zero = True
             logger.info(
-                "bidir parquet mode: no image_latent/image RGB available; enabling hard first-frame anchor and timestep[0]=0."
+                "bidir parquet mode: no image_latent/image RGB available; enabling conservative first-frame anchor and timestep[0]=0."
             )
         if (args.attention_mode == "bidirectional"
                 and effective_first_frame_timestep_zero
@@ -2840,6 +2864,7 @@ def main() -> None:
                 seed=args.seed + i,
                 dtype=dtype,
                 force_first_frame_anchor=force_first_frame_anchor,
+                parquet_anchor_fraction=float(args.parquet_anchor_fraction),
             )
         else:
             latents = _causal_dmd_rollout_ti2v_controlnet(
