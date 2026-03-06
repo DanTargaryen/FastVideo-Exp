@@ -2127,6 +2127,14 @@ def main() -> None:
             "Useful for parquet bidirectional inference, where parquet usually stores only first_frame_latent."
         ),
     )
+    parser.add_argument(
+        "--use_conditioning_image_latent",
+        action="store_true",
+        help=(
+            "Opt in to rebuilding image_latent from --conditioning_image_path. "
+            "Default OFF because parquet bidirectional often works better with the built-in first_frame_latent anchor path."
+        ),
+    )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
     parser.add_argument("--raw_mask_invert", action="store_true")
     parser.add_argument("--raw_require_normal", action="store_true")
@@ -2669,7 +2677,8 @@ def main() -> None:
                     sample.caption)
 
         image_latent = sample.image_latent_bcfhw
-        if image_latent is None and str(args.conditioning_image_path).strip():
+        if (image_latent is None and bool(args.use_conditioning_image_latent)
+                and str(args.conditioning_image_path).strip()):
             cond_img_path = Path(str(args.conditioning_image_path)).expanduser()
             if not cond_img_path.is_file():
                 raise FileNotFoundError(
@@ -2691,6 +2700,12 @@ def main() -> None:
                 "bidir alignment: rebuilt image_latent online from %s with shape=%s",
                 str(cond_img_path),
                 tuple(image_latent.shape),
+            )
+        elif (image_latent is None and str(args.conditioning_image_path).strip()
+              and not bool(args.use_conditioning_image_latent)):
+            logger.info(
+                "conditioning_image_path was provided but ignored because --use_conditioning_image_latent is OFF; "
+                "keeping parquet first_frame_latent anchor path."
             )
 
         prompt_embeds = sample.text_embedding_bld.to(device="cuda",

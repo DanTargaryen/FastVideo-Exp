@@ -334,7 +334,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     latents.device, latents.dtype)
             else:
                 latents = latents + self.vae.shift_factor
-        return self.vae.decode(latents).to(dtype)
+        if latents.device.type == "cuda":
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pixels = self.vae.decode(latents)
+        else:
+            pixels = self.vae.decode(latents)
+        return pixels.to(dtype)
 
     def _encode_pixels_to_dit_latents(self, pixels_bcfhw: torch.Tensor,
                                       dtype: torch.dtype) -> torch.Tensor:
@@ -1109,24 +1114,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                         continue
 
                     latents = latents.detach()
-                    latents = latents.permute(0, 2, 1, 3, 4)
-
-                    if isinstance(self.vae.scaling_factor, torch.Tensor):
-                        latents = latents / self.vae.scaling_factor.to(
-                            latents.device, latents.dtype)
-                    else:
-                        latents = latents / self.vae.scaling_factor
-
-                    if (hasattr(self.vae, "shift_factor")
-                            and self.vae.shift_factor is not None):
-                        if isinstance(self.vae.shift_factor, torch.Tensor):
-                            latents += self.vae.shift_factor.to(
-                                latents.device, latents.dtype)
-                        else:
-                            latents += self.vae.shift_factor
-
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        video = self.vae.decode(latents)
+                    video = self._decode_dit_latents_to_pixels(
+                        latents, torch.float32)
                     video = (video / 2 + 0.5).clamp(0, 1)
                     video = video.cpu().float()
                     video = video.permute(0, 2, 1, 3, 4)
@@ -1154,24 +1143,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                         continue
 
                     latents = latents.detach()
-                    latents = latents.permute(0, 2, 1, 3, 4)
-
-                    if isinstance(self.vae.scaling_factor, torch.Tensor):
-                        latents = latents / self.vae.scaling_factor.to(
-                            latents.device, latents.dtype)
-                    else:
-                        latents = latents / self.vae.scaling_factor
-
-                    if (hasattr(self.vae, "shift_factor")
-                            and self.vae.shift_factor is not None):
-                        if isinstance(self.vae.shift_factor, torch.Tensor):
-                            latents += self.vae.shift_factor.to(
-                                latents.device, latents.dtype)
-                        else:
-                            latents += self.vae.shift_factor
-
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        video = self.vae.decode(latents)
+                    video = self._decode_dit_latents_to_pixels(
+                        latents, torch.float32)
                     video = (video / 2 + 0.5).clamp(0, 1)
                     video = video.cpu().float()
                     video = video.permute(0, 2, 1, 3, 4)
@@ -1218,30 +1191,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         *,
         max_frames: int = 0,
     ) -> np.ndarray:
-        vae_device = next(self.vae.parameters()).device
-        # latents: (B, F_lat, C, H, W) -> VAE expects (B, C, F_lat, H, W)
-        latents = latents_bfchw.detach().permute(0, 2, 1, 3, 4).to(vae_device)
-
-        if isinstance(self.vae.scaling_factor, torch.Tensor):
-            latents = latents / self.vae.scaling_factor.to(
-                latents.device, latents.dtype)
-        else:
-            latents = latents / self.vae.scaling_factor
-
-        if hasattr(self.vae,
-                   "shift_factor") and self.vae.shift_factor is not None:
-            if isinstance(self.vae.shift_factor, torch.Tensor):
-                latents = latents + self.vae.shift_factor.to(
-                    latents.device, latents.dtype)
-            else:
-                latents = latents + self.vae.shift_factor
-
-        if vae_device.type == "cuda":
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                video = self.vae.decode(latents)
-        else:
-            video = self.vae.decode(latents)
-
+        video = self._decode_dit_latents_to_pixels(latents_bfchw.detach(),
+                                                   torch.float32)
         video = (video / 2 + 0.5).clamp(0, 1).cpu().float()
         video = video.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
         if max_frames and max_frames > 0:

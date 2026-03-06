@@ -94,6 +94,23 @@ def _normalize_control_latent(control_latent: torch.Tensor, vae,
     return torch.cat(chunks, dim=1)
 
 
+def _apply_first_frame_latent(
+    hidden_states: torch.Tensor,
+    first_frame_latent: torch.Tensor | None,
+) -> torch.Tensor:
+    if first_frame_latent is None:
+        return hidden_states
+    if hidden_states.ndim != 5 or first_frame_latent.ndim != 5:
+        return hidden_states
+    image_latent = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
+    if hidden_states.shape[1] != image_latent.shape[1] or hidden_states.shape[
+            2] < 1:
+        return hidden_states
+    conditioned = hidden_states.clone()
+    conditioned[:, :, :1] = image_latent[:, :, :1]
+    return conditioned
+
+
 class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeline):
     """
     Self-forcing DMD distillation with an external ControlNet module.
@@ -367,22 +384,29 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     def _predict_noise_with_controlnet(self, *, transformer, controlnet,
                                        input_kwargs: dict[str, Any],
-                                       control_latent: torch.Tensor | None):
+                                       control_latent: torch.Tensor | None,
+                                       first_frame_latent: torch.Tensor
+                                       | None = None):
+        conditioned_input_kwargs = dict(input_kwargs)
+        conditioned_hidden_states = _apply_first_frame_latent(
+            conditioned_input_kwargs["hidden_states"], first_frame_latent)
+        conditioned_input_kwargs["hidden_states"] = conditioned_hidden_states
         if controlnet is None or control_latent is None:
-            return transformer(**input_kwargs)
+            return transformer(**conditioned_input_kwargs)
         num_channels_latents = getattr(transformer, "num_channels_latents",
                                        control_latent.shape[1] // 3)
         control_res = controlnet(
-            hidden_states=input_kwargs["hidden_states"],
-            encoder_hidden_states=input_kwargs["encoder_hidden_states"],
-            timestep=input_kwargs["timestep"],
-            encoder_hidden_states_image=input_kwargs.get(
+            hidden_states=conditioned_hidden_states,
+            encoder_hidden_states=conditioned_input_kwargs[
+                "encoder_hidden_states"],
+            timestep=conditioned_input_kwargs["timestep"],
+            encoder_hidden_states_image=conditioned_input_kwargs.get(
                 "encoder_hidden_states_image"),
             **_build_controlnet_kwargs(controlnet, control_latent,
                                        num_channels_latents),
         )
         return transformer(
-            **input_kwargs, block_controlnet_hidden_states=control_res)
+            **conditioned_input_kwargs, block_controlnet_hidden_states=control_res)
 
     def _score_context_timestep(self, timestep: torch.Tensor) -> int:
         return int(timestep.reshape(-1)[0].item())
@@ -404,6 +428,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                      training_batch) -> torch.Tensor:
         original_latent = generator_pred_video
         control_latent = getattr(training_batch, "control_latent", None)
+        first_frame_latent = getattr(training_batch, "first_frame_latent", None)
         if not hasattr(training_batch, "dmd_latent_vis_dict") or training_batch.dmd_latent_vis_dict is None:
             training_batch.dmd_latent_vis_dict = {}
         with torch.no_grad():
@@ -442,6 +467,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     controlnet=getattr(self, "fake_score_controlnet", None),
                     input_kwargs=training_batch.input_kwargs,
                     control_latent=control_latent,
+                    first_frame_latent=first_frame_latent,
                 ).permute(0, 2, 1, 3, 4)
 
             faker_score_pred_video = pred_noise_to_pred_video(
@@ -464,6 +490,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     controlnet=getattr(self, "real_score_controlnet", None),
                     input_kwargs=training_batch.input_kwargs,
                     control_latent=control_latent,
+                    first_frame_latent=first_frame_latent,
                 ).permute(0, 2, 1, 3, 4)
 
             pred_real_video_cond = pred_noise_to_pred_video(
@@ -484,6 +511,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     controlnet=getattr(self, "real_score_controlnet", None),
                     input_kwargs=training_batch.input_kwargs,
                     control_latent=control_latent,
+                    first_frame_latent=first_frame_latent,
                 ).permute(0, 2, 1, 3, 4)
 
             pred_real_video_uncond = pred_noise_to_pred_video(
@@ -551,6 +579,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     def faker_score_forward(self, training_batch):
         control_latent = getattr(training_batch, "control_latent", None)
+        first_frame_latent = getattr(training_batch, "first_frame_latent", None)
         # The Wan attention stack requires ForwardContext to be set for every
         # forward pass (including ControlNet during simulation).
         with torch.no_grad(), set_forward_context(
@@ -600,6 +629,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 controlnet=getattr(self, "fake_score_controlnet", None),
                 input_kwargs=training_batch.input_kwargs,
                 control_latent=control_latent,
+                first_frame_latent=first_frame_latent,
             ).permute(0, 2, 1, 3, 4)
 
         target = fake_score_noise - generator_pred_video
@@ -851,6 +881,11 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
     def initialize_validation_pipeline(self, training_args: TrainingArgs):
         # Keep same validation pipeline as WanSelfForcingDistillationPipeline
         logger.info("Initializing validation pipeline...")
+        if getattr(self, "controlnet", None) is not None:
+            logger.warning(
+                "Validation pipeline is not ControlNet-aware yet. "
+                "Checkpoint-step validation samples do not include student controlnet conditioning."
+            )
         args_copy = deepcopy(training_args)
         args_copy.inference_mode = True
         from fastvideo.pipelines.basic.wan.wan_causal_dmd_pipeline import (
