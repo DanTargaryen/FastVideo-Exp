@@ -963,6 +963,15 @@ def _load_sample_raw(
             dtype=torch.float32,
         )
 
+    # Match Diff-Factory/FastVideo preprocess semantics for TI2V:
+    # the first control frame should reflect the given image anchor.
+    if mask_tchw.shape[0] > 0 and masked_rgb_tchw.shape[0] > 0:
+        mask_tchw = mask_tchw.clone()
+        masked_rgb_tchw = masked_rgb_tchw.clone()
+        mask_tchw[0] = 1.0
+        masked_rgb_tchw[0] = first_rgb
+        mask3_tchw = mask_tchw.repeat(1, 3, 1, 1)
+
     normal_tchw = None
     if normal_paths is not None:
         normal_tchw = torch.stack(
@@ -2239,6 +2248,16 @@ def main() -> None:
         "fp16": torch.float16,
     }[args.dtype]
     guidance_scale_value = float(args.guidance_scale)
+    if args.attention_mode == "bidirectional" and guidance_scale_value == 1.0:
+        logger.warning(
+            "bidir alignment: guidance_scale=1.0 differs from the Diff-Factory example default (5.0). "
+            "Pass --guidance_scale 5.0 for a closer baseline match."
+        )
+    if args.attention_mode == "bidirectional" and args.dtype != "fp32":
+        logger.warning(
+            "bidir alignment: Diff-Factory examples typically run fp32. "
+            "Pass --dtype fp32 if memory allows."
+        )
     inference_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
 
     timestep_indices = [int(x) for x in args.timestep_indices.split(",") if x.strip() != ""]
@@ -2288,6 +2307,15 @@ def main() -> None:
         )
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
+    if args.attention_mode == "bidirectional":
+        # Diff-Factory Wan Union inference defaults to the non-expanded TI2V path.
+        if hasattr(fastvideo_args.pipeline_config, "expand_timesteps"):
+            fastvideo_args.pipeline_config.expand_timesteps = False
+        if hasattr(fastvideo_args.pipeline_config, "dit_config"):
+            fastvideo_args.pipeline_config.dit_config.expand_timesteps = False
+        logger.info(
+            "bidir alignment: forcing expand_timesteps=False to match Diff-Factory Wan ControlNet inference."
+        )
     fastvideo_args.pipeline_config.warp_denoising_step = bool(
         args.warp_denoising_step)
     fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps if dmd_steps_list is not None else []
@@ -2490,18 +2518,14 @@ def main() -> None:
                 total_c - base_c,
             )
         effective_first_frame_timestep_zero = bool(args.first_frame_timestep_zero)
-        if args.attention_mode == "bidirectional" and first_frame_latent is not None:
-            # Match run_wan_contorlnet_union.md / Diffusers TI2V behavior in bidirectional mode:
-            # first conditioned frame uses t=0.
-            if not effective_first_frame_timestep_zero:
-                logger.info(
-                    "bidir alignment: forcing first_frame_timestep_zero=True because first-frame latent is present."
-                )
-            effective_first_frame_timestep_zero = True
+        if args.attention_mode == "bidirectional" and effective_first_frame_timestep_zero:
+            logger.info(
+                "bidir alignment: first_frame_timestep_zero=True was requested explicitly."
+            )
         elif first_frame_latent is not None and not effective_first_frame_timestep_zero:
             logger.warning(
-                "TI2V alignment: Diff-Factory sets first-frame timestep to 0 when first-frame conditioning is present. "
-                "Consider adding --first_frame_timestep_zero for closer matching."
+                "TI2V alignment: first_frame_timestep_zero is OFF. "
+                "This matches the current Diff-Factory default when expand_timesteps=False."
             )
 
         if args.debug_dump:
