@@ -2,6 +2,7 @@
 import copy
 import gc
 import json
+import math
 import os
 import time
 from abc import abstractmethod
@@ -46,6 +47,14 @@ from fastvideo.utils import (is_vsa_available, maybe_download_model,
 vsa_available = is_vsa_available()
 
 logger = init_logger(__name__)
+
+
+def _to_log_scalar(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.item())
+        return float(value.float().mean().item())
+    return float(value)
 
 
 class DistillationPipeline(TrainingPipeline):
@@ -538,8 +547,9 @@ class DistillationPipeline(TrainingPipeline):
         """
         Get the appropriate real score transformer based on timestep and boundary logic.
         """
+        timestep_scalar = float(timestep.float().reshape(-1)[0].item())
         if self.real_score_transformer_2 is not None and self.boundary_timestep is not None:
-            if timestep.item() < self.boundary_timestep:
+            if timestep_scalar < self.boundary_timestep:
                 return self.real_score_transformer_2  # Low noise expert
             else:
                 return self.real_score_transformer  # High noise expert
@@ -550,8 +560,9 @@ class DistillationPipeline(TrainingPipeline):
         """
         Get the appropriate fake score transformer based on timestep and boundary logic.
         """
+        timestep_scalar = float(timestep.float().reshape(-1)[0].item())
         if self.fake_score_transformer_2 is not None and self.boundary_timestep is not None:
-            if timestep.item() < self.boundary_timestep:
+            if timestep_scalar < self.boundary_timestep:
                 self.train_fake_score_transformer_2 = True
                 return self.fake_score_transformer_2  # Low noise expert
             else:
@@ -712,10 +723,12 @@ class DistillationPipeline(TrainingPipeline):
         """Compute DMD (Diffusion Model Distillation) loss."""
         original_latent = generator_pred_video
         with torch.no_grad():
+            batch_size, num_frames = original_latent.shape[:2]
             timestep = torch.randint(0,
-                                     self.num_train_timestep, [1],
+                                     self.num_train_timestep, [1, 1],
                                      device=self.device,
-                                     dtype=torch.long)
+                                     dtype=torch.long).repeat(
+                                         batch_size, num_frames)
 
             timestep = shift_timestep(
                 timestep,
@@ -724,13 +737,11 @@ class DistillationPipeline(TrainingPipeline):
 
             timestep = timestep.clamp(self.min_timestep, self.max_timestep)
 
-            noise = torch.randn(self.video_latent_shape,
-                                device=self.device,
-                                dtype=generator_pred_video.dtype)
+            noise = torch.randn_like(generator_pred_video)
 
             noisy_latent = self.noise_scheduler.add_noise(
                 generator_pred_video.flatten(0, 1), noise.flatten(0, 1),
-                timestep).detach().unflatten(0,
+                timestep.flatten(0, 1)).detach().unflatten(0,
                                              (1, generator_pred_video.shape[1]))
 
             # fake_score_transformer forward
@@ -816,6 +827,7 @@ class DistillationPipeline(TrainingPipeline):
             if grad_clip > 0:
                 grad = grad.clamp(min=-grad_clip, max=grad_clip)
             grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+            grad_abs_mean = grad.abs().mean().detach()
 
         dmd_loss = 0.5 * F.mse_loss(
             original_latent.float(),
@@ -838,6 +850,8 @@ class DistillationPipeline(TrainingPipeline):
             grad_normalizer_raw.detach(),
             "dmd_grad_normalizer_ema":
             grad_normalizer_ema.detach(),
+            "dmdtrain_gradient_norm":
+            grad_abs_mean,
         })
 
         return dmd_loss
@@ -854,10 +868,12 @@ class DistillationPipeline(TrainingPipeline):
             else:
                 generator_pred_video = self._generator_forward(training_batch)
 
+        batch_size, num_frames = generator_pred_video.shape[:2]
         fake_score_timestep = torch.randint(0,
-                                            self.num_train_timestep, [1],
+                                            self.num_train_timestep, [1, 1],
                                             device=self.device,
-                                            dtype=torch.long)
+                                            dtype=torch.long).repeat(
+                                                batch_size, num_frames)
 
         fake_score_timestep = shift_timestep(
             fake_score_timestep,
@@ -867,13 +883,11 @@ class DistillationPipeline(TrainingPipeline):
         fake_score_timestep = fake_score_timestep.clamp(self.min_timestep,
                                                         self.max_timestep)
 
-        fake_score_noise = torch.randn(self.video_latent_shape,
-                                       device=self.device,
-                                       dtype=generator_pred_video.dtype)
+        fake_score_noise = torch.randn_like(generator_pred_video)
 
         noisy_generator_pred_video = self.noise_scheduler.add_noise(
             generator_pred_video.flatten(0, 1), fake_score_noise.flatten(0, 1),
-            fake_score_timestep).unflatten(0,
+            fake_score_timestep.flatten(0, 1)).unflatten(0,
                                            (1, generator_pred_video.shape[1]))
 
         with set_forward_context(current_timestep=training_batch.timesteps,
@@ -911,9 +925,10 @@ class DistillationPipeline(TrainingPipeline):
                 max_grad_norm,
                 foreach=None,
             )
-            assert grad_norm is not float('nan') or grad_norm is not float(
-                'inf')
             grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+            if not math.isfinite(grad_norm):
+                raise ValueError(
+                    f"Detected non-finite gradient norm: {grad_norm}")
         else:
             grad_norm = 0.0
         training_batch.grad_norm = grad_norm
@@ -1059,6 +1074,7 @@ class DistillationPipeline(TrainingPipeline):
             # Only clip gradients for the model that is currently training
             self._clip_model_grad_norm_(batch_gen, self.transformer)
             self.optimizer.step()
+            self.lr_scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
             if self.generator_ema is not None:
@@ -1102,9 +1118,6 @@ class DistillationPipeline(TrainingPipeline):
         else:
             self.fake_score_optimizer.step()
             self.fake_score_lr_scheduler.step()
-
-        # Step the appropriate scheduler
-        self.lr_scheduler.step()
 
         self.fake_score_optimizer.zero_grad(set_to_none=True)
         if self.fake_score_transformer_2 is not None:
@@ -1668,21 +1681,22 @@ class DistillationPipeline(TrainingPipeline):
                 if training_batch.dmd_latent_vis_dict:
                     dmd_additional_logs = {
                         "generator_timestep":
-                        training_batch.
-                        dmd_latent_vis_dict["generator_timestep"].item(),
+                        _to_log_scalar(
+                            training_batch.dmd_latent_vis_dict[
+                                "generator_timestep"]),
                         "dmd_timestep":
-                        training_batch.dmd_latent_vis_dict["dmd_timestep"].item(
-                        ),
+                        _to_log_scalar(
+                            training_batch.dmd_latent_vis_dict["dmd_timestep"]),
                     }
                     if "dmd_grad_normalizer" in training_batch.dmd_latent_vis_dict:
                         dmd_additional_logs["dmd_grad_normalizer"] = training_batch.dmd_latent_vis_dict[
-                            "dmd_grad_normalizer"].item()
+                            "dmd_grad_normalizer"].float().mean().item()
                     log_data.update(dmd_additional_logs)
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":
-                    training_batch.
-                    fake_score_latent_vis_dict["fake_score_timestep"].item(),
+                    _to_log_scalar(training_batch.fake_score_latent_vis_dict[
+                        "fake_score_timestep"]),
                 }
                 log_data.update(faker_score_additional_logs)
 

@@ -36,6 +36,14 @@ vsa_available = is_vsa_available()
 sync_list_verbose_log = bool(int(os.getenv("FASTVIDEO_SYNC_LIST_LOG", "0")))
 
 
+def _to_log_scalar(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.item())
+        return float(value.float().mean().item())
+    return float(value)
+
+
 def _compute_negative_prompt_embeddings(
     *,
     tokenizer,
@@ -229,8 +237,13 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 generator_pred_video=generator_pred_video,
                 training_batch=training_batch)
 
+        dmd_grad_norm = training_batch.dmd_latent_vis_dict.get(
+            "dmdtrain_gradient_norm", torch.tensor(0.0, device=self.device))
+        if not isinstance(dmd_grad_norm, torch.Tensor):
+            dmd_grad_norm = torch.tensor(float(dmd_grad_norm),
+                                         device=self.device)
         log_dict = {
-            "dmdtrain_gradient_norm": torch.tensor(0.0, device=self.device)
+            "dmdtrain_gradient_norm": dmd_grad_norm
         }
 
         return dmd_loss, log_dict
@@ -252,7 +265,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
     def _generator_multi_step_simulation_forward(
             self,
             training_batch: TrainingBatch,
-            return_sim_steps: bool = False) -> torch.Tensor:
+            return_sim_steps: bool = False):
         """Forward pass through student transformer matching inference procedure with KV cache management.
         
         This function is adapted from the reference self-forcing implementation's inference_with_trajectory
@@ -607,7 +620,26 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             self._reset_simulation_caches(self.kv_cache1, self.crossattn_cache)
             self._reset_additional_simulation_caches()
 
-        return final_output if gradient_mask is not None else pred_image_or_video
+        output_tensor = final_output if gradient_mask is not None else pred_image_or_video
+        denoised_timestep_from: int | None = None
+        denoised_timestep_to: int | None = None
+        if self.same_step_across_blocks and len(exit_flags) > 0:
+            exit_idx = int(exit_flags[0])
+            scheduler_timesteps = self.noise_scheduler.timesteps.to(self.device)
+            from_t = self.denoising_step_list[exit_idx]
+            denoised_timestep_from = int(self.num_train_timestep - torch.argmin(
+                (scheduler_timesteps - from_t).abs()).item())
+            if exit_idx == len(self.denoising_step_list) - 1:
+                denoised_timestep_to = 0
+            else:
+                to_t = self.denoising_step_list[exit_idx + 1]
+                denoised_timestep_to = int(self.num_train_timestep - torch.argmin(
+                    (scheduler_timesteps - to_t).abs()).item())
+
+        if return_sim_steps:
+            return output_tensor, denoised_timestep_from, denoised_timestep_to, (
+                int(exit_flags[0]) + 1 if len(exit_flags) > 0 else 0)
+        return output_tensor
 
     def _simulation_postprocess_chunk_output(self,
                                              denoised_pred: torch.Tensor,
@@ -1077,18 +1109,18 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             if "generator_timestep" in training_batch.dmd_latent_vis_dict:
                 tracker_loss_dict[
                     "generator_timestep"] = training_batch.dmd_latent_vis_dict[
-                        "generator_timestep"].item()
+                        "generator_timestep"].float().mean().item()
             if "dmd_timestep" in training_batch.dmd_latent_vis_dict:
                 tracker_loss_dict[
                     "dmd_timestep"] = training_batch.dmd_latent_vis_dict[
-                        "dmd_timestep"].item()
+                        "dmd_timestep"].float().mean().item()
 
         if hasattr(
                 training_batch, 'fake_score_latent_vis_dict'
         ) and training_batch.fake_score_latent_vis_dict and "fake_score_timestep" in training_batch.fake_score_latent_vis_dict:
             tracker_loss_dict[
                 "fake_score_timestep"] = training_batch.fake_score_latent_vis_dict[
-                    "fake_score_timestep"].item()
+                    "fake_score_timestep"].float().mean().item()
 
         # Log final dict contents
         logger.info("Final tracker_loss_dict keys: %s",
@@ -1339,24 +1371,24 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 if training_batch.dmd_latent_vis_dict:
                     if "generator_timestep" in training_batch.dmd_latent_vis_dict:
                         log_data["generator_timestep"] = training_batch.dmd_latent_vis_dict[
-                            "generator_timestep"].item()
+                            "generator_timestep"].float().mean().item()
                     if "dmd_timestep" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_timestep"] = training_batch.dmd_latent_vis_dict[
-                            "dmd_timestep"].item()
+                            "dmd_timestep"].float().mean().item()
                     if "dmd_grad_normalizer" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_grad_normalizer"] = training_batch.dmd_latent_vis_dict[
-                            "dmd_grad_normalizer"].item()
+                            "dmd_grad_normalizer"].float().mean().item()
                     if "dmd_grad_normalizer_raw" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_grad_normalizer_raw"] = training_batch.dmd_latent_vis_dict[
-                            "dmd_grad_normalizer_raw"].item()
+                            "dmd_grad_normalizer_raw"].float().mean().item()
                     if "dmd_grad_normalizer_ema" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_grad_normalizer_ema"] = training_batch.dmd_latent_vis_dict[
-                            "dmd_grad_normalizer_ema"].item()
+                            "dmd_grad_normalizer_ema"].float().mean().item()
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":
-                    training_batch.
-                    fake_score_latent_vis_dict["fake_score_timestep"].item(),
+                    _to_log_scalar(training_batch.fake_score_latent_vis_dict[
+                        "fake_score_timestep"]),
                 }
                 log_data.update(faker_score_additional_logs)
 
