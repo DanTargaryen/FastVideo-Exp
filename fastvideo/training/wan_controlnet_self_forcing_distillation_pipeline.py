@@ -355,23 +355,22 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         with torch.no_grad():
             batch_size, num_frames = original_latent.shape[:2]
             timestep = torch.randint(0,
-                                     self.num_train_timestep, [1, 1],
+                                     self.num_train_timestep, [batch_size],
                                      device=self.device,
-                                     dtype=torch.long).repeat(
-                                         batch_size, num_frames)
+                                     dtype=torch.long)
             from fastvideo.training.training_utils import shift_timestep
 
             timestep = shift_timestep(timestep, self.timestep_shift,
                                       self.num_train_timestep)
             timestep = timestep.clamp(self.min_timestep, self.max_timestep)
+            timestep_for_noise = timestep.repeat_interleave(num_frames)
 
             noise = torch.randn_like(generator_pred_video)
 
             noisy_latent = self.noise_scheduler.add_noise(
                 generator_pred_video.flatten(0, 1), noise.flatten(0, 1),
-                timestep.flatten(0, 1)).detach().unflatten(
-                    0,
-                                             (1, generator_pred_video.shape[1]))
+                timestep_for_noise).detach().unflatten(
+                    0, (batch_size, generator_pred_video.shape[1]))
 
             # fake_score forward (critic)
             training_batch = self._build_distill_input_kwargs(
@@ -389,7 +388,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             faker_score_pred_video = pred_noise_to_pred_video(
                 pred_noise=fake_score_pred_noise.flatten(0, 1),
                 noise_input_latent=noisy_latent.flatten(0, 1),
-                timestep=timestep,
+                timestep=timestep_for_noise,
                 scheduler=self.noise_scheduler).unflatten(
                     0, fake_score_pred_noise.shape[:2])
 
@@ -409,7 +408,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             pred_real_video_cond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_cond.flatten(0, 1),
                 noise_input_latent=noisy_latent.flatten(0, 1),
-                timestep=timestep,
+                timestep=timestep_for_noise,
                 scheduler=self.noise_scheduler).unflatten(
                     0, real_score_pred_noise_cond.shape[:2])
 
@@ -427,7 +426,7 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             pred_real_video_uncond = pred_noise_to_pred_video(
                 pred_noise=real_score_pred_noise_uncond.flatten(0, 1),
                 noise_input_latent=noisy_latent.flatten(0, 1),
-                timestep=timestep,
+                timestep=timestep_for_noise,
                 scheduler=self.noise_scheduler).unflatten(
                     0, real_score_pred_noise_uncond.shape[:2])
 
@@ -502,23 +501,24 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
         batch_size, num_frames = generator_pred_video.shape[:2]
         fake_score_timestep = torch.randint(0,
-                                            self.num_train_timestep, [1, 1],
+                                            self.num_train_timestep,
+                                            [batch_size],
                                             device=self.device,
-                                            dtype=torch.long).repeat(
-                                                batch_size, num_frames)
+                                            dtype=torch.long)
         from fastvideo.training.training_utils import shift_timestep
         fake_score_timestep = shift_timestep(fake_score_timestep,
                                              self.timestep_shift,
                                              self.num_train_timestep)
         fake_score_timestep = fake_score_timestep.clamp(self.min_timestep,
                                                         self.max_timestep)
+        fake_score_timestep_for_noise = fake_score_timestep.repeat_interleave(
+            num_frames)
 
         fake_score_noise = torch.randn_like(generator_pred_video)
         noisy_generator_pred_video = self.noise_scheduler.add_noise(
             generator_pred_video.flatten(0, 1), fake_score_noise.flatten(0, 1),
-            fake_score_timestep.flatten(0, 1)).unflatten(
-                0,
-                                           (1, generator_pred_video.shape[1]))
+            fake_score_timestep_for_noise).unflatten(
+                0, (batch_size, generator_pred_video.shape[1]))
 
         training_batch = self._build_distill_input_kwargs(
             noisy_generator_pred_video, fake_score_timestep,
