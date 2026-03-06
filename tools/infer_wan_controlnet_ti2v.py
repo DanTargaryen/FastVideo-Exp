@@ -1900,9 +1900,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     if expand_timesteps and image_latents is not None:
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
-    elif first_frame_latent_bcfhw is not None:
-        latents = latents.clone()
-        latents[:, :, :1] = image_latents[:, :, :1]
 
     return latents
 
