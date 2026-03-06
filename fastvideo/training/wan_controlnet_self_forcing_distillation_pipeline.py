@@ -114,6 +114,34 @@ def _apply_first_frame_latent(
     return conditioned
 
 
+def _sample_uniform_score_timestep(*,
+                                   batch_size: int,
+                                   device: torch.device,
+                                   num_train_timestep: int,
+                                   timestep_shift: float,
+                                   min_timestep: int,
+                                   max_timestep: int,
+                                   denoised_timestep_from: int | None,
+                                   denoised_timestep_to: int | None
+                                   ) -> torch.Tensor:
+    raw_min_timestep = int(min_timestep)
+    raw_max_timestep = int(max_timestep)
+    if denoised_timestep_to is not None:
+        raw_min_timestep = max(raw_min_timestep, int(denoised_timestep_to))
+    if denoised_timestep_from is not None:
+        raw_max_timestep = min(raw_max_timestep, int(denoised_timestep_from))
+    if raw_max_timestep < raw_min_timestep:
+        raw_min_timestep, raw_max_timestep = min_timestep, max_timestep
+
+    timestep = torch.randint(raw_min_timestep,
+                             raw_max_timestep + 1, [batch_size],
+                             device=device,
+                             dtype=torch.long)
+    from fastvideo.training.training_utils import shift_timestep
+    timestep = shift_timestep(timestep, timestep_shift, num_train_timestep)
+    return timestep.clamp(min_timestep, max_timestep)
+
+
 def _np_dtype(dtype_str: str | None) -> np.dtype:
     if dtype_str is None or dtype_str == "":
         return np.float32
@@ -490,19 +518,24 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         original_latent = generator_pred_video
         control_latent = getattr(training_batch, "control_latent", None)
         first_frame_latent = getattr(training_batch, "first_frame_latent", None)
+        denoised_timestep_from = getattr(training_batch, "denoised_timestep_from",
+                                         None)
+        denoised_timestep_to = getattr(training_batch, "denoised_timestep_to",
+                                       None)
         if not hasattr(training_batch, "dmd_latent_vis_dict") or training_batch.dmd_latent_vis_dict is None:
             training_batch.dmd_latent_vis_dict = {}
         with torch.no_grad():
             batch_size, num_frames = original_latent.shape[:2]
-            timestep = torch.randint(0,
-                                     self.num_train_timestep, [batch_size],
-                                     device=self.device,
-                                     dtype=torch.long)
-            from fastvideo.training.training_utils import shift_timestep
-
-            timestep = shift_timestep(timestep, self.timestep_shift,
-                                      self.num_train_timestep)
-            timestep = timestep.clamp(self.min_timestep, self.max_timestep)
+            timestep = _sample_uniform_score_timestep(
+                batch_size=batch_size,
+                device=self.device,
+                num_train_timestep=self.num_train_timestep,
+                timestep_shift=self.timestep_shift,
+                min_timestep=self.min_timestep,
+                max_timestep=self.max_timestep,
+                denoised_timestep_from=denoised_timestep_from,
+                denoised_timestep_to=denoised_timestep_to,
+            )
             timestep_for_noise = timestep.repeat_interleave(num_frames)
             score_attn_metadata = self._build_score_attn_metadata(
                 training_batch, timestep)
@@ -631,6 +664,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "real_score_pred_video": real_score_pred_video.detach(),
             "faker_score_pred_video": faker_score_pred_video.detach(),
             "dmd_timestep": timestep.detach(),
+            "denoised_timestep_from": torch.tensor(
+                -1 if denoised_timestep_from is None else denoised_timestep_from,
+                device=self.device,
+                dtype=torch.float32),
+            "denoised_timestep_to": torch.tensor(
+                -1 if denoised_timestep_to is None else denoised_timestep_to,
+                device=self.device,
+                dtype=torch.float32),
             "dmd_grad_normalizer": grad_normalizer.detach(),
             "dmd_grad_normalizer_raw": grad_normalizer_raw.detach(),
             "dmd_grad_normalizer_ema": grad_normalizer_ema.detach(),
@@ -641,29 +682,39 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
     def faker_score_forward(self, training_batch):
         control_latent = getattr(training_batch, "control_latent", None)
         first_frame_latent = getattr(training_batch, "first_frame_latent", None)
+        denoised_timestep_from = getattr(training_batch, "denoised_timestep_from",
+                                         None)
+        denoised_timestep_to = getattr(training_batch, "denoised_timestep_to",
+                                       None)
         # The Wan attention stack requires ForwardContext to be set for every
         # forward pass (including ControlNet during simulation).
         with torch.no_grad(), set_forward_context(
                 current_timestep=training_batch.timesteps,
                 attn_metadata=training_batch.attn_metadata):
             if self.training_args.simulate_generator_forward:
-                generator_pred_video = self._generator_multi_step_simulation_forward(
-                    training_batch)
+                rollout = self._generator_multi_step_simulation_forward(
+                    training_batch, return_sim_steps=True)
+                if isinstance(rollout, tuple):
+                    (generator_pred_video, denoised_timestep_from,
+                     denoised_timestep_to, _) = rollout
+                else:
+                    generator_pred_video = rollout
             else:
                 generator_pred_video = self._generator_forward(training_batch)
 
         batch_size, num_frames = generator_pred_video.shape[:2]
-        fake_score_timestep = torch.randint(0,
-                                            self.num_train_timestep,
-                                            [batch_size],
-                                            device=self.device,
-                                            dtype=torch.long)
-        from fastvideo.training.training_utils import shift_timestep
-        fake_score_timestep = shift_timestep(fake_score_timestep,
-                                             self.timestep_shift,
-                                             self.num_train_timestep)
-        fake_score_timestep = fake_score_timestep.clamp(self.min_timestep,
-                                                        self.max_timestep)
+        training_batch.denoised_timestep_from = denoised_timestep_from
+        training_batch.denoised_timestep_to = denoised_timestep_to
+        fake_score_timestep = _sample_uniform_score_timestep(
+            batch_size=batch_size,
+            device=self.device,
+            num_train_timestep=self.num_train_timestep,
+            timestep_shift=self.timestep_shift,
+            min_timestep=self.min_timestep,
+            max_timestep=self.max_timestep,
+            denoised_timestep_from=denoised_timestep_from,
+            denoised_timestep_to=denoised_timestep_to,
+        )
         fake_score_timestep_for_noise = fake_score_timestep.repeat_interleave(
             num_frames)
         score_attn_metadata = self._build_score_attn_metadata(
@@ -699,6 +750,14 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         training_batch.fake_score_latent_vis_dict = {
             "generator_pred_video": generator_pred_video,
             "fake_score_timestep": fake_score_timestep,
+            "denoised_timestep_from": torch.tensor(
+                -1 if denoised_timestep_from is None else denoised_timestep_from,
+                device=self.device,
+                dtype=torch.float32),
+            "denoised_timestep_to": torch.tensor(
+                -1 if denoised_timestep_to is None else denoised_timestep_to,
+                device=self.device,
+                dtype=torch.float32),
         }
         return training_batch, flow_matching_loss
 

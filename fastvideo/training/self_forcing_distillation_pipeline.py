@@ -206,6 +206,16 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     self.global_rank,
                     local_main_process_only=False)
 
+    def _normalize_dit_input(self,
+                             training_batch: TrainingBatch) -> TrainingBatch:
+        # Self-forcing generator rollout synthesizes its own noise latents.
+        # The placeholder batch.latents created by _get_next_batch are used for
+        # shape bookkeeping only, so they should not be remapped from VAE latent
+        # space through DiT input normalization.
+        if getattr(self.training_args, "simulate_generator_forward", False):
+            return training_batch
+        return super()._normalize_dit_input(training_batch)
+
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int,
                                device: torch.device) -> list[int]:
         """Generate and synchronize random exit flags across distributed processes."""
@@ -279,8 +289,17 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         with set_forward_context(
                 current_timestep=training_batch.timesteps,
                 attn_metadata=training_batch.attn_metadata_vsa):
-            generator_pred_video = self._generator_multi_step_simulation_forward(
-                training_batch)
+            rollout = self._generator_multi_step_simulation_forward(
+                training_batch, return_sim_steps=True)
+        if isinstance(rollout, tuple):
+            (generator_pred_video, denoised_timestep_from,
+             denoised_timestep_to, _) = rollout
+        else:
+            generator_pred_video = rollout
+            denoised_timestep_from = None
+            denoised_timestep_to = None
+        training_batch.denoised_timestep_from = denoised_timestep_from
+        training_batch.denoised_timestep_to = denoised_timestep_to
 
         with set_forward_context(current_timestep=training_batch.timesteps,
                                  attn_metadata=training_batch.attn_metadata):
