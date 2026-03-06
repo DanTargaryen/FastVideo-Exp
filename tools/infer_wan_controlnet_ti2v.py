@@ -638,6 +638,74 @@ def _encode_video_latents(vae,
     return _postprocess_vae_latents(vae, latents)
 
 
+@torch.no_grad()
+def _build_online_image_latent_from_rgb(
+    *,
+    first_rgb_chw: torch.Tensor,
+    num_frames: int,
+    vae,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    first_bcthw = _to_vae_input(first_rgb_chw[None, ...], normalize=True).to(
+        device=inference_device, dtype=compute_dtype)
+    video_condition = torch.cat(
+        [
+            first_bcthw,
+            first_bcthw.new_zeros(first_bcthw.shape[0], first_bcthw.shape[1],
+                                  max(int(num_frames) - 1, 0),
+                                  first_bcthw.shape[3], first_bcthw.shape[4]),
+        ],
+        dim=2,
+    )
+    latent_condition = _encode_video_latents(
+        vae,
+        video_condition,
+        sample_mode="mode",
+        compute_dtype=compute_dtype,
+    )
+    latent_condition_cf = _align_latent_channels(latent_condition[0], target_c,
+                                                 "image_latent_condition")
+    latent_condition = latent_condition_cf.unsqueeze(0)
+
+    latent_t = int(latent_condition.shape[2])
+    latent_h = int(latent_condition.shape[3])
+    latent_w = int(latent_condition.shape[4])
+    temporal_ratio = int(getattr(vae, "temporal_compression_ratio", 4))
+
+    mask_lat_size = torch.ones(
+        1,
+        1,
+        max(int(num_frames), 1),
+        latent_h,
+        latent_w,
+        device=latent_condition.device,
+        dtype=latent_condition.dtype,
+    )
+    if int(num_frames) > 1:
+        mask_lat_size[:, :, 1:] = 0
+    first_frame_mask = mask_lat_size[:, :, 0:1]
+    first_frame_mask = torch.repeat_interleave(first_frame_mask,
+                                               dim=2,
+                                               repeats=temporal_ratio)
+    mask_lat_size = torch.cat([first_frame_mask, mask_lat_size[:, :, 1:]], dim=2)
+
+    required_steps = latent_t * temporal_ratio
+    current_steps = int(mask_lat_size.shape[2])
+    if current_steps < required_steps:
+        pad = mask_lat_size.new_zeros(1, 1, required_steps - current_steps,
+                                      latent_h, latent_w)
+        mask_lat_size = torch.cat([mask_lat_size, pad], dim=2)
+    elif current_steps > required_steps:
+        mask_lat_size = mask_lat_size[:, :, :required_steps]
+
+    mask_lat_size = mask_lat_size.view(1, latent_t, temporal_ratio, latent_h,
+                                       latent_w)
+    mask_lat_size = mask_lat_size.transpose(1, 2).contiguous()
+    return torch.cat([mask_lat_size, latent_condition], dim=1)
+
+
 def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
     if lat.ndim != 4:
         raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
@@ -770,6 +838,7 @@ class Sample:
     text_embedding_bld: torch.Tensor  # [B, L, D]
     first_frame_latent_bcfhw: torch.Tensor  # [B, C, 1, H, W]
     control_latent_bcfhw: torch.Tensor  # [B, 3*C, F, H, W]
+    image_latent_bcfhw: torch.Tensor | None = None  # [B, C_img, F, H, W]
 
 
 def _load_sample(data_path: str, index: int) -> Sample:
@@ -806,7 +875,8 @@ def _load_sample(data_path: str, index: int) -> Sample:
                   fps=fps_val,
                   text_embedding_bld=text_embedding,
                   first_frame_latent_bcfhw=first_frame_latent,
-                  control_latent_bcfhw=control_latent)
+                  control_latent_bcfhw=control_latent,
+                  image_latent_bcfhw=None)
 
 
 def _read_caption_json(path: Path, caption_key: str) -> str:
@@ -1049,6 +1119,14 @@ def _load_sample_raw(
     target_c = int(getattr(transformer, "num_channels_latents", first_lat.shape[1]))
     first_lat_cf = _align_latent_channels(first_lat[0], target_c, "first_frame_lat")
     first_lat_bcfhw = first_lat_cf.unsqueeze(0)
+    image_latent_bcfhw = _build_online_image_latent_from_rgb(
+        first_rgb_chw=first_rgb,
+        num_frames=int(args.num_frames),
+        vae=vae,
+        target_c=target_c,
+        inference_device=inference_device,
+        compute_dtype=compute_dtype,
+    )
 
     depth_lat = _align_latent_channels(depth_lat, target_c, "depth_lat")
     masked_lat = _align_latent_channels(masked_lat, target_c, "masked_lat")
@@ -1068,6 +1146,7 @@ def _load_sample_raw(
         text_embedding_bld=text_embedding,
         first_frame_latent_bcfhw=first_lat_bcfhw,
         control_latent_bcfhw=control_lat_bcfhw,
+        image_latent_bcfhw=image_latent_bcfhw,
     )
 
 
@@ -1681,6 +1760,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     guidance_scale: float,
     controlnet_weight: float,
     first_frame_latent_bcfhw: torch.Tensor | None,
+    image_latent_bcfhw: torch.Tensor | None,
     control_latent_bcfhw: torch.Tensor,
     height: int,
     width: int,
@@ -1733,7 +1813,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         device=device,
         dtype=torch.float32,
     )
-    if first_frame_latent_bcfhw is not None:
+    if not expand_timesteps and image_latent_bcfhw is not None:
+        image_latents = image_latent_bcfhw.to(device=device, dtype=dtype)
+    elif first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         first_frame_mask[:, :, 0] = 0
 
@@ -2055,6 +2137,15 @@ def main() -> None:
     parser.add_argument("--raw_caption_key", type=str, default="Video_Caption")
     parser.add_argument("--raw_prompt", type=str, default="")
     parser.add_argument("--raw_fps", type=int, default=16)
+    parser.add_argument(
+        "--conditioning_image_path",
+        type=str,
+        default="",
+        help=(
+            "Optional first-frame RGB image for rebuilding full TI2V image_latent online. "
+            "Useful for parquet bidirectional inference, where parquet usually stores only first_frame_latent."
+        ),
+    )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
     parser.add_argument("--raw_mask_invert", action="store_true")
     parser.add_argument("--raw_require_normal", action="store_true")
@@ -2572,6 +2663,31 @@ def main() -> None:
         logger.info("sample=%s idx=%s caption=%s", sample.sample_id, sample_idx,
                     sample.caption)
 
+        image_latent = sample.image_latent_bcfhw
+        if image_latent is None and str(args.conditioning_image_path).strip():
+            cond_img_path = Path(str(args.conditioning_image_path)).expanduser()
+            if not cond_img_path.is_file():
+                raise FileNotFoundError(
+                    f"--conditioning_image_path not found: {str(cond_img_path)}")
+            cond_rgb = _load_rgb_frame(cond_img_path, int(args.height),
+                                       int(args.width))
+            target_c = int(
+                getattr(transformer, "num_channels_latents",
+                        sample.first_frame_latent_bcfhw.shape[1]))
+            image_latent = _build_online_image_latent_from_rgb(
+                first_rgb_chw=cond_rgb,
+                num_frames=int(args.num_frames),
+                vae=vae,
+                target_c=target_c,
+                inference_device=inference_device,
+                compute_dtype=dtype,
+            )
+            logger.info(
+                "bidir alignment: rebuilt image_latent online from %s with shape=%s",
+                str(cond_img_path),
+                tuple(image_latent.shape),
+            )
+
         prompt_embeds = sample.text_embedding_bld.to(device="cuda",
                                                      dtype=dtype)
         negative_prompt_embeds = None
@@ -2614,6 +2730,8 @@ def main() -> None:
             logger.info(_tensor_stats("text_embedding", prompt_embeds))
             logger.info(_tensor_stats("first_frame_latent", first_frame_latent))
             logger.info(_tensor_stats("control_latent", control_latent))
+            if image_latent is not None:
+                logger.info(_tensor_stats("image_latent", image_latent))
             # Sanity-check decode: if this PNG already looks like noise, then the latent space / decode
             # path is mismatched (preprocess vs decode), independent of diffusion sampling quality.
             decoded_first = decoding.decode(first_frame_latent, fastvideo_args)[0]
@@ -2648,6 +2766,8 @@ def main() -> None:
                 guidance_scale=float(args.guidance_scale),
                 controlnet_weight=float(args.controlnet_weight),
                 first_frame_latent_bcfhw=first_frame_latent,
+                image_latent_bcfhw=(image_latent.to(device="cuda", dtype=dtype)
+                                    if image_latent is not None else None),
                 control_latent_bcfhw=control_latent,
                 height=args.height,
                 width=args.width,
