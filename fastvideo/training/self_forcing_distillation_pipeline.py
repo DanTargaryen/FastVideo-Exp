@@ -1175,6 +1175,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                    training_batch: TrainingBatch
                                    ) -> dict[str, Any]:
         metrics: dict[str, Any] = {}
+        metrics["dmd_ts_schedule_min_enabled"] = float(
+            bool(getattr(self.training_args, "ts_schedule", False)))
+        metrics["dmd_ts_schedule_max_enabled"] = float(
+            bool(getattr(self.training_args, "ts_schedule_max", False)))
         dmd_vis = getattr(training_batch, "dmd_latent_vis_dict", None) or {}
         fake_vis = getattr(training_batch, "fake_score_latent_vis_dict",
                            None) or {}
@@ -1272,10 +1276,19 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             if denoised_to.numel() == 1:
                 denoised_to = denoised_to.expand_as(dmd_timestep)
             valid_mask = (denoised_from >= 0) & (denoised_to >= 0)
-            metrics["dmd_timestep_out_of_range"] = (
-                valid_mask & ((dmd_timestep < denoised_to)
-                              | (dmd_timestep > denoised_from))
-            ).float().mean().item()
+            use_min = bool(getattr(self.training_args, "ts_schedule", False))
+            use_max = bool(getattr(self.training_args, "ts_schedule_max",
+                                   False))
+            if use_min or use_max:
+                out = torch.zeros_like(dmd_timestep, dtype=torch.bool)
+                if use_min:
+                    out = out | (dmd_timestep < denoised_to)
+                if use_max:
+                    out = out | (dmd_timestep > denoised_from)
+                metrics["dmd_timestep_out_of_range"] = (
+                    valid_mask & out).float().mean().item()
+            else:
+                metrics["dmd_timestep_out_of_range"] = 0.0
 
         fake_shifted_from = _maybe_shift_rollout_timestep_bounds(
             fake_vis.get("denoised_timestep_from"),
@@ -1308,10 +1321,19 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             if denoised_to.numel() == 1:
                 denoised_to = denoised_to.expand_as(fake_score_timestep)
             valid_mask = (denoised_from >= 0) & (denoised_to >= 0)
-            metrics["fake_score_timestep_out_of_range"] = (
-                valid_mask & ((fake_score_timestep < denoised_to)
-                              | (fake_score_timestep > denoised_from))
-            ).float().mean().item()
+            use_min = bool(getattr(self.training_args, "ts_schedule", False))
+            use_max = bool(getattr(self.training_args, "ts_schedule_max",
+                                   False))
+            if use_min or use_max:
+                out = torch.zeros_like(fake_score_timestep, dtype=torch.bool)
+                if use_min:
+                    out = out | (fake_score_timestep < denoised_to)
+                if use_max:
+                    out = out | (fake_score_timestep > denoised_from)
+                metrics["fake_score_timestep_out_of_range"] = (
+                    valid_mask & out).float().mean().item()
+            else:
+                metrics["fake_score_timestep_out_of_range"] = 0.0
 
         return metrics
 
@@ -1334,6 +1356,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             "teacher_residual_clip_scale",
             "teacher_output_std",
             "teacher_output_clip_scale",
+            "dmd_ts_schedule_min_enabled",
+            "dmd_ts_schedule_max_enabled",
             "dmd_first_frame_grad_zeroed",
             "dmd_gen_vs_real_abs_mean",
             "dmd_fake_vs_real_abs_mean",

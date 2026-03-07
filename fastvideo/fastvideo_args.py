@@ -831,6 +831,15 @@ class TrainingArgs(FastVideoArgs):
     dmd_teacher_cfg_delta_max_ratio: float = 1.5
     dmd_teacher_residual_max_ratio: float = 1.5
     dmd_teacher_output_max_ratio: float = 1.15
+    # Match Causal-Forcing DMD timestep policy by default.
+    # ts_schedule: constrain min timestep by denoised_timestep_to
+    # ts_schedule_max: constrain max timestep by denoised_timestep_from
+    ts_schedule: bool = False
+    ts_schedule_max: bool = False
+    # Whether to normalize first_frame/control latents with Wan latents_mean/std
+    # before feeding generator/teacher/critic ControlNet paths.
+    # Default False to align with existing phase-1 ODE/controlnet parquet space.
+    normalize_condition_latents: bool = False
     fake_score_learning_rate: float = 0.0  # separate learning rate for fake_score_transformer, if 0.0, use learning_rate
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
     fake_score_betas: str = "0.9,0.999"  # betas for fake score optimizer, format: "beta1,beta2"
@@ -1305,6 +1314,24 @@ class TrainingArgs(FastVideoArgs):
             default=TrainingArgs.dmd_teacher_output_max_ratio,
             help=
             "Final clamp: teacher output std <= student std * ratio (<=0 disables)."
+        )
+        parser.add_argument(
+            "--ts-schedule",
+            action=StoreBoolean,
+            help=
+            "Constrain sampled DMD/fake-score min timestep to rollout denoised_timestep_to (Causal-Forcing: default False)."
+        )
+        parser.add_argument(
+            "--ts-schedule-max",
+            action=StoreBoolean,
+            help=
+            "Constrain sampled DMD/fake-score max timestep to rollout denoised_timestep_from (Causal-Forcing: default False)."
+        )
+        parser.add_argument(
+            "--normalize-condition-latents",
+            action=StoreBoolean,
+            help=
+            "Normalize first_frame/control latents with Wan latents_mean/std before model forward (default False for phase-1/causal alignment)."
         )
         parser.add_argument("--fake-score-learning-rate",
                             type=float,

@@ -73,8 +73,10 @@ def _build_controlnet_kwargs(controlnet, control_latent: torch.Tensor,
 
 
 def _normalize_first_frame_latent(first_frame_latent: torch.Tensor,
-                                  vae) -> torch.Tensor:
-    if first_frame_latent.ndim != 5:
+                                  vae,
+                                  *,
+                                  enabled: bool = False) -> torch.Tensor:
+    if (not enabled) or first_frame_latent.ndim != 5:
         return first_frame_latent
     latent_bcfhw = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
     latent_bcfhw = normalize_dit_input("wan", latent_bcfhw, vae)
@@ -82,8 +84,10 @@ def _normalize_first_frame_latent(first_frame_latent: torch.Tensor,
 
 
 def _normalize_control_latent(control_latent: torch.Tensor, vae,
-                              num_channels_latents: int) -> torch.Tensor:
-    if control_latent.ndim != 5:
+                              num_channels_latents: int,
+                              *,
+                              enabled: bool = False) -> torch.Tensor:
+    if (not enabled) or control_latent.ndim != 5:
         return control_latent
     chunks = []
     total_channels = control_latent.shape[1]
@@ -121,14 +125,16 @@ def _sample_uniform_score_timestep(*,
                                    timestep_shift: float,
                                    min_timestep: int,
                                    max_timestep: int,
+                                   use_rollout_min: bool,
+                                   use_rollout_max: bool,
                                    denoised_timestep_from: int | None,
                                    denoised_timestep_to: int | None
                                    ) -> torch.Tensor:
     raw_min_timestep = int(min_timestep)
     raw_max_timestep = int(max_timestep)
-    if denoised_timestep_to is not None:
+    if use_rollout_min and denoised_timestep_to is not None:
         raw_min_timestep = max(raw_min_timestep, int(denoised_timestep_to))
-    if denoised_timestep_from is not None:
+    if use_rollout_max and denoised_timestep_from is not None:
         raw_max_timestep = min(raw_max_timestep, int(denoised_timestep_from))
     if raw_max_timestep < raw_min_timestep:
         raw_min_timestep, raw_max_timestep = min_timestep, max_timestep
@@ -538,6 +544,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                                          None)
         denoised_timestep_to = getattr(training_batch, "denoised_timestep_to",
                                        None)
+        use_rollout_min = bool(getattr(self.training_args, "ts_schedule", False))
+        use_rollout_max = bool(
+            getattr(self.training_args, "ts_schedule_max", False))
         if not hasattr(training_batch, "dmd_latent_vis_dict") or training_batch.dmd_latent_vis_dict is None:
             training_batch.dmd_latent_vis_dict = {}
         with torch.no_grad():
@@ -549,6 +558,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 timestep_shift=self.timestep_shift,
                 min_timestep=self.min_timestep,
                 max_timestep=self.max_timestep,
+                use_rollout_min=use_rollout_min,
+                use_rollout_max=use_rollout_max,
                 denoised_timestep_from=denoised_timestep_from,
                 denoised_timestep_to=denoised_timestep_to,
             )
@@ -771,6 +782,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                                          None)
         denoised_timestep_to = getattr(training_batch, "denoised_timestep_to",
                                        None)
+        use_rollout_min = bool(getattr(self.training_args, "ts_schedule", False))
+        use_rollout_max = bool(
+            getattr(self.training_args, "ts_schedule_max", False))
         # The Wan attention stack requires ForwardContext to be set for every
         # forward pass (including ControlNet during simulation).
         with torch.no_grad(), set_forward_context(
@@ -797,6 +811,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             timestep_shift=self.timestep_shift,
             min_timestep=self.min_timestep,
             max_timestep=self.max_timestep,
+            use_rollout_min=use_rollout_min,
+            use_rollout_max=use_rollout_max,
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to,
         )
@@ -883,6 +899,15 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 "Forcing rollout_add_context_noise=False in Wan ControlNet self-forcing to align with causal inference cache update."
             )
         self.rollout_add_context_noise = False
+        logger.info(
+            "DMD timestep schedule flags: ts_schedule(min)=%s ts_schedule_max(max)=%s",
+            bool(getattr(training_args, "ts_schedule", False)),
+            bool(getattr(training_args, "ts_schedule_max", False)),
+        )
+        logger.info(
+            "Condition latent normalization: normalize_condition_latents=%s",
+            bool(getattr(training_args, "normalize_condition_latents", False)),
+        )
 
         # Activation checkpointing for ControlNet modules (important for memory in
         # self-forcing rollout, where the KV-cache path would otherwise retain a
@@ -1077,15 +1102,29 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         # Expected shape: BFCHW (B,1,16,H,W). Also allow BCFHW (B,16,1,H,W).
         if first_frame_latent.ndim == 5 and first_frame_latent.shape[1] == 16 and first_frame_latent.shape[2] == 1:
             first_frame_latent = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
+        normalize_condition_latents = bool(
+            getattr(self.training_args, "normalize_condition_latents", False))
         first_frame_latent = _normalize_first_frame_latent(first_frame_latent,
-                                                           self.vae)
+                                                           self.vae,
+                                                           enabled=normalize_condition_latents)
 
         num_channels = int(self.training_args.pipeline_config.vae_config.arch_config.z_dim)
         control_latent = _normalize_control_latent(control_latent, self.vae,
-                                                   num_channels)
+                                                   num_channels,
+                                                   enabled=normalize_condition_latents)
 
         training_batch.control_latent = control_latent
         training_batch.first_frame_latent = first_frame_latent
+        if not getattr(self, "_logged_condition_latent_stats", False):
+            logger.info(
+                "Condition latent stats (post-load): normalize=%s first_frame(mean=%.6f std=%.6f) control(mean=%.6f std=%.6f)",
+                normalize_condition_latents,
+                float(first_frame_latent.float().mean().item()),
+                float(first_frame_latent.float().std(unbiased=False).item()),
+                float(control_latent.float().mean().item()),
+                float(control_latent.float().std(unbiased=False).item()),
+            )
+            self._logged_condition_latent_stats = True
 
         return training_batch
 
@@ -1141,11 +1180,17 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
         device = get_local_torch_device()
         dtype = torch.bfloat16
+        normalize_condition_latents = bool(
+            getattr(training_args, "normalize_condition_latents", False))
         first_frame_latent = _normalize_first_frame_latent(
-            first_frame_latent.to(device=device, dtype=dtype), self.vae)
+            first_frame_latent.to(device=device, dtype=dtype),
+            self.vae,
+            enabled=normalize_condition_latents)
         control_latent = _normalize_control_latent(
-            control_latent.to(device=device, dtype=dtype), self.vae,
-            int(training_args.pipeline_config.vae_config.arch_config.z_dim))
+            control_latent.to(device=device, dtype=dtype),
+            self.vae,
+            int(training_args.pipeline_config.vae_config.arch_config.z_dim),
+            enabled=normalize_condition_latents)
 
         batch = ForwardBatch(
             **shallow_asdict(sampling_param),
@@ -1181,11 +1226,6 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             if not hasattr(args_copy.pipeline_config,
                            "validation_full_schedule"):
                 args_copy.pipeline_config.validation_full_schedule = False
-            if not hasattr(args_copy.pipeline_config,
-                           "validation_timestep_indices"):
-                args_copy.pipeline_config.validation_timestep_indices = [
-                    0, 12, 24, 36
-                ]
             logger.info(
                 "Validation rollout config: update_rule=%s full_schedule=%s timestep_indices=%s",
                 getattr(args_copy.pipeline_config, "validation_update_rule",

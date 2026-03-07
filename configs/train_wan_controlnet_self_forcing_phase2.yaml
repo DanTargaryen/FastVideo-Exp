@@ -55,7 +55,8 @@ context_noise: 0
 dfake_gen_update_ratio: 5
 
 # ---- DMD / CFG ----
-real_score_guidance_scale: 5
+# Causal-Forcing DMD uses guidance_scale=3.0.
+real_score_guidance_scale: 3.0
 training_cfg_rate: 0.0
 dmd_grad_normalizer_min: 1.0e-3
 dmd_grad_normalizer_ema_decay: 0.99
@@ -64,6 +65,10 @@ dmd_grad_value_clip: 10.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
 dmd_denoising_steps: "1000,750,500,250"
 warp_denoising_step: true
+ts_schedule: false
+ts_schedule_max: false
+# Keep condition latent space aligned with phase-1 causal/inference parquet convention.
+normalize_condition_latents: false
 negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 # ---- Training ----
