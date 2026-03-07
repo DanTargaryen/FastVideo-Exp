@@ -817,9 +817,15 @@ class DistillationPipeline(TrainingPipeline):
                 scheduler=self.noise_scheduler).unflatten(
                     0, real_score_pred_noise_uncond.shape[:2])
 
-            real_score_pred_video = pred_real_video_cond + (
-                pred_real_video_cond -
-                pred_real_video_uncond) * self.real_score_guidance_scale
+            teacher_cfg_delta = (pred_real_video_cond -
+                                 pred_real_video_uncond
+                                 ) * self.real_score_guidance_scale
+            if bool(
+                    getattr(self.training_args,
+                            "dmd_teacher_cfg_use_uncond_base", True)):
+                real_score_pred_video = pred_real_video_uncond + teacher_cfg_delta
+            else:
+                real_score_pred_video = pred_real_video_cond + teacher_cfg_delta
 
             # Stabilize DMD normalization when student is very close to teacher.
             # Use raw normalizer with EMA-based floor to prevent tiny early-step
@@ -1237,6 +1243,10 @@ class DistillationPipeline(TrainingPipeline):
                     self.generator_update_interval)
         assert isinstance(self.training_args, TrainingArgs)
         logger.info("  Max gradient norm: %s", self.training_args.max_grad_norm)
+        logger.info("  Teacher CFG uses uncond base: %s",
+                    bool(
+                        getattr(self.training_args,
+                                "dmd_teacher_cfg_use_uncond_base", True)))
 
         logger.info(
             "  Real score transformer (high noise expert) parameters: %s B",

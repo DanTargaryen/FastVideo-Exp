@@ -22,6 +22,7 @@ from fastvideo.training.self_forcing_distillation_pipeline import (
 )
 from fastvideo.training.activation_checkpoint import apply_activation_checkpointing
 from fastvideo.training.training_utils import (
+    EMA_FSDP,
     clip_grad_norm_while_handling_failing_dtensor_cases,
     get_scheduler,
     normalize_dit_input,
@@ -714,7 +715,13 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                     max=1.0,
                 )
                 teacher_cfg_delta = teacher_cfg_delta * teacher_cfg_clip_scale
-            real_score_pred_video = pred_real_video_cond + teacher_cfg_delta
+            teacher_cfg_from_uncond = bool(
+                getattr(self.training_args, "dmd_teacher_cfg_use_uncond_base",
+                        True))
+            if teacher_cfg_from_uncond:
+                real_score_pred_video = pred_real_video_uncond + teacher_cfg_delta
+            else:
+                real_score_pred_video = pred_real_video_cond + teacher_cfg_delta
 
             teacher_residual = real_score_pred_video - original_latent
             teacher_residual_std = _samplewise_std(teacher_residual)
@@ -841,6 +848,10 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "teacher_cfg_delta_std": teacher_cfg_delta_std.detach(),
             "teacher_cfg_clip_scale": teacher_cfg_clip_scale.detach(),
             "teacher_cfg_clip_ratio_used": teacher_cfg_clip_ratio.detach(),
+            "teacher_cfg_from_uncond": torch.tensor(
+                1.0 if teacher_cfg_from_uncond else 0.0,
+                device=self.device,
+                dtype=torch.float32),
             "teacher_residual_std": teacher_residual_std.detach(),
             "teacher_residual_clip_scale":
             teacher_residual_clip_scale.detach(),
@@ -1024,6 +1035,12 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 getattr(training_args, "dmd_teacher_high_noise_guidance_scale",
                         2.0)),
         )
+        logger.info(
+            "Teacher CFG composition: use_uncond_base=%s",
+            bool(
+                getattr(training_args, "dmd_teacher_cfg_use_uncond_base",
+                        True)),
+        )
 
         # Activation checkpointing for ControlNet modules (important for memory in
         # self-forcing rollout, where the KV-cache path would otherwise retain a
@@ -1068,6 +1085,17 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         if getattr(self, "fake_score_controlnet", None) is not None:
             self.fake_score_controlnet.requires_grad_(True)
             self.fake_score_controlnet.train()
+
+        # Maintain EMA for student ControlNet as well; transformer-only EMA is
+        # insufficient for TI2V+ControlNet inference stability.
+        self.controlnet_ema = None
+        if (getattr(self, "controlnet", None) is not None
+                and self.training_args.ema_decay is not None
+                and self.training_args.ema_decay > 0.0):
+            self.controlnet_ema = EMA_FSDP(
+                self.controlnet, decay=self.training_args.ema_decay)
+            logger.info("Initialized controlnet EMA with decay=%s",
+                        self.training_args.ema_decay)
 
         # Rebuild generator optimizer to include controlnet params
         if getattr(self, "controlnet", None) is not None:
@@ -1211,13 +1239,25 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         training_batch.infos = infos
 
         # Required fields for TI2V + ControlNet
-        control_latent = batch["control_latent"].to(device, dtype=dtype)
-        first_frame_latent = batch["first_frame_latent"].to(device, dtype=dtype)
-        # Store separately: we keep TI2V first-frame as an in-chunk constraint (chunk 0, frame 0),
-        # instead of treating it as an extra "context frame" (which would require 1+3k frames).
-        # Expected shape: BFCHW (B,1,16,H,W). Also allow BCFHW (B,16,1,H,W).
-        if first_frame_latent.ndim == 5 and first_frame_latent.shape[1] == 16 and first_frame_latent.shape[2] == 1:
-            first_frame_latent = first_frame_latent.permute(0, 2, 1, 3, 4).contiguous()
+        # Canonicalize condition latent layouts to avoid silent shape-space
+        # mismatch across parquet sources:
+        # - first_frame_latent: BCFHW (B,C,1,H,W) -> BFCHW (B,1,C,H,W) internally
+        # - control_latent: B,C_total,F,H,W
+        first_frame_latent_bcfhw = _ensure_first_frame_bcfhw(
+            batch["first_frame_latent"])
+        control_latent = _ensure_control_latent_bcfhw(
+            batch["control_latent"],
+            latent_channels=int(first_frame_latent_bcfhw.shape[1]))
+        if int(control_latent.shape[2]) != int(self.training_args.num_latent_t):
+            raise ValueError(
+                "Training control_latent temporal length mismatch: "
+                f"control_latent.shape[2]={int(control_latent.shape[2])}, "
+                f"num_latent_t={int(self.training_args.num_latent_t)}")
+
+        first_frame_latent = first_frame_latent_bcfhw.permute(
+            0, 2, 1, 3, 4).contiguous()
+        first_frame_latent = first_frame_latent.to(device, dtype=dtype)
+        control_latent = control_latent.to(device, dtype=dtype)
         normalize_condition_latents = bool(
             getattr(self.training_args, "normalize_condition_latents", False))
         first_frame_latent = _normalize_first_frame_latent(first_frame_latent,

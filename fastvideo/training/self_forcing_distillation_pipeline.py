@@ -2,6 +2,7 @@
 import copy
 import os
 import time
+from contextlib import ExitStack
 from collections import deque
 from typing import Any
 
@@ -1069,6 +1070,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                         self.generator_ema_2.update(self.transformer_2)
                 else:
                     self.generator_ema.update(self.transformer)
+            controlnet_ema = getattr(self, "controlnet_ema", None)
+            controlnet = getattr(self, "controlnet", None)
+            if controlnet_ema is not None and controlnet is not None:
+                controlnet_ema.update(controlnet)
 
             avg_generator_loss = torch.tensor(total_generator_loss /
                                               gradient_accumulation_steps,
@@ -1228,6 +1233,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 ("teacher_cfg_delta_std", "teacher_cfg_delta_std"),
                 ("teacher_cfg_clip_scale", "teacher_cfg_clip_scale"),
                 ("teacher_cfg_clip_ratio_used", "teacher_cfg_clip_ratio_used"),
+                ("teacher_cfg_from_uncond", "teacher_cfg_from_uncond"),
                 ("teacher_residual_std", "teacher_residual_std"),
                 ("teacher_residual_clip_scale",
                  "teacher_residual_clip_scale"),
@@ -1364,6 +1370,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             "teacher_cfg_delta_std",
             "teacher_cfg_clip_scale",
             "teacher_cfg_clip_ratio_used",
+            "teacher_cfg_from_uncond",
             "teacher_residual_std",
             "teacher_residual_clip_scale",
             "teacher_residual_clip_ratio_used",
@@ -1645,6 +1652,15 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                         "Created generator EMA_2 at step %s with decay=%s",
                         step, self.training_args.ema_decay)
 
+            if (step >= self.training_args.ema_start_step
+                    and getattr(self, "controlnet", None) is not None
+                    and getattr(self, "controlnet_ema", None) is None
+                    and self.training_args.ema_decay > 0):
+                self.controlnet_ema = EMA_FSDP(  # type: ignore[attr-defined]
+                    self.controlnet, decay=self.training_args.ema_decay)
+                logger.info("Created controlnet EMA at step %s with decay=%s",
+                            step, self.training_args.ema_decay)
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 training_batch = self.train_one_step(training_batch)
 
@@ -1799,39 +1815,67 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     self.training_args.weight_only_checkpointing_steps == 0):
                 print("rank", self.global_rank,
                       "save weight-only checkpoint at step", step)
-                save_distillation_checkpoint(
-                    self.transformer,
-                    self.fake_score_transformer,
-                    self.global_rank,
-                    self.training_args.output_dir,
-                    f"{step}_weight_only",
-                    only_save_generator_weight=True,
-                    generator_ema=self.generator_ema,
-                    generator_controlnet=getattr(self, "controlnet", None),
-                    fake_score_controlnet=getattr(self, "fake_score_controlnet",
-                                                  None),
-                    # MoE support
-                    generator_transformer_2=getattr(self, 'transformer_2',
-                                                    None),
-                    real_score_transformer_2=getattr(
-                        self, 'real_score_transformer_2', None),
-                    fake_score_transformer_2=getattr(
-                        self, 'fake_score_transformer_2', None),
-                    generator_optimizer_2=getattr(self, 'optimizer_2', None),
-                    fake_score_optimizer_2=getattr(self,
-                                                   'fake_score_optimizer_2',
-                                                   None),
-                    generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
-                    fake_score_scheduler_2=getattr(self,
-                                                   'fake_score_lr_scheduler_2',
-                                                   None),
-                    generator_ema_2=getattr(self, 'generator_ema_2', None))
+                with ExitStack() as ema_stack:
+                    saving_with_ema = False
+                    if self.is_ema_ready():
+                        if self.generator_ema is not None:
+                            ema_stack.enter_context(
+                                self.generator_ema.apply_to_model(
+                                    self.transformer))
+                            saving_with_ema = True
+                        if (getattr(self, "generator_ema_2", None) is not None
+                                and getattr(self, "transformer_2", None)
+                                is not None):
+                            ema_stack.enter_context(
+                                self.generator_ema_2.apply_to_model(
+                                    self.transformer_2))
+                            saving_with_ema = True
+                        if (getattr(self, "controlnet_ema", None) is not None
+                                and getattr(self, "controlnet", None)
+                                is not None):
+                            ema_stack.enter_context(
+                                self.controlnet_ema.apply_to_model(
+                                    self.controlnet))
+                            saving_with_ema = True
+                    logger.info(
+                        "Saving weight-only checkpoint at step %s with EMA-applied generator/controlnet=%s",
+                        step,
+                        saving_with_ema,
+                    )
+                    save_distillation_checkpoint(
+                        self.transformer,
+                        self.fake_score_transformer,
+                        self.global_rank,
+                        self.training_args.output_dir,
+                        f"{step}_weight_only",
+                        only_save_generator_weight=True,
+                        generator_ema=self.generator_ema,
+                        generator_controlnet=getattr(self, "controlnet", None),
+                        fake_score_controlnet=getattr(
+                            self, "fake_score_controlnet", None),
+                        # MoE support
+                        generator_transformer_2=getattr(self, 'transformer_2',
+                                                        None),
+                        real_score_transformer_2=getattr(
+                            self, 'real_score_transformer_2', None),
+                        fake_score_transformer_2=getattr(
+                            self, 'fake_score_transformer_2', None),
+                        generator_optimizer_2=getattr(self, 'optimizer_2',
+                                                      None),
+                        fake_score_optimizer_2=getattr(
+                            self, 'fake_score_optimizer_2', None),
+                        generator_scheduler_2=getattr(self, 'lr_scheduler_2',
+                                                      None),
+                        fake_score_scheduler_2=getattr(
+                            self, 'fake_score_lr_scheduler_2', None),
+                        generator_ema_2=getattr(self, 'generator_ema_2',
+                                                None))
 
                 self._maybe_log_checkpoint_preview(training_batch,
                                                    step,
                                                    tag="weight_only")
 
-                if self.training_args.use_ema and self.is_ema_ready():
+                if self.is_ema_ready():
                     self.save_ema_weights(self.training_args.output_dir, step)
 
             if self.training_args.log_validation and step % self.training_args.validation_steps == 0:
@@ -1871,7 +1915,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                            None),
             generator_ema_2=getattr(self, 'generator_ema_2', None))
 
-        if self.training_args.use_ema and self.is_ema_ready():
+        if self.is_ema_ready():
             self.save_ema_weights(self.training_args.output_dir,
                                   self.training_args.max_train_steps)
 

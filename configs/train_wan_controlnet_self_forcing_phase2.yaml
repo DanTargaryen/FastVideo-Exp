@@ -68,6 +68,9 @@ dmd_teacher_adaptive_start_ratio: 0.7
 dmd_teacher_high_noise_cfg_delta_max_ratio: 1.0
 dmd_teacher_high_noise_residual_max_ratio: 1.0
 dmd_teacher_high_noise_output_max_ratio: 1.0
+# Use standard CFG compose for teacher x0 to avoid extra conditional
+# amplification (cond + scale*delta), which can induce whitening drift.
+dmd_teacher_cfg_use_uncond_base: true
 # Bucketed teacher guidance: keep base guidance for low-noise, reduce only
 # on high-noise timesteps to suppress whitening drift.
 dmd_teacher_adaptive_guidance: true
@@ -101,6 +104,8 @@ max_timestep_ratio: 0.98
 # Enable EMA to stabilize training (adds extra memory).
 ema_decay: 0.999
 ema_start_step: 200
+# Use EMA model for validation/exported inference checkpoints.
+use_ema: true
 seed: 1024
 
 # ---- Parallelism (8 GPUs typical) ----

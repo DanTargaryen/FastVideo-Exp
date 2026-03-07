@@ -831,6 +831,12 @@ class TrainingArgs(FastVideoArgs):
     dmd_teacher_cfg_delta_max_ratio: float = 1.5
     dmd_teacher_residual_max_ratio: float = 1.5
     dmd_teacher_output_max_ratio: float = 1.15
+    # Compose teacher CFG prediction as:
+    #   uncond + scale * (cond - uncond)
+    # instead of the legacy:
+    #   cond + scale * (cond - uncond)
+    # which can over-amplify conditional branch and cause whitening drift.
+    dmd_teacher_cfg_use_uncond_base: bool = True
     # Optional timestep-adaptive teacher clamp:
     # linearly interpolate low-noise ratio -> high-noise ratio by sampled DMD timestep.
     dmd_teacher_adaptive_clamp: bool = True
@@ -1326,6 +1332,12 @@ class TrainingArgs(FastVideoArgs):
             default=TrainingArgs.dmd_teacher_output_max_ratio,
             help=
             "Final clamp: teacher output std <= student std * ratio (<=0 disables)."
+        )
+        parser.add_argument(
+            "--dmd-teacher-cfg-use-uncond-base",
+            action=StoreBoolean,
+            help=
+            "Use standard CFG composition for teacher prediction: uncond + scale*(cond-uncond)."
         )
         parser.add_argument(
             "--dmd-teacher-adaptive-clamp",
