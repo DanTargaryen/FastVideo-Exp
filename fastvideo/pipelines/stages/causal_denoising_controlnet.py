@@ -94,15 +94,57 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
         self.frame_seq_length = latent_seq_length // patch_ratio
         independent_first_frame = self.transformer.independent_first_frame if hasattr(
             self.transformer, 'independent_first_frame') else False
-        timesteps = torch.tensor(
-            fastvideo_args.pipeline_config.dmd_denoising_steps,
-            dtype=torch.long).cpu()
-        if fastvideo_args.pipeline_config.warp_denoising_step:
-            scheduler_timesteps = torch.cat((self.scheduler.timesteps.cpu(),
-                                             torch.tensor([0],
-                                                          dtype=torch.float32)))
-            timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(get_local_torch_device())
+        use_full_schedule = bool(
+            getattr(fastvideo_args.pipeline_config, "validation_full_schedule",
+                    False))
+        validation_timestep_indices = getattr(
+            fastvideo_args.pipeline_config, "validation_timestep_indices", None)
+        parsed_timestep_indices: list[int] = []
+        if isinstance(validation_timestep_indices, str):
+            parsed_timestep_indices = [
+                int(x.strip()) for x in validation_timestep_indices.split(",")
+                if x.strip()
+            ]
+        elif isinstance(validation_timestep_indices, (list, tuple)):
+            parsed_timestep_indices = [
+                int(x) for x in validation_timestep_indices
+            ]
+
+        if parsed_timestep_indices:
+            self.scheduler.set_timesteps(int(batch.num_inference_steps),
+                                         device=get_local_torch_device())
+            scheduler_timesteps = self.scheduler.timesteps.to(
+                get_local_torch_device())
+            max_idx = int(scheduler_timesteps.shape[0] - 1)
+            select_indices = [
+                min(max(i, 0), max_idx) for i in parsed_timestep_indices
+            ]
+            timesteps = scheduler_timesteps[torch.tensor(
+                select_indices,
+                device=scheduler_timesteps.device,
+                dtype=torch.long)]
+        elif use_full_schedule:
+            self.scheduler.set_timesteps(int(batch.num_inference_steps),
+                                         device=get_local_torch_device())
+            timesteps = self.scheduler.timesteps.to(get_local_torch_device())
+        else:
+            timesteps = torch.tensor(
+                fastvideo_args.pipeline_config.dmd_denoising_steps,
+                dtype=torch.long).cpu()
+            if fastvideo_args.pipeline_config.warp_denoising_step:
+                scheduler_timesteps = torch.cat(
+                    (self.scheduler.timesteps.cpu(),
+                     torch.tensor([0], dtype=torch.float32)))
+                timesteps = scheduler_timesteps[1000 - timesteps]
+            timesteps = timesteps.to(get_local_torch_device())
+        update_rule = str(
+            getattr(fastvideo_args.pipeline_config, "validation_update_rule",
+                    "euler_dt")).strip().lower()
+        if update_rule not in ("euler_dt", "renoise_x0"):
+            logger.warning(
+                "Unknown validation_update_rule=%s. Falling back to euler_dt.",
+                update_rule)
+            update_rule = "euler_dt"
 
         if fastvideo_args.pipeline_config.dit_config.boundary_ratio is not None:
             boundary_timestep = fastvideo_args.pipeline_config.dit_config.boundary_ratio * self.scheduler.num_train_timesteps
@@ -128,6 +170,14 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
         b, c, t, h, w = latents.shape
         self._last_t_lat = int(t)
         prompt_embeds = batch.prompt_embeds[0]
+        negative_prompt_embeds = None
+        do_cfg = bool(batch.do_classifier_free_guidance and
+                      batch.guidance_scale is not None
+                      and float(batch.guidance_scale) != 1.0
+                      and batch.negative_prompt_embeds
+                      and len(batch.negative_prompt_embeds) > 0)
+        if do_cfg:
+            negative_prompt_embeds = batch.negative_prompt_embeds[0]
         control_latent = batch.control_latent.to(latents.device,
                                                  dtype=target_dtype)
         first_frame_latent = batch.first_frame_latent
@@ -152,6 +202,30 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                 assert kv_cache2 is not None
                 return kv_cache2
             return kv_cache1
+        kv_cache1_uncond = None
+        kv_cache2_uncond = None
+        if do_cfg:
+            kv_cache1_uncond = self._initialize_kv_cache(
+                batch_size=latents.shape[0],
+                dtype=target_dtype,
+                device=latents.device)
+            if boundary_timestep is not None and self.transformer_2 is not None:
+                kv_cache2_uncond = self._initialize_kv_cache(
+                    batch_size=latents.shape[0],
+                    dtype=target_dtype,
+                    device=latents.device,
+                    model=self.transformer_2)
+
+        def _get_kv_cache_uncond(timestep: float) -> list[dict] | None:
+            if not do_cfg:
+                return None
+            assert kv_cache1_uncond is not None
+            if boundary_timestep is not None:
+                if timestep >= boundary_timestep:
+                    return kv_cache1_uncond
+                assert kv_cache2_uncond is not None
+                return kv_cache2_uncond
+            return kv_cache1_uncond
 
         crossattn_cache = self._initialize_crossattn_cache(
             batch_size=latents.shape[0],
@@ -159,10 +233,25 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
             arch_config.text_len,
             dtype=target_dtype,
             device=latents.device)
+        crossattn_cache_uncond = None
+        if do_cfg:
+            crossattn_cache_uncond = self._initialize_crossattn_cache(
+                batch_size=latents.shape[0],
+                max_text_len=fastvideo_args.pipeline_config.
+                text_encoder_configs[0].arch_config.text_len,
+                dtype=target_dtype,
+                device=latents.device)
         control_kv_cache = self._initialize_kv_cache(batch_size=latents.shape[0],
                                                      dtype=target_dtype,
                                                      device=latents.device,
                                                      model=self.controlnet)
+        control_kv_cache_uncond = None
+        if do_cfg:
+            control_kv_cache_uncond = self._initialize_kv_cache(
+                batch_size=latents.shape[0],
+                dtype=target_dtype,
+                device=latents.device,
+                model=self.controlnet)
         control_crossattn_cache = self._initialize_crossattn_cache(
             batch_size=latents.shape[0],
             max_text_len=getattr(self.controlnet, "text_len",
@@ -171,6 +260,17 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
             dtype=target_dtype,
             device=latents.device,
             model=self.controlnet)
+        control_crossattn_cache_uncond = None
+        if do_cfg:
+            control_crossattn_cache_uncond = self._initialize_crossattn_cache(
+                batch_size=latents.shape[0],
+                max_text_len=getattr(
+                    self.controlnet, "text_len",
+                    fastvideo_args.pipeline_config.text_encoder_configs[0].
+                    arch_config.text_len),
+                dtype=target_dtype,
+                device=latents.device,
+                model=self.controlnet)
 
         num_blocks = t // self.num_frames_per_block
         block_sizes = [self.num_frames_per_block] * num_blocks
@@ -234,12 +334,63 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
+                if do_cfg and negative_prompt_embeds is not None:
+                    assert kv_cache1_uncond is not None
+                    assert control_kv_cache_uncond is not None
+                    assert crossattn_cache_uncond is not None
+                    assert control_crossattn_cache_uncond is not None
+                    control_res_uncond = self.controlnet(
+                        hidden_states=first_frame_latent,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        timestep=t_zero,
+                        **_build_controlnet_kwargs(self.controlnet,
+                                                   control_chunk,
+                                                   num_channels_latents),
+                        kv_cache=control_kv_cache_uncond,
+                        crossattn_cache=control_crossattn_cache_uncond,
+                        current_start=(pos_start_base + start_index) *
+                        self.frame_seq_length,
+                        start_frame=start_index,
+                        **image_kwargs,
+                        **pos_cond_kwargs,
+                    )
+                    self.transformer(
+                        first_frame_latent,
+                        negative_prompt_embeds,
+                        t_zero,
+                        kv_cache=kv_cache1_uncond,
+                        crossattn_cache=crossattn_cache_uncond,
+                        current_start=(pos_start_base + start_index) *
+                        self.frame_seq_length,
+                        start_frame=start_index,
+                        block_controlnet_hidden_states=control_res_uncond,
+                        **image_kwargs,
+                        **pos_cond_kwargs,
+                    )
+                    if boundary_timestep is not None and self.transformer_2 is not None:
+                        assert kv_cache2_uncond is not None
+                        self.transformer_2(
+                            first_frame_latent,
+                            negative_prompt_embeds,
+                            t_zero,
+                            kv_cache=kv_cache2_uncond,
+                            crossattn_cache=crossattn_cache_uncond,
+                            current_start=(pos_start_base + start_index) *
+                            self.frame_seq_length,
+                            start_frame=start_index,
+                            block_controlnet_hidden_states=control_res_uncond,
+                            **image_kwargs,
+                            **pos_cond_kwargs,
+                        )
             start_index += 1
             block_sizes.pop(0)
             latents[:, :, :1, :, :] = first_frame_latent
 
+        steps_per_block = max(1, len(timesteps) -
+                              1) if update_rule == "euler_dt" else len(
+                                  timesteps)
         with self.progress_bar(total=len(block_sizes) *
-                               len(timesteps)) as progress_bar:
+                               steps_per_block) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[:, :, start_index:start_index +
                                           current_num_frames, :, :]
@@ -247,8 +398,11 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                 video_raw_latent_shape = noise_latents_btchw.shape
                 control_chunk = control_latent[:, :, start_index:start_index +
                                                current_num_frames]
-
-                for i, t_cur in enumerate(timesteps):
+                attn_metadata = None
+                max_step_index = len(timesteps) if update_rule != "euler_dt" else max(
+                    0, len(timesteps) - 1)
+                for i in range(max_step_index):
+                    t_cur = timesteps[i]
                     if boundary_timestep is not None and t_cur < boundary_timestep:
                         current_model = self.transformer_2
                     else:
@@ -334,6 +488,64 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                             **image_kwargs,
                             **pos_cond_kwargs,
                         ).permute(0, 2, 1, 3, 4)
+                        if do_cfg and negative_prompt_embeds is not None:
+                            assert control_kv_cache_uncond is not None
+                            assert control_crossattn_cache_uncond is not None
+                            assert crossattn_cache_uncond is not None
+                            kv_cache_uncond = _get_kv_cache_uncond(t_cur)
+                            assert kv_cache_uncond is not None
+                            control_res_uncond = self.controlnet(
+                                hidden_states=latent_model_input,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                timestep=t_expanded_noise,
+                                **_build_controlnet_kwargs(
+                                    self.controlnet, control_chunk,
+                                    num_channels_latents),
+                                kv_cache=control_kv_cache_uncond,
+                                crossattn_cache=control_crossattn_cache_uncond,
+                                current_start=(pos_start_base + start_index) *
+                                self.frame_seq_length,
+                                start_frame=start_index,
+                                **image_kwargs,
+                                **pos_cond_kwargs,
+                            )
+                            pred_noise_uncond_btchw = current_model(
+                                latent_model_input,
+                                negative_prompt_embeds,
+                                t_expanded_noise,
+                                kv_cache=kv_cache_uncond,
+                                crossattn_cache=crossattn_cache_uncond,
+                                current_start=(pos_start_base + start_index) *
+                                self.frame_seq_length,
+                                start_frame=start_index,
+                                block_controlnet_hidden_states=
+                                control_res_uncond,
+                                **image_kwargs,
+                                **pos_cond_kwargs,
+                            ).permute(0, 2, 1, 3, 4)
+                            pred_noise_btchw = pred_noise_uncond_btchw + float(
+                                batch.guidance_scale) * (
+                                    pred_noise_btchw - pred_noise_uncond_btchw)
+
+                    if update_rule == "euler_dt":
+                        timesteps_1d = self.scheduler.timesteps.to(
+                            device=latents.device, dtype=torch.float32)
+                        sigmas_1d = self.scheduler.sigmas.to(device=latents.device,
+                                                             dtype=torch.float32)
+                        t_next = timesteps[i + 1]
+                        idx_cur = torch.argmin(
+                            (timesteps_1d - t_cur.float()).abs())
+                        idx_next = torch.argmin(
+                            (timesteps_1d - t_next.float()).abs())
+                        sigma_cur = sigmas_1d[idx_cur]
+                        sigma_next = sigmas_1d[idx_next]
+                        dt = (sigma_next - sigma_cur).to(
+                            dtype=pred_noise_btchw.dtype)
+                        current_latents = current_latents + dt * pred_noise_btchw.permute(
+                            0, 2, 1, 3, 4).contiguous()
+                        if progress_bar is not None:
+                            progress_bar.update()
+                        continue
 
                     if boundary_timestep is not None and t_cur >= boundary_timestep:
                         pred_video_btchw = pred_noise_to_x_bound(
@@ -397,8 +609,24 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                                         "context_noise", 0)
                 t_context = torch.ones([latents.shape[0]],
                                        device=latents.device,
-                                       dtype=torch.long) * int(context_noise)
+                                       dtype=torch.float32) * float(
+                                           context_noise)
                 context_bcthw = current_latents.to(target_dtype)
+                if float(context_noise) > 0.0:
+                    if hasattr(self.scheduler, "timesteps"
+                               ) and self.scheduler.timesteps is not None and self.scheduler.timesteps.numel(
+                               ) > 0:
+                        schedule_ts = self.scheduler.timesteps.to(
+                            device=latents.device, dtype=t_context.dtype)
+                        diff = (t_context[:, None] - schedule_ts[None, :]).abs()
+                        nearest_idx = diff.argmin(dim=1)
+                        t_context = schedule_ts.index_select(0, nearest_idx)
+                    ctx_noise = torch.randn_like(context_bcthw.flatten(0, 1))
+                    context_bcthw = self.scheduler.add_noise(
+                        context_bcthw.flatten(0, 1),
+                        ctx_noise,
+                        t_context.repeat_interleave(current_num_frames),
+                    ).unflatten(0, context_bcthw.shape[:2])
                 if first_frame_latent is not None and start_index == 0:
                     context_bcthw = context_bcthw.clone()
                     context_bcthw[:, :, :1] = first_frame_latent[:, :, :1]
@@ -455,6 +683,57 @@ class ControlnetCausalDMDDenosingStage(CausalDMDDenosingStage):
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
+                    if do_cfg and negative_prompt_embeds is not None:
+                        assert control_kv_cache_uncond is not None
+                        assert control_crossattn_cache_uncond is not None
+                        assert kv_cache1_uncond is not None
+                        assert crossattn_cache_uncond is not None
+                        control_res_ctx_uncond = self.controlnet(
+                            hidden_states=context_bcthw,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            timestep=t_expanded_context,
+                            **_build_controlnet_kwargs(
+                                self.controlnet, control_chunk,
+                                num_channels_latents),
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=(pos_start_base + start_index) *
+                            self.frame_seq_length,
+                            start_frame=start_index,
+                            **image_kwargs,
+                            **pos_cond_kwargs,
+                        )
+                        if boundary_timestep is not None and self.transformer_2 is not None:
+                            assert kv_cache2_uncond is not None
+                            self.transformer_2(
+                                context_bcthw,
+                                negative_prompt_embeds,
+                                t_expanded_context,
+                                kv_cache=kv_cache2_uncond,
+                                crossattn_cache=crossattn_cache_uncond,
+                                current_start=(pos_start_base + start_index) *
+                                self.frame_seq_length,
+                                start_frame=start_index,
+                                block_controlnet_hidden_states=
+                                control_res_ctx_uncond,
+                                **image_kwargs,
+                                **pos_cond_kwargs,
+                            )
+
+                        self.transformer(
+                            context_bcthw,
+                            negative_prompt_embeds,
+                            t_expanded_context,
+                            kv_cache=kv_cache1_uncond,
+                            crossattn_cache=crossattn_cache_uncond,
+                            current_start=(pos_start_base + start_index) *
+                            self.frame_seq_length,
+                            start_frame=start_index,
+                            block_controlnet_hidden_states=
+                            control_res_ctx_uncond,
+                            **image_kwargs,
+                            **pos_cond_kwargs,
+                        )
 
                 start_index += current_num_frames
 

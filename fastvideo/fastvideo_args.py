@@ -827,6 +827,10 @@ class TrainingArgs(FastVideoArgs):
     dmd_grad_normalizer_ema_decay: float = 0.99
     dmd_grad_normalizer_ema_floor_ratio: float = 0.1
     dmd_grad_value_clip: float = 10.0
+    # Teacher strength clamps for DMD stabilization (help reduce whitening/drift).
+    dmd_teacher_cfg_delta_max_ratio: float = 1.5
+    dmd_teacher_residual_max_ratio: float = 1.5
+    dmd_teacher_output_max_ratio: float = 1.15
     fake_score_learning_rate: float = 0.0  # separate learning rate for fake_score_transformer, if 0.0, use learning_rate
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
     fake_score_betas: str = "0.9,0.999"  # betas for fake score optimizer, format: "beta1,beta2"
@@ -1283,6 +1287,25 @@ class TrainingArgs(FastVideoArgs):
             type=float,
             default=TrainingArgs.dmd_grad_value_clip,
             help="Elementwise clip value for DMD target gradient (<=0 disables).")
+        parser.add_argument(
+            "--dmd-teacher-cfg-delta-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_cfg_delta_max_ratio,
+            help="Clip teacher CFG delta std to cond std * ratio (<=0 disables).")
+        parser.add_argument(
+            "--dmd-teacher-residual-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_residual_max_ratio,
+            help=
+            "Clip teacher residual std (teacher - student) to student std * ratio (<=0 disables)."
+        )
+        parser.add_argument(
+            "--dmd-teacher-output-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_output_max_ratio,
+            help=
+            "Final clamp: teacher output std <= student std * ratio (<=0 disables)."
+        )
         parser.add_argument("--fake-score-learning-rate",
                             type=float,
                             default=TrainingArgs.fake_score_learning_rate,

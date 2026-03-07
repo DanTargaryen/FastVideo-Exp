@@ -656,8 +656,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             teacher_residual_clip_ratio = float(
                 getattr(self.training_args,
                         "dmd_teacher_residual_max_ratio", 1.5))
+            generator_std = _samplewise_std(original_latent).clamp_min(1e-6)
             if teacher_residual_clip_ratio > 0:
-                generator_std = _samplewise_std(original_latent).clamp_min(1e-6)
                 max_teacher_residual_std = (
                     generator_std * teacher_residual_clip_ratio)
                 teacher_residual_clip_scale = torch.clamp(
@@ -667,6 +667,24 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 )
                 real_score_pred_video = original_latent + (
                     teacher_residual * teacher_residual_clip_scale)
+
+            # Final safety clamp on teacher output std to avoid high-noise
+            # teacher overpowering the student (whitening/drift failure mode).
+            teacher_output_std = _samplewise_std(real_score_pred_video)
+            teacher_output_clip_scale = torch.ones_like(teacher_output_std)
+            teacher_output_clip_ratio = float(
+                getattr(self.training_args, "dmd_teacher_output_max_ratio",
+                        1.15))
+            if teacher_output_clip_ratio > 0:
+                max_teacher_output_std = generator_std * teacher_output_clip_ratio
+                teacher_output_clip_scale = torch.clamp(
+                    max_teacher_output_std /
+                    teacher_output_std.clamp_min(1e-6),
+                    max=1.0,
+                )
+                teacher_delta = real_score_pred_video - original_latent
+                real_score_pred_video = original_latent + (
+                    teacher_delta * teacher_output_clip_scale)
 
             # Stabilize DMD normalization when student is close to teacher.
             # Use raw normalizer with EMA-based floor to prevent tiny early-step
@@ -737,6 +755,8 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "teacher_residual_std": teacher_residual_std.detach(),
             "teacher_residual_clip_scale":
             teacher_residual_clip_scale.detach(),
+            "teacher_output_std": teacher_output_std.detach(),
+            "teacher_output_clip_scale": teacher_output_clip_scale.detach(),
             "dmd_first_frame_grad_zeroed": torch.tensor(
                 first_frame_grad_zeroed,
                 device=self.device,
@@ -1152,6 +1172,29 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 and hasattr(args_copy.pipeline_config.dit_config,
                             "boundary_ratio")):
             args_copy.pipeline_config.dit_config.boundary_ratio = None
+        if hasattr(args_copy, "pipeline_config"):
+            # Align checkpoint validation rollout with tools/infer_wan_controlnet_ti2v.py
+            # defaults for causal mode.
+            if not hasattr(args_copy.pipeline_config,
+                           "validation_update_rule"):
+                args_copy.pipeline_config.validation_update_rule = "renoise_x0"
+            if not hasattr(args_copy.pipeline_config,
+                           "validation_full_schedule"):
+                args_copy.pipeline_config.validation_full_schedule = False
+            if not hasattr(args_copy.pipeline_config,
+                           "validation_timestep_indices"):
+                args_copy.pipeline_config.validation_timestep_indices = [
+                    0, 12, 24, 36
+                ]
+            logger.info(
+                "Validation rollout config: update_rule=%s full_schedule=%s timestep_indices=%s",
+                getattr(args_copy.pipeline_config, "validation_update_rule",
+                        "renoise_x0"),
+                getattr(args_copy.pipeline_config, "validation_full_schedule",
+                        False),
+                getattr(args_copy.pipeline_config,
+                        "validation_timestep_indices", []),
+            )
         from fastvideo.pipelines.basic.wan.wan_controlnet_causal_dmd_pipeline import (
             WanControlnetCausalDMDPipeline)
 
