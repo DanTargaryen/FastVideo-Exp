@@ -1130,6 +1130,116 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         tracker_loss_dict[f"{prefix}_abs_mean"] = diff.abs().mean().item()
         tracker_loss_dict[f"{prefix}_mse"] = torch.mean(diff * diff).item()
 
+    def _collect_dmd_debug_metrics(self,
+                                   training_batch: TrainingBatch
+                                   ) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        dmd_vis = getattr(training_batch, "dmd_latent_vis_dict", None) or {}
+        fake_vis = getattr(training_batch, "fake_score_latent_vis_dict",
+                           None) or {}
+
+        self._append_tensor_debug_stats(metrics,
+                                        prefix="dmd_generator_pred_video",
+                                        tensor=dmd_vis.get(
+                                            "generator_pred_video"))
+        self._append_tensor_debug_stats(metrics,
+                                        prefix="dmd_real_score_pred_video",
+                                        tensor=dmd_vis.get(
+                                            "real_score_pred_video"))
+        self._append_tensor_debug_stats(metrics,
+                                        prefix="dmd_faker_score_pred_video",
+                                        tensor=dmd_vis.get(
+                                            "faker_score_pred_video"))
+        self._append_pair_debug_stats(metrics,
+                                      prefix="dmd_gen_vs_real",
+                                      lhs=dmd_vis.get("generator_pred_video"),
+                                      rhs=dmd_vis.get("real_score_pred_video"))
+        self._append_pair_debug_stats(metrics,
+                                      prefix="dmd_fake_vs_real",
+                                      lhs=dmd_vis.get("faker_score_pred_video"),
+                                      rhs=dmd_vis.get("real_score_pred_video"))
+        self._append_pair_debug_stats(metrics,
+                                      prefix="dmd_gen_vs_fake",
+                                      lhs=dmd_vis.get("generator_pred_video"),
+                                      rhs=dmd_vis.get("faker_score_pred_video"))
+
+        for src, key_pairs in (
+            (dmd_vis, (
+                ("generator_timestep", "generator_timestep"),
+                ("dmd_timestep", "dmd_timestep"),
+                ("denoised_timestep_from", "denoised_timestep_from"),
+                ("denoised_timestep_to", "denoised_timestep_to"),
+                ("dmd_grad_normalizer", "dmd_grad_normalizer"),
+                ("dmd_grad_normalizer_raw", "dmd_grad_normalizer_raw"),
+                ("dmd_grad_normalizer_ema", "dmd_grad_normalizer_ema"),
+                ("dmdtrain_gradient_norm", "dmdtrain_gradient_norm"),
+            )),
+            (fake_vis, (
+                ("fake_score_timestep", "fake_score_timestep"),
+                ("denoised_timestep_from", "fake_score_denoised_timestep_from"),
+                ("denoised_timestep_to", "fake_score_denoised_timestep_to"),
+            )),
+        ):
+            for source_key, metric_key in key_pairs:
+                value = src.get(source_key)
+                if isinstance(value, torch.Tensor):
+                    metrics[metric_key] = value.float().mean().item()
+
+        if ("dmd_timestep" in dmd_vis and "denoised_timestep_from" in dmd_vis
+                and "denoised_timestep_to" in dmd_vis):
+            dmd_timestep = dmd_vis["dmd_timestep"].float()
+            denoised_from = dmd_vis["denoised_timestep_from"].float()
+            denoised_to = dmd_vis["denoised_timestep_to"].float()
+            if denoised_from.numel() == 1:
+                denoised_from = denoised_from.expand_as(dmd_timestep)
+            if denoised_to.numel() == 1:
+                denoised_to = denoised_to.expand_as(dmd_timestep)
+            metrics["dmd_timestep_out_of_range"] = (
+                (dmd_timestep < denoised_to)
+                | (dmd_timestep > denoised_from)).float().mean().item()
+
+        if ("fake_score_timestep" in fake_vis
+                and "denoised_timestep_from" in fake_vis
+                and "denoised_timestep_to" in fake_vis):
+            fake_score_timestep = fake_vis["fake_score_timestep"].float()
+            denoised_from = fake_vis["denoised_timestep_from"].float()
+            denoised_to = fake_vis["denoised_timestep_to"].float()
+            if denoised_from.numel() == 1:
+                denoised_from = denoised_from.expand_as(fake_score_timestep)
+            if denoised_to.numel() == 1:
+                denoised_to = denoised_to.expand_as(fake_score_timestep)
+            metrics["fake_score_timestep_out_of_range"] = (
+                (fake_score_timestep < denoised_to)
+                | (fake_score_timestep > denoised_from)).float().mean().item()
+
+        return metrics
+
+    def _log_dmd_debug_summary(self, step: int,
+                               metrics: dict[str, Any]) -> None:
+        if not metrics:
+            return
+        summary_keys = [
+            "dmd_generator_pred_video_mean",
+            "dmd_generator_pred_video_std",
+            "dmd_real_score_pred_video_mean",
+            "dmd_real_score_pred_video_std",
+            "dmd_faker_score_pred_video_mean",
+            "dmd_faker_score_pred_video_std",
+            "dmd_gen_vs_real_abs_mean",
+            "dmd_fake_vs_real_abs_mean",
+            "dmd_timestep",
+            "denoised_timestep_from",
+            "denoised_timestep_to",
+            "dmd_timestep_out_of_range",
+            "fake_score_timestep",
+            "fake_score_timestep_out_of_range",
+        ]
+        parts = [f"step={step}"]
+        for key in summary_keys:
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.6f}")
+        logger.info("DMD debug: %s", " ".join(parts))
+
     def visualize_intermediate_latents(self, training_batch: TrainingBatch,
                                        training_args: TrainingArgs, step: int):
         """Add visualization data to tracker logging and save frames to disk."""
@@ -1148,33 +1258,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 training_batch,
                 'dmd_latent_vis_dict') and training_batch.dmd_latent_vis_dict:
             dmd_latents_vis_dict = training_batch.dmd_latent_vis_dict
-            self._append_tensor_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_generator_pred_video",
-                tensor=dmd_latents_vis_dict.get("generator_pred_video"))
-            self._append_tensor_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_real_score_pred_video",
-                tensor=dmd_latents_vis_dict.get("real_score_pred_video"))
-            self._append_tensor_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_faker_score_pred_video",
-                tensor=dmd_latents_vis_dict.get("faker_score_pred_video"))
-            self._append_pair_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_gen_vs_real",
-                lhs=dmd_latents_vis_dict.get("generator_pred_video"),
-                rhs=dmd_latents_vis_dict.get("real_score_pred_video"))
-            self._append_pair_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_fake_vs_real",
-                lhs=dmd_latents_vis_dict.get("faker_score_pred_video"),
-                rhs=dmd_latents_vis_dict.get("real_score_pred_video"))
-            self._append_pair_debug_stats(
-                tracker_loss_dict,
-                prefix="dmd_gen_vs_fake",
-                lhs=dmd_latents_vis_dict.get("generator_pred_video"),
-                rhs=dmd_latents_vis_dict.get("faker_score_pred_video"))
+            tracker_loss_dict.update(
+                self._collect_dmd_debug_metrics(training_batch))
             dmd_log_keys = [
                 'generator_pred_video', 'real_score_pred_video',
                 'faker_score_pred_video'
@@ -1245,67 +1330,6 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 tracker_loss_dict[
                     "dmd_timestep"] = training_batch.dmd_latent_vis_dict[
                         "dmd_timestep"].float().mean().item()
-            if "denoised_timestep_from" in training_batch.dmd_latent_vis_dict:
-                tracker_loss_dict[
-                    "denoised_timestep_from"] = training_batch.dmd_latent_vis_dict[
-                        "denoised_timestep_from"].float().mean().item()
-            if "denoised_timestep_to" in training_batch.dmd_latent_vis_dict:
-                tracker_loss_dict[
-                    "denoised_timestep_to"] = training_batch.dmd_latent_vis_dict[
-                        "denoised_timestep_to"].float().mean().item()
-            if ("dmd_timestep" in training_batch.dmd_latent_vis_dict
-                    and "denoised_timestep_from"
-                    in training_batch.dmd_latent_vis_dict
-                    and "denoised_timestep_to"
-                    in training_batch.dmd_latent_vis_dict):
-                dmd_timestep = training_batch.dmd_latent_vis_dict[
-                    "dmd_timestep"].float()
-                denoised_from = training_batch.dmd_latent_vis_dict[
-                    "denoised_timestep_from"].float()
-                denoised_to = training_batch.dmd_latent_vis_dict[
-                    "denoised_timestep_to"].float()
-                if denoised_from.numel() == 1:
-                    denoised_from = denoised_from.expand_as(dmd_timestep)
-                if denoised_to.numel() == 1:
-                    denoised_to = denoised_to.expand_as(dmd_timestep)
-                violation = ((dmd_timestep < denoised_to)
-                             | (dmd_timestep > denoised_from)).float().mean()
-                tracker_loss_dict["dmd_timestep_out_of_range"] = violation.item()
-
-        if hasattr(
-                training_batch, 'fake_score_latent_vis_dict'
-        ) and training_batch.fake_score_latent_vis_dict and "fake_score_timestep" in training_batch.fake_score_latent_vis_dict:
-            tracker_loss_dict[
-                "fake_score_timestep"] = training_batch.fake_score_latent_vis_dict[
-                    "fake_score_timestep"].float().mean().item()
-            if "denoised_timestep_from" in training_batch.fake_score_latent_vis_dict:
-                tracker_loss_dict[
-                    "fake_score_denoised_timestep_from"] = training_batch.fake_score_latent_vis_dict[
-                        "denoised_timestep_from"].float().mean().item()
-            if "denoised_timestep_to" in training_batch.fake_score_latent_vis_dict:
-                tracker_loss_dict[
-                    "fake_score_denoised_timestep_to"] = training_batch.fake_score_latent_vis_dict[
-                        "denoised_timestep_to"].float().mean().item()
-            if ("fake_score_timestep" in training_batch.fake_score_latent_vis_dict
-                    and "denoised_timestep_from"
-                    in training_batch.fake_score_latent_vis_dict
-                    and "denoised_timestep_to"
-                    in training_batch.fake_score_latent_vis_dict):
-                fake_score_timestep = training_batch.fake_score_latent_vis_dict[
-                    "fake_score_timestep"].float()
-                denoised_from = training_batch.fake_score_latent_vis_dict[
-                    "denoised_timestep_from"].float()
-                denoised_to = training_batch.fake_score_latent_vis_dict[
-                    "denoised_timestep_to"].float()
-                if denoised_from.numel() == 1:
-                    denoised_from = denoised_from.expand_as(fake_score_timestep)
-                if denoised_to.numel() == 1:
-                    denoised_to = denoised_to.expand_as(fake_score_timestep)
-                violation = ((fake_score_timestep < denoised_to)
-                             | (fake_score_timestep > denoised_from)).float().mean()
-                tracker_loss_dict[
-                    "fake_score_timestep_out_of_range"] = violation.item()
-
         # Log final dict contents
         logger.info("Final tracker_loss_dict keys: %s",
                     list(tracker_loss_dict.keys()))
@@ -1530,6 +1554,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 ema_stats = self.get_ema_stats()
                 log_data.update(ema_stats)
 
+                dmd_debug_metrics = self._collect_dmd_debug_metrics(
+                    training_batch)
                 if training_batch.dmd_latent_vis_dict:
                     if "generator_timestep" in training_batch.dmd_latent_vis_dict:
                         log_data["generator_timestep"] = training_batch.dmd_latent_vis_dict[
@@ -1546,6 +1572,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     if "dmd_grad_normalizer_ema" in training_batch.dmd_latent_vis_dict:
                         log_data["dmd_grad_normalizer_ema"] = training_batch.dmd_latent_vis_dict[
                             "dmd_grad_normalizer_ema"].float().mean().item()
+                if dmd_debug_metrics:
+                    log_data.update(dmd_debug_metrics)
 
                 faker_score_additional_logs = {
                     "fake_score_timestep":
@@ -1553,6 +1581,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                         "fake_score_timestep"]),
                 }
                 log_data.update(faker_score_additional_logs)
+                if dmd_debug_metrics:
+                    self._log_dmd_debug_summary(step, dmd_debug_metrics)
 
                 self.tracker.log(log_data, step)
 
