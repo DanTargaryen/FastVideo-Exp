@@ -175,6 +175,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                                'same_step_across_blocks', False)
         self.last_step_only = getattr(training_args, 'last_step_only', False)
         self.context_noise = getattr(training_args, 'context_noise', 0)
+        self.rollout_add_context_noise = bool(
+            getattr(training_args, "rollout_add_context_noise", True))
 
         self.kv_cache1: list[dict[str, Any]] | None = None
         self.crossattn_cache: list[dict[str, Any]] | None = None
@@ -192,6 +194,9 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             self.boundary_timestep = None
             self.train_transformer_2 = False
             self.train_fake_score_transformer_2 = False
+
+        logger.info("Self-forcing rollout_add_context_noise=%s",
+                    self.rollout_add_context_noise)
 
         neg_prompt = str(getattr(training_args, "negative_prompt", "") or "").strip()
         if neg_prompt:
@@ -636,14 +641,17 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
             # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise
-            denoised_pred = self.noise_scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
-                context_timestep).unflatten(0, denoised_pred.shape[:2])
+            if self.rollout_add_context_noise:
+                context_input = self.noise_scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    torch.randn_like(denoised_pred.flatten(0, 1)),
+                    context_timestep).unflatten(0, denoised_pred.shape[:2])
+            else:
+                context_input = denoised_pred
 
             with torch.no_grad():
                 training_batch_temp = self._build_distill_input_kwargs(
-                    denoised_pred, context_timestep,
+                    context_input, context_timestep,
                     training_batch.conditional_dict, training_batch)
 
                 current_model = self._select_generator_model_for_timestep(
@@ -791,18 +799,29 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         current_num_frames: int,
     ) -> torch.Tensor:
         """Hookable model forward used by the self-forcing generator simulation."""
-        return model(
-            hidden_states=training_batch_temp.input_kwargs["hidden_states"],
-            encoder_hidden_states=training_batch_temp.input_kwargs[
-                "encoder_hidden_states"],
-            timestep=training_batch_temp.input_kwargs["timestep"],
-            encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
-                "encoder_hidden_states_image"),
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start=current_start_frame * self.frame_seq_length,
-            start_frame=start_frame,
-        )
+        timestep = training_batch_temp.input_kwargs.get("timestep", 0)
+        if isinstance(timestep, torch.Tensor):
+            if timestep.numel() == 0:
+                context_timestep = 0
+            else:
+                context_timestep = int(timestep.reshape(-1)[0].item())
+        else:
+            context_timestep = int(timestep)
+
+        with set_forward_context(current_timestep=context_timestep,
+                                 attn_metadata=None):
+            return model(
+                hidden_states=training_batch_temp.input_kwargs["hidden_states"],
+                encoder_hidden_states=training_batch_temp.input_kwargs[
+                    "encoder_hidden_states"],
+                timestep=training_batch_temp.input_kwargs["timestep"],
+                encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
+                    "encoder_hidden_states_image"),
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                start_frame=start_frame,
+            )
 
     def _simulation_predict_flow(
         self,

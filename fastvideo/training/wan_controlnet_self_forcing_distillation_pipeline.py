@@ -431,36 +431,47 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             if hidden_states.shape[2] >= 1:
                 hidden_states = torch.cat([img, hidden_states[:, :, 1:]], dim=2)
 
+        timestep = training_batch_temp.input_kwargs.get("timestep", 0)
+        if isinstance(timestep, torch.Tensor):
+            if timestep.numel() == 0:
+                context_timestep = 0
+            else:
+                context_timestep = int(timestep.reshape(-1)[0].item())
+        else:
+            context_timestep = int(timestep)
+
         num_channels_latents = getattr(model, "num_channels_latents",
                                        control_chunk.shape[1] // 3)
-        control_res = self.controlnet(
-            hidden_states=hidden_states,
-            encoder_hidden_states=training_batch_temp.input_kwargs[
-                "encoder_hidden_states"],
-            timestep=training_batch_temp.input_kwargs["timestep"],
-            encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
-                "encoder_hidden_states_image"),
-            **_build_controlnet_kwargs(self.controlnet, control_chunk,
-                                       num_channels_latents),
-            kv_cache=self.controlnet_kv_cache1,
-            crossattn_cache=self.controlnet_crossattn_cache,
-            current_start=current_start_frame * self.frame_seq_length,
-            start_frame=start_frame,
-        )
+        with set_forward_context(current_timestep=context_timestep,
+                                 attn_metadata=None):
+            control_res = self.controlnet(
+                hidden_states=hidden_states,
+                encoder_hidden_states=training_batch_temp.input_kwargs[
+                    "encoder_hidden_states"],
+                timestep=training_batch_temp.input_kwargs["timestep"],
+                encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
+                    "encoder_hidden_states_image"),
+                **_build_controlnet_kwargs(self.controlnet, control_chunk,
+                                           num_channels_latents),
+                kv_cache=self.controlnet_kv_cache1,
+                crossattn_cache=self.controlnet_crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                start_frame=start_frame,
+            )
 
-        return model(
-            hidden_states=hidden_states,
-            encoder_hidden_states=training_batch_temp.input_kwargs[
-                "encoder_hidden_states"],
-            timestep=training_batch_temp.input_kwargs["timestep"],
-            encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
-                "encoder_hidden_states_image"),
-            block_controlnet_hidden_states=control_res,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start=current_start_frame * self.frame_seq_length,
-            start_frame=start_frame,
-        )
+            return model(
+                hidden_states=hidden_states,
+                encoder_hidden_states=training_batch_temp.input_kwargs[
+                    "encoder_hidden_states"],
+                timestep=training_batch_temp.input_kwargs["timestep"],
+                encoder_hidden_states_image=training_batch_temp.input_kwargs.get(
+                    "encoder_hidden_states_image"),
+                block_controlnet_hidden_states=control_res,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                start_frame=start_frame,
+            )
 
     def _simulation_postprocess_chunk_output(self,
                                              denoised_pred: torch.Tensor,
@@ -846,6 +857,12 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
     def initialize_training_pipeline(self, training_args: TrainingArgs):
         super().initialize_training_pipeline(training_args)
+
+        if getattr(self, "rollout_add_context_noise", True):
+            logger.info(
+                "Forcing rollout_add_context_noise=False in Wan ControlNet self-forcing to align with causal inference cache update."
+            )
+        self.rollout_add_context_noise = False
 
         # Activation checkpointing for ControlNet modules (important for memory in
         # self-forcing rollout, where the KV-cache path would otherwise retain a
