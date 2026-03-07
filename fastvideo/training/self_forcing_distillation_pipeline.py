@@ -27,6 +27,7 @@ from fastvideo.pipelines import TrainingBatch
 from fastvideo.training.distillation_pipeline import DistillationPipeline
 from fastvideo.training.training_utils import (EMA_FSDP,
                                                normalize_dit_input,
+                                               shift_timestep,
                                                save_distillation_checkpoint)
 from fastvideo.utils import is_vsa_available, set_random_seed
 from fastvideo.profiler import profile_region
@@ -53,6 +54,27 @@ def _wan_denormalize_dit_latents(latents: torch.Tensor, vae) -> torch.Tensor:
                                device=latents.device,
                                dtype=latents.dtype).view(1, -1, 1, 1, 1)
     return latents * latents_std + latents_mean
+
+
+def _maybe_shift_rollout_timestep_bounds(
+    timestep: torch.Tensor | None,
+    *,
+    timestep_shift: float,
+    num_train_timestep: int,
+) -> torch.Tensor | None:
+    if timestep is None:
+        return None
+    shifted = timestep.detach().clone().float()
+    valid_mask = shifted >= 0
+    if not torch.any(valid_mask):
+        return shifted
+    shifted_long = shifted[valid_mask].round().long()
+    shifted[valid_mask] = shift_timestep(
+        shifted_long,
+        timestep_shift,
+        num_train_timestep,
+    ).float()
+    return shifted
 
 
 def _compute_negative_prompt_embeddings(
@@ -1162,6 +1184,13 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                                       prefix="dmd_gen_vs_fake",
                                       lhs=dmd_vis.get("generator_pred_video"),
                                       rhs=dmd_vis.get("faker_score_pred_video"))
+        gen_std = metrics.get("dmd_generator_pred_video_std")
+        real_std = metrics.get("dmd_real_score_pred_video_std")
+        fake_std = metrics.get("dmd_faker_score_pred_video_std")
+        if gen_std is not None and real_std is not None and gen_std > 0:
+            metrics["dmd_teacher_std_ratio"] = real_std / gen_std
+        if real_std is not None and fake_std is not None and real_std > 0:
+            metrics["dmd_fake_teacher_std_ratio"] = fake_std / real_std
 
         for src, key_pairs in (
             (dmd_vis, (
@@ -1173,6 +1202,11 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 ("dmd_grad_normalizer_raw", "dmd_grad_normalizer_raw"),
                 ("dmd_grad_normalizer_ema", "dmd_grad_normalizer_ema"),
                 ("dmdtrain_gradient_norm", "dmdtrain_gradient_norm"),
+                ("teacher_cfg_delta_std", "teacher_cfg_delta_std"),
+                ("teacher_cfg_clip_scale", "teacher_cfg_clip_scale"),
+                ("teacher_residual_std", "teacher_residual_std"),
+                ("teacher_residual_clip_scale",
+                 "teacher_residual_clip_scale"),
             )),
             (fake_vis, (
                 ("fake_score_timestep", "fake_score_timestep"),
@@ -1185,32 +1219,76 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 if isinstance(value, torch.Tensor):
                     metrics[metric_key] = value.float().mean().item()
 
+        dmd_shifted_from = _maybe_shift_rollout_timestep_bounds(
+            dmd_vis.get("denoised_timestep_from"),
+            timestep_shift=self.timestep_shift,
+            num_train_timestep=self.num_train_timestep,
+        )
+        dmd_shifted_to = _maybe_shift_rollout_timestep_bounds(
+            dmd_vis.get("denoised_timestep_to"),
+            timestep_shift=self.timestep_shift,
+            num_train_timestep=self.num_train_timestep,
+        )
+        if isinstance(dmd_shifted_from, torch.Tensor):
+            metrics["denoised_timestep_from_shifted"] = dmd_shifted_from.float(
+            ).mean().item()
+        if isinstance(dmd_shifted_to, torch.Tensor):
+            metrics["denoised_timestep_to_shifted"] = dmd_shifted_to.float(
+            ).mean().item()
+
         if ("dmd_timestep" in dmd_vis and "denoised_timestep_from" in dmd_vis
                 and "denoised_timestep_to" in dmd_vis):
             dmd_timestep = dmd_vis["dmd_timestep"].float()
-            denoised_from = dmd_vis["denoised_timestep_from"].float()
-            denoised_to = dmd_vis["denoised_timestep_to"].float()
+            denoised_from = dmd_shifted_from
+            denoised_to = dmd_shifted_to
+            if denoised_from is None or denoised_to is None:
+                denoised_from = dmd_vis["denoised_timestep_from"].float()
+                denoised_to = dmd_vis["denoised_timestep_to"].float()
             if denoised_from.numel() == 1:
                 denoised_from = denoised_from.expand_as(dmd_timestep)
             if denoised_to.numel() == 1:
                 denoised_to = denoised_to.expand_as(dmd_timestep)
+            valid_mask = (denoised_from >= 0) & (denoised_to >= 0)
             metrics["dmd_timestep_out_of_range"] = (
-                (dmd_timestep < denoised_to)
-                | (dmd_timestep > denoised_from)).float().mean().item()
+                valid_mask & ((dmd_timestep < denoised_to)
+                              | (dmd_timestep > denoised_from))
+            ).float().mean().item()
+
+        fake_shifted_from = _maybe_shift_rollout_timestep_bounds(
+            fake_vis.get("denoised_timestep_from"),
+            timestep_shift=self.timestep_shift,
+            num_train_timestep=self.num_train_timestep,
+        )
+        fake_shifted_to = _maybe_shift_rollout_timestep_bounds(
+            fake_vis.get("denoised_timestep_to"),
+            timestep_shift=self.timestep_shift,
+            num_train_timestep=self.num_train_timestep,
+        )
+        if isinstance(fake_shifted_from, torch.Tensor):
+            metrics["fake_score_denoised_timestep_from_shifted"
+                    ] = fake_shifted_from.float().mean().item()
+        if isinstance(fake_shifted_to, torch.Tensor):
+            metrics["fake_score_denoised_timestep_to_shifted"
+                    ] = fake_shifted_to.float().mean().item()
 
         if ("fake_score_timestep" in fake_vis
                 and "denoised_timestep_from" in fake_vis
                 and "denoised_timestep_to" in fake_vis):
             fake_score_timestep = fake_vis["fake_score_timestep"].float()
-            denoised_from = fake_vis["denoised_timestep_from"].float()
-            denoised_to = fake_vis["denoised_timestep_to"].float()
+            denoised_from = fake_shifted_from
+            denoised_to = fake_shifted_to
+            if denoised_from is None or denoised_to is None:
+                denoised_from = fake_vis["denoised_timestep_from"].float()
+                denoised_to = fake_vis["denoised_timestep_to"].float()
             if denoised_from.numel() == 1:
                 denoised_from = denoised_from.expand_as(fake_score_timestep)
             if denoised_to.numel() == 1:
                 denoised_to = denoised_to.expand_as(fake_score_timestep)
+            valid_mask = (denoised_from >= 0) & (denoised_to >= 0)
             metrics["fake_score_timestep_out_of_range"] = (
-                (fake_score_timestep < denoised_to)
-                | (fake_score_timestep > denoised_from)).float().mean().item()
+                valid_mask & ((fake_score_timestep < denoised_to)
+                              | (fake_score_timestep > denoised_from))
+            ).float().mean().item()
 
         return metrics
 
@@ -1225,13 +1303,23 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             "dmd_real_score_pred_video_std",
             "dmd_faker_score_pred_video_mean",
             "dmd_faker_score_pred_video_std",
+            "dmd_teacher_std_ratio",
+            "dmd_fake_teacher_std_ratio",
+            "teacher_cfg_delta_std",
+            "teacher_cfg_clip_scale",
+            "teacher_residual_std",
+            "teacher_residual_clip_scale",
             "dmd_gen_vs_real_abs_mean",
             "dmd_fake_vs_real_abs_mean",
             "dmd_timestep",
             "denoised_timestep_from",
             "denoised_timestep_to",
+            "denoised_timestep_from_shifted",
+            "denoised_timestep_to_shifted",
             "dmd_timestep_out_of_range",
             "fake_score_timestep",
+            "fake_score_denoised_timestep_from_shifted",
+            "fake_score_denoised_timestep_to_shifted",
             "fake_score_timestep_out_of_range",
         ]
         parts = [f"step={step}"]

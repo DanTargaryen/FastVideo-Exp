@@ -168,6 +168,11 @@ def _decode_validation_tensor(row: dict[str, Any], prefix: str) -> torch.Tensor:
     return torch.from_numpy(array)
 
 
+def _samplewise_std(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.float().flatten(1).std(dim=1, unbiased=False).view(
+        tensor.shape[0], 1, 1, 1, 1)
+
+
 def _ensure_first_frame_bcfhw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:
         x = x.unsqueeze(0).unsqueeze(2)
@@ -615,9 +620,42 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 scheduler=self.noise_scheduler).unflatten(
                     0, real_score_pred_noise_uncond.shape[:2])
 
-            real_score_pred_video = pred_real_video_cond + (
-                pred_real_video_cond -
-                pred_real_video_uncond) * self.real_score_guidance_scale
+            teacher_cfg_delta = (
+                pred_real_video_cond - pred_real_video_uncond
+            ) * self.real_score_guidance_scale
+            teacher_cfg_delta_std = _samplewise_std(teacher_cfg_delta)
+            teacher_cfg_clip_scale = torch.ones_like(teacher_cfg_delta_std)
+            teacher_cfg_clip_ratio = float(
+                getattr(self.training_args,
+                        "dmd_teacher_cfg_delta_max_ratio", 1.5))
+            if teacher_cfg_clip_ratio > 0:
+                cond_std = _samplewise_std(pred_real_video_cond).clamp_min(1e-6)
+                max_cfg_std = cond_std * teacher_cfg_clip_ratio
+                teacher_cfg_clip_scale = torch.clamp(
+                    max_cfg_std / teacher_cfg_delta_std.clamp_min(1e-6),
+                    max=1.0,
+                )
+                teacher_cfg_delta = teacher_cfg_delta * teacher_cfg_clip_scale
+            real_score_pred_video = pred_real_video_cond + teacher_cfg_delta
+
+            teacher_residual = real_score_pred_video - original_latent
+            teacher_residual_std = _samplewise_std(teacher_residual)
+            teacher_residual_clip_scale = torch.ones_like(
+                teacher_residual_std)
+            teacher_residual_clip_ratio = float(
+                getattr(self.training_args,
+                        "dmd_teacher_residual_max_ratio", 1.5))
+            if teacher_residual_clip_ratio > 0:
+                generator_std = _samplewise_std(original_latent).clamp_min(1e-6)
+                max_teacher_residual_std = (
+                    generator_std * teacher_residual_clip_ratio)
+                teacher_residual_clip_scale = torch.clamp(
+                    max_teacher_residual_std /
+                    teacher_residual_std.clamp_min(1e-6),
+                    max=1.0,
+                )
+                real_score_pred_video = original_latent + (
+                    teacher_residual * teacher_residual_clip_scale)
 
             # Stabilize DMD normalization when student is close to teacher.
             # Use raw normalizer with EMA-based floor to prevent tiny early-step
@@ -676,6 +714,11 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "dmd_grad_normalizer_raw": grad_normalizer_raw.detach(),
             "dmd_grad_normalizer_ema": grad_normalizer_ema.detach(),
             "dmdtrain_gradient_norm": grad_abs_mean,
+            "teacher_cfg_delta_std": teacher_cfg_delta_std.detach(),
+            "teacher_cfg_clip_scale": teacher_cfg_clip_scale.detach(),
+            "teacher_residual_std": teacher_residual_std.detach(),
+            "teacher_residual_clip_scale":
+            teacher_residual_clip_scale.detach(),
         })
         return dmd_loss
 
