@@ -838,6 +838,11 @@ class TrainingArgs(FastVideoArgs):
     dmd_teacher_high_noise_cfg_delta_max_ratio: float = 1.0
     dmd_teacher_high_noise_residual_max_ratio: float = 1.0
     dmd_teacher_high_noise_output_max_ratio: float = 1.0
+    # Optional bucketed teacher guidance: use lower guidance scale on high-noise
+    # timesteps only (helps reduce overexposure/whitening drift).
+    dmd_teacher_adaptive_guidance: bool = True
+    dmd_teacher_guidance_high_noise_threshold_ratio: float = 0.7
+    dmd_teacher_high_noise_guidance_scale: float = 2.0
     # Match Causal-Forcing DMD timestep policy by default.
     # ts_schedule: constrain min timestep by denoised_timestep_to
     # ts_schedule_max: constrain max timestep by denoised_timestep_from
@@ -1355,6 +1360,27 @@ class TrainingArgs(FastVideoArgs):
             default=TrainingArgs.dmd_teacher_high_noise_output_max_ratio,
             help=
             "Adaptive target ratio for teacher output std clamp at high-noise end."
+        )
+        parser.add_argument(
+            "--dmd-teacher-adaptive-guidance",
+            action=StoreBoolean,
+            help=
+            "Enable bucketed teacher guidance: lower guidance scale on high-noise timesteps."
+        )
+        parser.add_argument(
+            "--dmd-teacher-guidance-high-noise-threshold-ratio",
+            type=float,
+            default=TrainingArgs.
+            dmd_teacher_guidance_high_noise_threshold_ratio,
+            help=
+            "Normalized timestep ratio threshold (0-1) for switching to high-noise teacher guidance scale."
+        )
+        parser.add_argument(
+            "--dmd-teacher-high-noise-guidance-scale",
+            type=float,
+            default=TrainingArgs.dmd_teacher_high_noise_guidance_scale,
+            help=
+            "Teacher guidance scale used for high-noise timesteps when bucketed guidance is enabled."
         )
         parser.add_argument(
             "--ts-schedule",

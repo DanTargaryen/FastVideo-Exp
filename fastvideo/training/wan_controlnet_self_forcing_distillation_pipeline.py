@@ -642,16 +642,42 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 scheduler=self.noise_scheduler).unflatten(
                     0, real_score_pred_noise_uncond.shape[:2])
 
-            teacher_cfg_delta = (
-                pred_real_video_cond - pred_real_video_uncond
-            ) * self.real_score_guidance_scale
-            # Timestep-adaptive teacher clamp:
-            # high-noise steps use tighter teacher ratios to reduce whitening/drift.
+            # Optional bucketed teacher guidance:
+            # use a lower guidance scale on high-noise timesteps only.
             timestep_ratio = (
                 (timestep.float().view(batch_size, 1, 1, 1, 1) -
                  float(self.min_timestep)) /
                 max(float(self.max_timestep - self.min_timestep), 1.0)
             ).clamp(0.0, 1.0)
+            teacher_guidance_scale = torch.full_like(
+                timestep_ratio, float(self.real_score_guidance_scale))
+            high_noise_guidance_mask_ratio = torch.zeros_like(timestep_ratio)
+            if bool(
+                    getattr(self.training_args,
+                            "dmd_teacher_adaptive_guidance", True)):
+                guidance_threshold = float(
+                    getattr(
+                        self.training_args,
+                        "dmd_teacher_guidance_high_noise_threshold_ratio",
+                        0.7,
+                    ))
+                guidance_threshold = min(max(guidance_threshold, 0.0), 1.0)
+                high_noise_mask = timestep_ratio >= guidance_threshold
+                high_noise_guidance_scale = float(
+                    getattr(self.training_args,
+                            "dmd_teacher_high_noise_guidance_scale", 2.0))
+                teacher_guidance_scale = torch.where(
+                    high_noise_mask,
+                    torch.full_like(teacher_guidance_scale,
+                                    high_noise_guidance_scale),
+                    teacher_guidance_scale,
+                )
+                high_noise_guidance_mask_ratio = high_noise_mask.float()
+            teacher_cfg_delta = (
+                pred_real_video_cond -
+                pred_real_video_uncond) * teacher_guidance_scale
+            # Timestep-adaptive teacher clamp:
+            # high-noise steps use tighter teacher ratios to reduce whitening/drift.
             adaptive_alpha = torch.zeros_like(timestep_ratio)
             if bool(
                     getattr(self.training_args, "dmd_teacher_adaptive_clamp",
@@ -824,6 +850,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "teacher_output_clip_scale": teacher_output_clip_scale.detach(),
             "teacher_output_clip_ratio_used":
             teacher_output_clip_ratio.detach(),
+            "teacher_guidance_scale_used": teacher_guidance_scale.detach(),
+            "teacher_guidance_high_noise_mask_ratio":
+            high_noise_guidance_mask_ratio.detach(),
             "teacher_timestep_ratio": timestep_ratio.detach(),
             "teacher_adaptive_alpha": adaptive_alpha.detach(),
             "dmd_first_frame_grad_zeroed": torch.tensor(
@@ -981,6 +1010,19 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             float(
                 getattr(training_args,
                         "dmd_teacher_high_noise_output_max_ratio", 1.0)),
+        )
+        logger.info(
+            "Adaptive teacher guidance: enabled=%s threshold=%.3f base=%.3f high_noise=%.3f",
+            bool(
+                getattr(training_args, "dmd_teacher_adaptive_guidance", True)),
+            float(
+                getattr(training_args,
+                        "dmd_teacher_guidance_high_noise_threshold_ratio",
+                        0.7)),
+            float(self.real_score_guidance_scale),
+            float(
+                getattr(training_args, "dmd_teacher_high_noise_guidance_scale",
+                        2.0)),
         )
 
         # Activation checkpointing for ControlNet modules (important for memory in

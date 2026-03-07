@@ -68,6 +68,11 @@ dmd_teacher_adaptive_start_ratio: 0.7
 dmd_teacher_high_noise_cfg_delta_max_ratio: 1.0
 dmd_teacher_high_noise_residual_max_ratio: 1.0
 dmd_teacher_high_noise_output_max_ratio: 1.0
+# Bucketed teacher guidance: keep base guidance for low-noise, reduce only
+# on high-noise timesteps to suppress whitening drift.
+dmd_teacher_adaptive_guidance: true
+dmd_teacher_guidance_high_noise_threshold_ratio: 0.7
+dmd_teacher_high_noise_guidance_scale: 2.0
 # DMD denoising step list used by generator simulation (must be set; otherwise None will crash)
 dmd_denoising_steps: "1000,750,500,250"
 warp_denoising_step: true
