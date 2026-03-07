@@ -660,8 +660,9 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             # Stabilize DMD normalization when student is close to teacher.
             # Use raw normalizer with EMA-based floor to prevent tiny early-step
             # denominators from amplifying updates.
-            grad_normalizer_raw = torch.abs(original_latent -
-                                            real_score_pred_video).mean()
+            grad_normalizer_raw = torch.abs(
+                original_latent - real_score_pred_video).mean(
+                    dim=(1, 2, 3, 4), keepdim=True)
             ema_decay = float(
                 getattr(self.training_args, "dmd_grad_normalizer_ema_decay",
                         0.99))
@@ -673,10 +674,10 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
 
             prev_ema = getattr(self, "_dmd_grad_norm_ema", None)
             if prev_ema is None:
-                grad_normalizer_ema = grad_normalizer_raw.detach()
+                grad_normalizer_ema = grad_normalizer_raw.detach().mean()
             else:
                 grad_normalizer_ema = prev_ema * ema_decay + grad_normalizer_raw.detach(
-                ) * (1.0 - ema_decay)
+                ).mean() * (1.0 - ema_decay)
             self._dmd_grad_norm_ema = grad_normalizer_ema
 
             grad_normalizer = torch.maximum(
@@ -689,6 +690,12 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
                 getattr(self.training_args, "dmd_grad_value_clip", 10.0))
             if grad_clip > 0:
                 grad = grad.clamp(min=-grad_clip, max=grad_clip)
+            first_frame_grad_zeroed = 0.0
+            if first_frame_latent is not None and grad.ndim == 5 and grad.shape[
+                    1] > 0:
+                grad = grad.clone()
+                grad[:, :1] = 0
+                first_frame_grad_zeroed = 1.0
             grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
             grad_abs_mean = grad.abs().mean().detach()
 
@@ -719,6 +726,10 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "teacher_residual_std": teacher_residual_std.detach(),
             "teacher_residual_clip_scale":
             teacher_residual_clip_scale.detach(),
+            "dmd_first_frame_grad_zeroed": torch.tensor(
+                first_frame_grad_zeroed,
+                device=self.device,
+                dtype=torch.float32),
         })
         return dmd_loss
 

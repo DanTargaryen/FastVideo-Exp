@@ -1207,6 +1207,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 ("teacher_residual_std", "teacher_residual_std"),
                 ("teacher_residual_clip_scale",
                  "teacher_residual_clip_scale"),
+                ("dmd_first_frame_grad_zeroed",
+                 "dmd_first_frame_grad_zeroed"),
             )),
             (fake_vis, (
                 ("fake_score_timestep", "fake_score_timestep"),
@@ -1309,6 +1311,7 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             "teacher_cfg_clip_scale",
             "teacher_residual_std",
             "teacher_residual_clip_scale",
+            "dmd_first_frame_grad_zeroed",
             "dmd_gen_vs_real_abs_mean",
             "dmd_fake_vs_real_abs_mean",
             "dmd_timestep",
