@@ -645,12 +645,42 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             teacher_cfg_delta = (
                 pred_real_video_cond - pred_real_video_uncond
             ) * self.real_score_guidance_scale
+            # Timestep-adaptive teacher clamp:
+            # high-noise steps use tighter teacher ratios to reduce whitening/drift.
+            timestep_ratio = (
+                (timestep.float().view(batch_size, 1, 1, 1, 1) -
+                 float(self.min_timestep)) /
+                max(float(self.max_timestep - self.min_timestep), 1.0)
+            ).clamp(0.0, 1.0)
+            adaptive_alpha = torch.zeros_like(timestep_ratio)
+            if bool(
+                    getattr(self.training_args, "dmd_teacher_adaptive_clamp",
+                            True)):
+                adaptive_start_ratio = float(
+                    getattr(self.training_args,
+                            "dmd_teacher_adaptive_start_ratio", 0.7))
+                adaptive_start_ratio = min(max(adaptive_start_ratio, 0.0),
+                                           0.999)
+                adaptive_alpha = (
+                    (timestep_ratio - adaptive_start_ratio) /
+                    max(1e-6, 1.0 - adaptive_start_ratio)
+                ).clamp(0.0, 1.0)
             teacher_cfg_delta_std = _samplewise_std(teacher_cfg_delta)
             teacher_cfg_clip_scale = torch.ones_like(teacher_cfg_delta_std)
-            teacher_cfg_clip_ratio = float(
+            teacher_cfg_clip_ratio_base = float(
                 getattr(self.training_args,
                         "dmd_teacher_cfg_delta_max_ratio", 1.5))
-            if teacher_cfg_clip_ratio > 0:
+            teacher_cfg_clip_ratio_high = float(
+                getattr(self.training_args,
+                        "dmd_teacher_high_noise_cfg_delta_max_ratio",
+                        teacher_cfg_clip_ratio_base))
+            teacher_cfg_clip_ratio = torch.clamp(
+                torch.full_like(teacher_cfg_delta_std, teacher_cfg_clip_ratio_base)
+                + (teacher_cfg_clip_ratio_high - teacher_cfg_clip_ratio_base) *
+                adaptive_alpha,
+                min=0.0,
+            )
+            if float(teacher_cfg_clip_ratio.max().item()) > 0:
                 cond_std = _samplewise_std(pred_real_video_cond).clamp_min(1e-6)
                 max_cfg_std = cond_std * teacher_cfg_clip_ratio
                 teacher_cfg_clip_scale = torch.clamp(
@@ -664,11 +694,22 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             teacher_residual_std = _samplewise_std(teacher_residual)
             teacher_residual_clip_scale = torch.ones_like(
                 teacher_residual_std)
-            teacher_residual_clip_ratio = float(
+            teacher_residual_clip_ratio_base = float(
                 getattr(self.training_args,
                         "dmd_teacher_residual_max_ratio", 1.5))
+            teacher_residual_clip_ratio_high = float(
+                getattr(self.training_args,
+                        "dmd_teacher_high_noise_residual_max_ratio",
+                        teacher_residual_clip_ratio_base))
+            teacher_residual_clip_ratio = torch.clamp(
+                torch.full_like(teacher_residual_std,
+                                teacher_residual_clip_ratio_base)
+                + (teacher_residual_clip_ratio_high -
+                   teacher_residual_clip_ratio_base) * adaptive_alpha,
+                min=0.0,
+            )
             generator_std = _samplewise_std(original_latent).clamp_min(1e-6)
-            if teacher_residual_clip_ratio > 0:
+            if float(teacher_residual_clip_ratio.max().item()) > 0:
                 max_teacher_residual_std = (
                     generator_std * teacher_residual_clip_ratio)
                 teacher_residual_clip_scale = torch.clamp(
@@ -683,10 +724,20 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             # teacher overpowering the student (whitening/drift failure mode).
             teacher_output_std = _samplewise_std(real_score_pred_video)
             teacher_output_clip_scale = torch.ones_like(teacher_output_std)
-            teacher_output_clip_ratio = float(
+            teacher_output_clip_ratio_base = float(
                 getattr(self.training_args, "dmd_teacher_output_max_ratio",
                         1.15))
-            if teacher_output_clip_ratio > 0:
+            teacher_output_clip_ratio_high = float(
+                getattr(self.training_args,
+                        "dmd_teacher_high_noise_output_max_ratio",
+                        teacher_output_clip_ratio_base))
+            teacher_output_clip_ratio = torch.clamp(
+                torch.full_like(teacher_output_std, teacher_output_clip_ratio_base)
+                + (teacher_output_clip_ratio_high -
+                   teacher_output_clip_ratio_base) * adaptive_alpha,
+                min=0.0,
+            )
+            if float(teacher_output_clip_ratio.max().item()) > 0:
                 max_teacher_output_std = generator_std * teacher_output_clip_ratio
                 teacher_output_clip_scale = torch.clamp(
                     max_teacher_output_std /
@@ -763,11 +814,18 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
             "dmdtrain_gradient_norm": grad_abs_mean,
             "teacher_cfg_delta_std": teacher_cfg_delta_std.detach(),
             "teacher_cfg_clip_scale": teacher_cfg_clip_scale.detach(),
+            "teacher_cfg_clip_ratio_used": teacher_cfg_clip_ratio.detach(),
             "teacher_residual_std": teacher_residual_std.detach(),
             "teacher_residual_clip_scale":
             teacher_residual_clip_scale.detach(),
+            "teacher_residual_clip_ratio_used":
+            teacher_residual_clip_ratio.detach(),
             "teacher_output_std": teacher_output_std.detach(),
             "teacher_output_clip_scale": teacher_output_clip_scale.detach(),
+            "teacher_output_clip_ratio_used":
+            teacher_output_clip_ratio.detach(),
+            "teacher_timestep_ratio": timestep_ratio.detach(),
+            "teacher_adaptive_alpha": adaptive_alpha.detach(),
             "dmd_first_frame_grad_zeroed": torch.tensor(
                 first_frame_grad_zeroed,
                 device=self.device,
@@ -907,6 +965,22 @@ class WanControlnetSelfForcingDistillationPipeline(SelfForcingDistillationPipeli
         logger.info(
             "Condition latent normalization: normalize_condition_latents=%s",
             bool(getattr(training_args, "normalize_condition_latents", False)),
+        )
+        logger.info(
+            "Adaptive teacher clamp: enabled=%s start_ratio=%.3f high_noise(cfg=%.3f residual=%.3f output=%.3f)",
+            bool(getattr(training_args, "dmd_teacher_adaptive_clamp", True)),
+            float(
+                getattr(training_args, "dmd_teacher_adaptive_start_ratio",
+                        0.7)),
+            float(
+                getattr(training_args,
+                        "dmd_teacher_high_noise_cfg_delta_max_ratio", 1.0)),
+            float(
+                getattr(training_args,
+                        "dmd_teacher_high_noise_residual_max_ratio", 1.0)),
+            float(
+                getattr(training_args,
+                        "dmd_teacher_high_noise_output_max_ratio", 1.0)),
         )
 
         # Activation checkpointing for ControlNet modules (important for memory in

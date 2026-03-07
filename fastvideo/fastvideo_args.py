@@ -831,6 +831,13 @@ class TrainingArgs(FastVideoArgs):
     dmd_teacher_cfg_delta_max_ratio: float = 1.5
     dmd_teacher_residual_max_ratio: float = 1.5
     dmd_teacher_output_max_ratio: float = 1.15
+    # Optional timestep-adaptive teacher clamp:
+    # linearly interpolate low-noise ratio -> high-noise ratio by sampled DMD timestep.
+    dmd_teacher_adaptive_clamp: bool = True
+    dmd_teacher_adaptive_start_ratio: float = 0.7
+    dmd_teacher_high_noise_cfg_delta_max_ratio: float = 1.0
+    dmd_teacher_high_noise_residual_max_ratio: float = 1.0
+    dmd_teacher_high_noise_output_max_ratio: float = 1.0
     # Match Causal-Forcing DMD timestep policy by default.
     # ts_schedule: constrain min timestep by denoised_timestep_to
     # ts_schedule_max: constrain max timestep by denoised_timestep_from
@@ -1314,6 +1321,40 @@ class TrainingArgs(FastVideoArgs):
             default=TrainingArgs.dmd_teacher_output_max_ratio,
             help=
             "Final clamp: teacher output std <= student std * ratio (<=0 disables)."
+        )
+        parser.add_argument(
+            "--dmd-teacher-adaptive-clamp",
+            action=StoreBoolean,
+            help=
+            "Enable timestep-adaptive teacher clamp (stronger at high-noise timesteps)."
+        )
+        parser.add_argument(
+            "--dmd-teacher-adaptive-start-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_adaptive_start_ratio,
+            help=
+            "Normalized timestep ratio where adaptive teacher clamp starts increasing (0-1)."
+        )
+        parser.add_argument(
+            "--dmd-teacher-high-noise-cfg-delta-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_high_noise_cfg_delta_max_ratio,
+            help=
+            "Adaptive target ratio for teacher CFG delta clamp at high-noise end."
+        )
+        parser.add_argument(
+            "--dmd-teacher-high-noise-residual-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_high_noise_residual_max_ratio,
+            help=
+            "Adaptive target ratio for teacher residual clamp at high-noise end."
+        )
+        parser.add_argument(
+            "--dmd-teacher-high-noise-output-max-ratio",
+            type=float,
+            default=TrainingArgs.dmd_teacher_high_noise_output_max_ratio,
+            help=
+            "Adaptive target ratio for teacher output std clamp at high-noise end."
         )
         parser.add_argument(
             "--ts-schedule",
