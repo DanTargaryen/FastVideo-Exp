@@ -1380,7 +1380,7 @@ class _PointCloudWarper:
 
         u_v = u_proj[in_bounds]
         v_v = v_proj[in_bounds]
-        zs_v = zs[in_bounds]
+        zs_v = zs_v[in_bounds]
         colors_v = colors_v[in_bounds]
 
         if target_depth is not None:
