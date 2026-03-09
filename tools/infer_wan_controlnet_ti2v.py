@@ -1114,6 +1114,784 @@ def _load_sample_raw(
     )
 
 
+@dataclass(frozen=True)
+class RawLongSequence:
+    sample_id: str
+    prompt: str
+    fps: int
+    text_embedding_bld: torch.Tensor
+    rgb_paths: list[Path]
+    depth_paths: list[Path]
+    normal_paths: list[Path] | None
+    mask_paths: list[Path]
+    masked_rgb_paths: list[Path] | None
+    frame_ids: list[int]
+    camera_k_aligned: np.ndarray
+    camera_rt_dir: Path
+    crop_params: tuple[int, int, int, int]
+
+
+def _resolve_raw_dirs(
+    *,
+    sample_root: Path,
+    args,
+) -> tuple[Path, Path, Path, Path, Path]:
+    rgb_dir = Path(str(args.raw_rgb_dir)).expanduser() if str(
+        args.raw_rgb_dir).strip() else (sample_root / "rgb")
+    depth_dir = Path(str(args.raw_depth_dir)).expanduser() if str(
+        args.raw_depth_dir).strip() else (sample_root / "depth")
+    normal_dir = Path(str(args.raw_normal_dir)).expanduser() if str(
+        args.raw_normal_dir).strip() else (sample_root / "normal")
+    mask_dir = Path(str(args.raw_mask_dir)).expanduser() if str(
+        args.raw_mask_dir).strip() else (sample_root / "mask")
+    masked_rgb_dir = Path(str(args.raw_masked_rgb_dir)).expanduser() if str(
+        args.raw_masked_rgb_dir).strip() else (sample_root / "masked_rgb")
+    return rgb_dir, depth_dir, normal_dir, mask_dir, masked_rgb_dir
+
+
+def _resolve_raw_prompt(sample_root: Path, args) -> str:
+    prompt = str(args.raw_prompt or "").strip()
+    if prompt:
+        return prompt
+
+    caption_path = Path(str(args.raw_caption_path)).expanduser(
+    ) if str(args.raw_caption_path).strip() else None
+    if caption_path is not None and caption_path.exists():
+        if caption_path.suffix.lower() == ".json":
+            prompt = _read_caption_json(caption_path, str(args.raw_caption_key))
+        else:
+            prompt = caption_path.read_text(encoding="utf-8").strip()
+        if prompt:
+            return prompt
+
+    text_txt = sample_root / "text.txt"
+    if text_txt.is_file():
+        prompt = text_txt.read_text(encoding="utf-8").strip()
+        if prompt:
+            return prompt
+
+    cap_jsons = sorted(sample_root.glob("caption*.json"), key=lambda p: p.name)
+    if cap_jsons:
+        prompt = _read_caption_json(cap_jsons[-1], str(args.raw_caption_key))
+        if prompt:
+            return prompt
+
+    return "A driving scene in city street."
+
+
+def _extract_frame_ids(paths: list[Path], *, name: str) -> list[int]:
+    ids: list[int] = []
+    for p in paths:
+        idx = _frame_index_from_stem(p.stem)
+        if idx is None:
+            logger.warning(
+                "Failed to parse frame id from %s filename %s; fallback to sequential indices.",
+                name,
+                p.name,
+            )
+            return list(range(len(paths)))
+        ids.append(int(idx))
+    return ids
+
+
+def _get_crop_params(src_w: int, src_h: int,
+                     target_w: int, target_h: int) -> tuple[int, int, int, int]:
+    target_ratio = float(target_w) / float(target_h)
+    src_ratio = float(src_w) / float(src_h)
+    if src_ratio > target_ratio:
+        crop_w = int(src_h * target_ratio)
+        crop_h = int(src_h)
+        left = max(0, (src_w - crop_w) // 2)
+        top = 0
+    else:
+        crop_h = int(src_w / target_ratio)
+        crop_w = int(src_w)
+        top = max(0, (src_h - crop_h) // 2)
+        left = 0
+    return int(top), int(left), int(crop_h), int(crop_w)
+
+
+def _load_camera_matrix(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"camera matrix not found: {path}")
+    if path.suffix.lower() == ".npy":
+        return np.load(path)
+    return np.loadtxt(path)
+
+
+def _adjust_intrinsics(
+    K: np.ndarray,
+    crop_params: tuple[int, int, int, int],
+    target_w: int,
+    target_h: int,
+) -> np.ndarray:
+    top, left, crop_h, crop_w = crop_params
+    scale_x = float(target_w) / float(crop_w)
+    scale_y = float(target_h) / float(crop_h)
+
+    K_new = K.astype(np.float32).copy()
+    K_new[0, 2] -= float(left)
+    K_new[1, 2] -= float(top)
+    K_new[0, 0] *= scale_x
+    K_new[1, 1] *= scale_y
+    K_new[0, 2] *= scale_x
+    K_new[1, 2] *= scale_y
+    return K_new
+
+
+def _read_physical_depth(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".exr":
+        return _read_depth_any(path).astype(np.float32)
+    arr = imageio.imread(path)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    if arr.dtype == np.uint16:
+        return arr.astype(np.float32) / 1000.0
+    return arr.astype(np.float32)
+
+
+def _aligned_physical_depth(
+    path: Path,
+    crop_params: tuple[int, int, int, int],
+    target_w: int,
+    target_h: int,
+) -> np.ndarray:
+    top, left, ch, cw = crop_params
+    depth_raw = _read_physical_depth(path)
+    depth_t = torch.from_numpy(depth_raw).unsqueeze(0).unsqueeze(0).float()
+    depth_aligned = torch.nn.functional.interpolate(
+        depth_t[:, :, top:top + ch, left:left + cw],
+        size=(int(target_h), int(target_w)),
+        mode="nearest",
+    )
+    return depth_aligned[0, 0].cpu().numpy()
+
+
+def _resolve_camera_rt_path(camera_rt_dir: Path, frame_idx: int) -> Path:
+    candidates = [
+        camera_rt_dir / f"camera_RT_{int(frame_idx):04d}.txt",
+        camera_rt_dir / f"{int(frame_idx):04d}.txt",
+        camera_rt_dir / f"camera_RT_{int(frame_idx):06d}.txt",
+        camera_rt_dir / f"{int(frame_idx):06d}.txt",
+        camera_rt_dir / f"camera_RT_{int(frame_idx)}.txt",
+        camera_rt_dir / f"{int(frame_idx)}.txt",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"camera RT file not found for frame {int(frame_idx)} under {camera_rt_dir}"
+    )
+
+
+class _PointCloudWarper:
+
+    @staticmethod
+    def back_project(
+        rgb_u8: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        Rt: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        h, w = depth.shape
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+
+        valid_depth = np.isfinite(depth)
+        if valid_depth.any():
+            bg_val = float(np.nanmax(depth[valid_depth]))
+        else:
+            bg_val = 0.0
+        mask = valid_depth & (depth > 0.0)
+        if bg_val > 1e-8:
+            mask = mask & (depth < bg_val * 0.99)
+
+        if not np.any(mask):
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3),
+                                                                 dtype=np.uint8)
+
+        z_val = depth[mask]
+        u_val = u[mask]
+        v_val = v[mask]
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        x_cam = (u_val - cx) * z_val / fx
+        y_cam = -((v_val - cy) * z_val / fy)
+        z_cam = -z_val
+        p_cam = np.stack((x_cam, y_cam, z_cam), axis=-1)
+
+        R_raw = Rt[:3, :3]
+        T_raw = Rt[:3, 3]
+        R_inv = np.linalg.inv(R_raw)
+        points_world = (p_cam - T_raw[None, :]) @ R_inv.T
+        colors = rgb_u8[mask][:, :3]
+        return points_world.astype(np.float32), colors.astype(np.uint8)
+
+    @staticmethod
+    def project_to_view(
+        points_world: np.ndarray,
+        colors: np.ndarray,
+        K: np.ndarray,
+        Rt: np.ndarray,
+        out_h: int,
+        out_w: int,
+        target_depth: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if points_world.shape[0] == 0:
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.uint8))
+
+        R = Rt[:3, :3]
+        T = Rt[:3, 3]
+        cam_points = (points_world @ R.T) + T[None, :]
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        zs = -cam_points[:, 2]
+        valid = zs > 0.05
+        if not np.any(valid):
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.uint8))
+
+        zs_safe = np.where(valid, zs, 1e-6)
+        u_proj = (fx * (cam_points[:, 0] / zs_safe) + cx).astype(np.int32)
+        v_proj = (fy * (-cam_points[:, 1] / zs_safe) + cy).astype(np.int32)
+        in_bounds = valid & (u_proj >= 0) & (u_proj < out_w) & (v_proj >= 0) & (
+            v_proj < out_h)
+        if not np.any(in_bounds):
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.uint8))
+
+        u_v = u_proj[in_bounds]
+        v_v = v_proj[in_bounds]
+        zs_v = zs[in_bounds]
+        colors_v = colors[in_bounds]
+
+        if target_depth is not None:
+            ref_depths = target_depth[v_v, u_v]
+            margin = ref_depths * 0.05
+            not_occluded = (ref_depths == 0) | (zs_v <= ref_depths + margin)
+            u_v = u_v[not_occluded]
+            v_v = v_v[not_occluded]
+            zs_v = zs_v[not_occluded]
+            colors_v = colors_v[not_occluded]
+            if u_v.shape[0] == 0:
+                return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                        np.zeros((out_h, out_w), dtype=np.uint8))
+
+        sort_idx = np.argsort(zs_v)[::-1]
+        img = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        mask = np.zeros((out_h, out_w), dtype=np.uint8)
+        img[v_v[sort_idx], u_v[sort_idx]] = colors_v[sort_idx]
+        mask[v_v[sort_idx], u_v[sort_idx]] = 255
+        return img, mask
+
+
+def _warp_maskrgb_from_keyframes(
+    *,
+    keyframe_rgbs_u8: list[np.ndarray],
+    keyframe_frame_ids: list[int],
+    target_frame_ids: list[int],
+    depth_path_by_frame_id: dict[int, Path],
+    camera_k_aligned: np.ndarray,
+    camera_rt_dir: Path,
+    crop_params: tuple[int, int, int, int],
+    target_height: int,
+    target_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    warper = _PointCloudWarper()
+
+    source_clouds: list[tuple[np.ndarray, np.ndarray]] = []
+    for src_rgb, src_id in zip(keyframe_rgbs_u8, keyframe_frame_ids):
+        if int(src_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for source frame id {int(src_id)}")
+        src_depth = _aligned_physical_depth(
+            depth_path_by_frame_id[int(src_id)],
+            crop_params,
+            target_width,
+            target_height,
+        )
+        src_rt = _load_camera_matrix(
+            _resolve_camera_rt_path(camera_rt_dir, int(src_id)))
+        source_clouds.append(
+            warper.back_project(src_rgb, src_depth, camera_k_aligned, src_rt))
+
+    merged_rgb_tensors: list[torch.Tensor] = []
+    merged_mask_tensors: list[torch.Tensor] = []
+    for tgt_id in target_frame_ids:
+        if int(tgt_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for target frame id {int(tgt_id)}")
+        tgt_rt = _load_camera_matrix(
+            _resolve_camera_rt_path(camera_rt_dir, int(tgt_id)))
+        tgt_depth = _aligned_physical_depth(
+            depth_path_by_frame_id[int(tgt_id)],
+            crop_params,
+            target_width,
+            target_height,
+        )
+
+        merged_rgb = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        merged_mask = np.zeros((target_height, target_width), dtype=np.uint8)
+        for points_world, colors in source_clouds:
+            w_rgb, w_mask = warper.project_to_view(
+                points_world,
+                colors,
+                camera_k_aligned,
+                tgt_rt,
+                target_height,
+                target_width,
+                target_depth=tgt_depth,
+            )
+            valid = w_mask > 127
+            merged_rgb[valid] = w_rgb[valid]
+            merged_mask[valid] = 255
+
+        merged_rgb_tensors.append(
+            torch.from_numpy(merged_rgb.astype(np.float32) / 255.0).permute(
+                2, 0, 1).contiguous())
+        merged_mask_tensors.append(
+            torch.from_numpy((merged_mask > 127).astype(np.float32))[None, ...]
+            .contiguous())
+
+    return (
+        torch.stack(merged_rgb_tensors, dim=0),
+        torch.stack(merged_mask_tensors, dim=0),
+    )
+
+
+def _encode_first_frame_latent(
+    *,
+    vae,
+    first_rgb_chw: torch.Tensor,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    first_bcthw = _to_vae_input(first_rgb_chw[None, ...], normalize=True).to(
+        device=inference_device, dtype=compute_dtype)
+    first_lat = _encode_video_latents(
+        vae,
+        first_bcthw,
+        sample_mode="mode",
+        compute_dtype=compute_dtype,
+    )
+    first_lat_cf = _align_latent_channels(first_lat[0], target_c, "first_frame_lat")
+    return first_lat_cf.unsqueeze(0)
+
+
+def _encode_control_latent_from_tchw(
+    *,
+    vae,
+    depth_tchw: torch.Tensor,
+    normal_tchw: torch.Tensor | None,
+    masked_rgb_tchw: torch.Tensor,
+    mask_tchw: torch.Tensor,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    mask3_tchw = mask_tchw.repeat(1, 3, 1, 1)
+    if normal_tchw is not None:
+        video_n = torch.cat(
+            [
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(normal_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask3_tchw, normalize=False),
+            ],
+            dim=0,
+        ).to(device=inference_device, dtype=compute_dtype)
+        lat_n = _encode_video_latents(
+            vae,
+            video_n,
+            sample_mode="mode",
+            compute_dtype=compute_dtype,
+        )
+        depth_lat = lat_n[0]
+        normal_lat = lat_n[1]
+        masked_lat = lat_n[2]
+        mask_lat = lat_n[3]
+        depth_lat = _align_latent_channels(depth_lat, target_c, "depth_lat")
+        normal_lat = _align_latent_channels(normal_lat, target_c, "normal_lat")
+        masked_lat = _align_latent_channels(masked_lat, target_c, "masked_lat")
+        mask_lat = _align_latent_channels(mask_lat, target_c, "mask_lat")
+        control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
+    else:
+        video_n = torch.cat(
+            [
+                _to_vae_input(depth_tchw, normalize=False),
+                _to_vae_input(masked_rgb_tchw, normalize=True),
+                _to_vae_input(mask3_tchw, normalize=False),
+            ],
+            dim=0,
+        ).to(device=inference_device, dtype=compute_dtype)
+        lat_n = _encode_video_latents(
+            vae,
+            video_n,
+            sample_mode="mode",
+            compute_dtype=compute_dtype,
+        )
+        depth_lat = lat_n[0]
+        masked_lat = lat_n[1]
+        mask_lat = lat_n[2]
+        depth_lat = _align_latent_channels(depth_lat, target_c, "depth_lat")
+        masked_lat = _align_latent_channels(masked_lat, target_c, "masked_lat")
+        mask_lat = _align_latent_channels(mask_lat, target_c, "mask_lat")
+        control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+    return control_lat.unsqueeze(0)
+
+
+def _load_raw_long_sequence(
+    *,
+    sample_root: Path,
+    sample_index: int,
+    args,
+    tokenizer,
+    text_encoder,
+    transformer,
+    inference_device: torch.device,
+    dtype: torch.dtype,
+) -> RawLongSequence:
+    window_frames = int(args.causal_window_frames)
+    overlap_frames = int(args.causal_overlap_frames)
+    stride = window_frames - overlap_frames
+    total_required = window_frames + int(args.T) * stride
+
+    rgb_dir, depth_dir, normal_dir, mask_dir, masked_rgb_dir = _resolve_raw_dirs(
+        sample_root=sample_root, args=args)
+
+    if not rgb_dir.is_dir():
+        raise FileNotFoundError(f"raw rgb dir not found: {rgb_dir}")
+    if not depth_dir.is_dir():
+        raise FileNotFoundError(f"raw depth dir not found: {depth_dir}")
+    if not mask_dir.is_dir():
+        raise FileNotFoundError(f"raw mask dir not found: {mask_dir}")
+
+    rgb_all = _sorted_files(rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+    depth_all = _sorted_files(depth_dir,
+                              (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
+    mask_all = _sorted_files(mask_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+    normal_all: list[Path] | None = None
+    if normal_dir.is_dir():
+        nfiles = _sorted_files(normal_dir,
+                               (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
+        if len(nfiles) > 0:
+            normal_all = nfiles
+    if bool(args.raw_require_normal) and normal_all is None:
+        raise FileNotFoundError(
+            f"--raw_require_normal is set but normal dir is missing/empty: {normal_dir}"
+        )
+    masked_rgb_all: list[Path] | None = None
+    if masked_rgb_dir.is_dir():
+        mfiles = _sorted_files(masked_rgb_dir,
+                               (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+        if len(mfiles) > 0:
+            masked_rgb_all = mfiles
+
+    if len(rgb_all) < total_required:
+        raise ValueError(
+            f"raw rgb frames are insufficient for long causal rollout: need {total_required}, got {len(rgb_all)}"
+        )
+    if len(depth_all) < total_required:
+        raise ValueError(
+            f"raw depth frames are insufficient for long causal rollout: need {total_required}, got {len(depth_all)}"
+        )
+    if normal_all is not None and len(normal_all) < total_required:
+        raise ValueError(
+            f"raw normal frames are insufficient for long causal rollout: need {total_required}, got {len(normal_all)}"
+        )
+    if len(mask_all) < window_frames:
+        raise ValueError(
+            f"raw mask frames are insufficient for first long window: need {window_frames}, got {len(mask_all)}"
+        )
+    if masked_rgb_all is not None and len(masked_rgb_all) < window_frames:
+        logger.warning(
+            "masked_rgb frames are fewer than first window (%s < %s); falling back to zero masked_rgb for missing frames.",
+            len(masked_rgb_all),
+            window_frames,
+        )
+        masked_rgb_all = _pad_or_trim_paths(masked_rgb_all, window_frames)
+
+    rgb_paths = rgb_all[:total_required]
+    depth_paths = depth_all[:total_required]
+    frame_ids = _extract_frame_ids(depth_paths, name="depth")
+    normal_paths = normal_all[:total_required] if normal_all is not None else None
+    mask_paths = mask_all[:window_frames]
+    masked_rgb_paths = masked_rgb_all[:window_frames] if masked_rgb_all is not None else None
+
+    prompt = _resolve_raw_prompt(sample_root, args)
+    max_text_len = int(getattr(transformer, "text_len", 226))
+    text_embedding = _compute_prompt_embeddings(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        prompt=prompt,
+        max_sequence_length=max_text_len,
+        dtype=dtype,
+        target_device=inference_device,
+    )
+
+    cam_k_path = Path(str(args.cam_k)).expanduser(
+    ) if str(args.cam_k).strip() else (sample_root / "camera" / "camera_K.txt")
+    camera_rt_dir = Path(str(args.cam_rt_dir)).expanduser(
+    ) if str(args.cam_rt_dir).strip() else (sample_root / "camera")
+    if not camera_rt_dir.is_dir():
+        raise FileNotFoundError(f"camera RT dir not found: {camera_rt_dir}")
+    camera_k = _load_camera_matrix(cam_k_path).astype(np.float32)
+
+    ref_img = Image.open(rgb_paths[0]).convert("RGB")
+    src_w, src_h = ref_img.size
+    crop_params = _get_crop_params(src_w, src_h, int(args.width), int(args.height))
+    camera_k_aligned = _adjust_intrinsics(camera_k, crop_params, int(args.width),
+                                          int(args.height))
+
+    sample_id = f"{sample_root.name}_idx{sample_index:06d}"
+    return RawLongSequence(
+        sample_id=sample_id,
+        prompt=prompt,
+        fps=int(args.raw_fps),
+        text_embedding_bld=text_embedding,
+        rgb_paths=rgb_paths,
+        depth_paths=depth_paths,
+        normal_paths=normal_paths,
+        mask_paths=mask_paths,
+        masked_rgb_paths=masked_rgb_paths,
+        frame_ids=frame_ids,
+        camera_k_aligned=camera_k_aligned,
+        camera_rt_dir=camera_rt_dir,
+        crop_params=crop_params,
+    )
+
+
+@torch.no_grad()
+def _run_causal_long_warp_rollout(
+    *,
+    sequence: RawLongSequence,
+    args,
+    transformer,
+    controlnet,
+    scheduler,
+    vae,
+    decoding: DecodingStage,
+    fastvideo_args: FastVideoArgs,
+    negative_prompt_embeds_global: torch.Tensor | None,
+    sample_seed: int,
+    dtype: torch.dtype,
+    dmd_steps_list: list[int] | None,
+    timestep_indices_list: list[int] | None,
+    inference_device: torch.device,
+) -> torch.Tensor:
+    window_frames = int(args.causal_window_frames)
+    overlap_frames = int(args.causal_overlap_frames)
+    if overlap_frames <= 0 or overlap_frames >= window_frames:
+        raise ValueError(
+            f"Invalid overlap/window settings: overlap={overlap_frames}, window={window_frames}"
+        )
+    stride = window_frames - overlap_frames
+    total_required = window_frames + int(args.T) * stride
+    if int(args.num_frames) != total_required:
+        logger.info(
+            "causal-long mode: using effective total frames=%s (window=%s overlap=%s T=%s), overriding --num_frames=%s.",
+            total_required,
+            window_frames,
+            overlap_frames,
+            int(args.T),
+            int(args.num_frames),
+        )
+
+    prompt_embeds = sequence.text_embedding_bld.to(device="cuda", dtype=dtype)
+    negative_prompt_embeds = None
+    if float(args.guidance_scale) != 1.0:
+        if negative_prompt_embeds_global is not None:
+            negative_prompt_embeds = negative_prompt_embeds_global
+        else:
+            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+
+    target_c = int(getattr(transformer, "num_channels_latents", 16))
+    H = int(args.height)
+    W = int(args.width)
+
+    depth_path_by_id = {
+        int(fid): p
+        for fid, p in zip(sequence.frame_ids, sequence.depth_paths)
+    }
+
+    stitched_chunks: list[torch.Tensor] = []
+    carry_keyframes_tchw: torch.Tensor | None = None
+    carry_keyframe_ids: list[int] | None = None
+    warped_masked_rgb_next: torch.Tensor | None = None
+    warped_mask_next: torch.Tensor | None = None
+
+    num_windows = int(args.T) + 1
+    for win_idx in range(num_windows):
+        start_pos = win_idx * stride
+        end_pos = start_pos + window_frames
+        depth_window_paths = sequence.depth_paths[start_pos:end_pos]
+        if len(depth_window_paths) != window_frames:
+            raise RuntimeError(
+                f"Depth window length mismatch at win={win_idx}: expected {window_frames}, got {len(depth_window_paths)}"
+            )
+
+        if win_idx == 0:
+            first_rgb = _load_rgb_frame(sequence.rgb_paths[0], H, W)
+            mask_tchw = torch.stack(
+                [
+                    _load_mask_frame(
+                        p,
+                        H,
+                        W,
+                        threshold=None if float(args.raw_mask_threshold) < 0 else
+                        float(args.raw_mask_threshold),
+                        invert=bool(args.raw_mask_invert),
+                    ) for p in sequence.mask_paths
+                ],
+                dim=0,
+            )
+            if sequence.masked_rgb_paths is not None:
+                masked_rgb_tchw = torch.stack(
+                    [_load_rgb_frame(p, H, W) for p in sequence.masked_rgb_paths],
+                    dim=0,
+                )
+            else:
+                masked_rgb_tchw = torch.zeros((window_frames, 3, H, W),
+                                              dtype=torch.float32)
+            mask_tchw = mask_tchw.clone()
+            masked_rgb_tchw = masked_rgb_tchw.clone()
+            mask_tchw[0] = 1.0
+            masked_rgb_tchw[0] = first_rgb
+        else:
+            if (carry_keyframes_tchw is None or carry_keyframe_ids is None
+                    or warped_masked_rgb_next is None or warped_mask_next is None):
+                raise RuntimeError("Missing carry-over warp state for long causal rollout.")
+            first_rgb = carry_keyframes_tchw[0]
+            mask_tchw = torch.cat(
+                [
+                    torch.ones((overlap_frames, 1, H, W), dtype=torch.float32),
+                    warped_mask_next,
+                ],
+                dim=0,
+            )
+            masked_rgb_tchw = torch.cat([carry_keyframes_tchw, warped_masked_rgb_next],
+                                        dim=0)
+
+        if mask_tchw.shape[0] != window_frames or masked_rgb_tchw.shape[0] != window_frames:
+            raise RuntimeError(
+                f"Window control frame count mismatch at win={win_idx}: mask={mask_tchw.shape[0]} masked_rgb={masked_rgb_tchw.shape[0]} expected={window_frames}"
+            )
+
+        depth_tchw = _load_depth_sequence(
+            depth_window_paths,
+            H,
+            W,
+            pmin=float(args.raw_depth_percentile_min),
+            pmax=float(args.raw_depth_percentile_max),
+            invert_depth=bool(args.raw_depth_invert),
+        )
+        normal_tchw = None
+        if sequence.normal_paths is not None:
+            normal_window_paths = sequence.normal_paths[start_pos:end_pos]
+            normal_tchw = torch.stack(
+                [_load_normal_frame(p, H, W) for p in normal_window_paths],
+                dim=0,
+            )
+
+        first_frame_latent = _encode_first_frame_latent(
+            vae=vae,
+            first_rgb_chw=first_rgb,
+            target_c=target_c,
+            inference_device=inference_device,
+            compute_dtype=dtype,
+        ).to(device="cuda", dtype=dtype)
+
+        control_latent = _encode_control_latent_from_tchw(
+            vae=vae,
+            depth_tchw=depth_tchw,
+            normal_tchw=normal_tchw,
+            masked_rgb_tchw=masked_rgb_tchw,
+            mask_tchw=mask_tchw,
+            target_c=target_c,
+            inference_device=inference_device,
+            compute_dtype=dtype,
+        ).to(device="cuda", dtype=dtype)
+
+        if bool(args.control_depth_only):
+            total_c = int(control_latent.shape[1])
+            if total_c % 3 != 0:
+                raise ValueError(
+                    f"control_latent channels must be divisible by 3, got {total_c}"
+                )
+            base_c = total_c // 3
+            control_latent = control_latent.clone()
+            control_latent[:, base_c:] = 0
+
+        latents = _causal_dmd_rollout_ti2v_controlnet(
+            transformer=transformer,
+            controlnet=controlnet,
+            scheduler=scheduler,
+            prompt_embeds_list=[prompt_embeds],
+            negative_prompt_embeds_list=(
+                [negative_prompt_embeds] if negative_prompt_embeds is not None else None),
+            guidance_scale=float(args.guidance_scale),
+            first_frame_latent_bcfhw=first_frame_latent,
+            control_latent_bcfhw=control_latent,
+            height=H,
+            width=W,
+            num_frames=window_frames,
+            schedule_num_inference_steps=int(args.schedule_num_inference_steps),
+            dmd_steps=dmd_steps_list,
+            timestep_indices=timestep_indices_list,
+            context_noise=args.context_noise,
+            warp_denoising_step=bool(args.warp_denoising_step),
+            update_rule=args.update_rule,
+            full_schedule=bool(args.full_schedule),
+            first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+            expand_timesteps=bool(
+                getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
+            reset_cache_each_block=bool(args.reset_cache_each_block),
+            disable_cache_update=bool(args.disable_cache_update),
+            seed=int(sample_seed + win_idx),
+            dtype=dtype,
+        )
+
+        decoded_window = decoding.decode(latents, fastvideo_args).cpu().float()
+        decoded_window_tchw = decoded_window[0].permute(1, 0, 2, 3).contiguous()
+        if decoded_window_tchw.shape[0] != window_frames:
+            raise RuntimeError(
+                f"Decoded window frame count mismatch at win={win_idx}: got {decoded_window_tchw.shape[0]}, expected {window_frames}"
+            )
+
+        if win_idx == 0:
+            stitched_chunks.append(decoded_window_tchw)
+        else:
+            stitched_chunks.append(decoded_window_tchw[overlap_frames:])
+
+        if win_idx < num_windows - 1:
+            tail = decoded_window_tchw[-overlap_frames:].contiguous()
+            carry_keyframes_tchw = tail
+            carry_keyframe_ids = sequence.frame_ids[end_pos - overlap_frames:end_pos]
+            target_ids_next = sequence.frame_ids[end_pos:end_pos + stride]
+            keyframe_rgbs_u8 = []
+            for k in range(overlap_frames):
+                frame = tail[k].permute(1, 2, 0).clamp(0, 1).numpy()
+                keyframe_rgbs_u8.append((frame * 255.0).round().astype(np.uint8))
+            warped_masked_rgb_next, warped_mask_next = _warp_maskrgb_from_keyframes(
+                keyframe_rgbs_u8=keyframe_rgbs_u8,
+                keyframe_frame_ids=carry_keyframe_ids,
+                target_frame_ids=target_ids_next,
+                depth_path_by_frame_id=depth_path_by_id,
+                camera_k_aligned=sequence.camera_k_aligned,
+                camera_rt_dir=sequence.camera_rt_dir,
+                crop_params=sequence.crop_params,
+                target_height=H,
+                target_width=W,
+            )
+
+            if warped_masked_rgb_next.shape[0] != stride or warped_mask_next.shape[0] != stride:
+                raise RuntimeError(
+                    f"Warp output frame count mismatch at win={win_idx}: got maskrgb={warped_masked_rgb_next.shape[0]} mask={warped_mask_next.shape[0]} expected={stride}"
+                )
+
+    final_tchw = torch.cat(stitched_chunks, dim=0)
+    return final_tchw.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+
+
 def _initialize_kv_cache(*,
                          model,
                          batch_size: int,
@@ -2119,6 +2897,46 @@ def main() -> None:
     parser.add_argument("--raw_prompt", type=str, default="")
     parser.add_argument("--raw_fps", type=int, default=16)
     parser.add_argument(
+        "--T",
+        type=int,
+        default=0,
+        help=(
+            "Long causal warp iterations. "
+            "When >0 in raw+causal mode, inference runs in repeated 45-frame (default) windows: "
+            "generate current window, decode tail overlap, warp next stride, repeat T times."
+        ),
+    )
+    parser.add_argument(
+        "--causal_window_frames",
+        type=int,
+        default=45,
+        help="Window frame count used by long causal warp mode.",
+    )
+    parser.add_argument(
+        "--causal_overlap_frames",
+        type=int,
+        default=4,
+        help="Tail overlap frame count used by long causal warp mode.",
+    )
+    parser.add_argument(
+        "--cam_k",
+        type=str,
+        default="",
+        help=(
+            "Path to camera intrinsics (.txt/.npy) for long causal warp mode. "
+            "If empty, defaults to <sample_root>/camera/camera_K.txt."
+        ),
+    )
+    parser.add_argument(
+        "--cam_rt_dir",
+        type=str,
+        default="",
+        help=(
+            "Directory containing per-frame camera RT files for long causal warp mode. "
+            "If empty, defaults to <sample_root>/camera."
+        ),
+    )
+    parser.add_argument(
         "--conditioning_image_path",
         type=str,
         default="",
@@ -2411,6 +3229,19 @@ def main() -> None:
             raise ValueError(
                 "For --input_mode raw, provide --raw_sample_root or --data_path"
             )
+    if int(args.T) < 0:
+        raise ValueError("--T must be >= 0")
+    if int(args.T) > 0:
+        if str(args.input_mode) != "raw" or str(args.attention_mode) != "causal":
+            raise ValueError("--T > 0 is only supported in raw + causal mode")
+        if int(args.causal_window_frames) <= 1:
+            raise ValueError("--causal_window_frames must be > 1")
+        if int(args.causal_overlap_frames) <= 0:
+            raise ValueError("--causal_overlap_frames must be > 0")
+        if int(args.causal_overlap_frames) >= int(args.causal_window_frames):
+            raise ValueError(
+                "--causal_overlap_frames must be smaller than --causal_window_frames"
+            )
 
     trace_jsonl_path = str(args.trace_rollout_jsonl).strip()
     if trace_jsonl_path and bool(args.trace_rollout_overwrite):
@@ -2652,9 +3483,73 @@ def main() -> None:
                                               "diffusers", fastvideo_args)
 
     decoding = DecodingStage(vae=vae)
+    use_long_causal_warp = bool(str(args.input_mode) == "raw"
+                                and str(args.attention_mode) == "causal"
+                                and int(args.T) > 0)
 
     for i in range(args.num_samples):
         sample_idx = args.index + i
+        if use_long_causal_warp:
+            if sample_idx < 0 or sample_idx >= len(raw_sample_roots):
+                raise IndexError(
+                    f"--index {sample_idx} out of range for raw samples (n={len(raw_sample_roots)})"
+                )
+            if tokenizer is None or text_encoder is None:
+                raise RuntimeError(
+                    "raw long causal mode requires tokenizer/text_encoder, but they are not loaded."
+                )
+            sample_root = raw_sample_roots[sample_idx]
+            sequence = _load_raw_long_sequence(
+                sample_root=sample_root,
+                sample_index=sample_idx,
+                args=args,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                transformer=transformer,
+                inference_device=inference_device,
+                dtype=dtype,
+            )
+            logger.info(
+                "sample=%s idx=%s caption=%s (long causal warp: T=%s window=%s overlap=%s)",
+                sequence.sample_id,
+                sample_idx,
+                sequence.prompt,
+                int(args.T),
+                int(args.causal_window_frames),
+                int(args.causal_overlap_frames),
+            )
+
+            decoded = _run_causal_long_warp_rollout(
+                sequence=sequence,
+                args=args,
+                transformer=transformer,
+                controlnet=controlnet,
+                scheduler=scheduler,
+                vae=vae,
+                decoding=decoding,
+                fastvideo_args=fastvideo_args,
+                negative_prompt_embeds_global=negative_prompt_embeds_global,
+                sample_seed=int(args.seed + i * max(1, int(args.T) + 1)),
+                dtype=dtype,
+                dmd_steps_list=dmd_steps_list,
+                timestep_indices_list=timestep_indices_list,
+                inference_device=inference_device,
+            )
+            fps = int(args.fps)
+            logger.info(
+                "decoded_video: shape=%s fps=%s seconds=%.2f",
+                tuple(decoded.shape),
+                fps,
+                float(decoded.shape[2]) / float(max(1, fps)),
+            )
+            out_path = str(Path(args.out_dir) / f"{sequence.sample_id}.mp4")
+            _save_mp4(decoded, out_path, fps=fps)
+            if bool(args.save_frames):
+                frames_dir = str(Path(args.out_dir) / "frames" / sequence.sample_id)
+                _save_frames_png(decoded, frames_dir, prefix=sequence.sample_id)
+            logger.info("saved: %s", out_path)
+            continue
+
         if str(args.input_mode) == "raw":
             if sample_idx < 0 or sample_idx >= len(raw_sample_roots):
                 raise IndexError(

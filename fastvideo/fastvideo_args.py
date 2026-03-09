@@ -858,6 +858,10 @@ class TrainingArgs(FastVideoArgs):
     # before feeding generator/teacher/critic ControlNet paths.
     # Default False to align with existing phase-1 ODE/controlnet parquet space.
     normalize_condition_latents: bool = False
+    # When `normalize_condition_latents` is False, automatically infer condition
+    # latent space from first_frame statistics and enable normalization only when
+    # samples look like raw VAE latents (non-zero mean / non-unit std).
+    auto_condition_latent_space: bool = True
     fake_score_learning_rate: float = 0.0  # separate learning rate for fake_score_transformer, if 0.0, use learning_rate
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
     fake_score_betas: str = "0.9,0.999"  # betas for fake score optimizer, format: "beta1,beta2"
