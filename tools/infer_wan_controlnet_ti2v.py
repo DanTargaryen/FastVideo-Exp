@@ -1343,19 +1343,37 @@ class _PointCloudWarper:
         R = Rt[:3, :3]
         T = Rt[:3, 3]
         cam_points = (points_world @ R.T) + T[None, :]
+        finite_cam = np.isfinite(cam_points).all(axis=1)
+        if not np.any(finite_cam):
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.uint8))
+        cam_points = cam_points[finite_cam]
+        colors = colors[finite_cam]
 
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
         zs = -cam_points[:, 2]
-        valid = zs > 0.05
+        valid = np.isfinite(zs) & (zs > 0.05)
         if not np.any(valid):
             return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
                     np.zeros((out_h, out_w), dtype=np.uint8))
 
-        zs_safe = np.where(valid, zs, 1e-6)
-        u_proj = (fx * (cam_points[:, 0] / zs_safe) + cx).astype(np.int32)
-        v_proj = (fy * (-cam_points[:, 1] / zs_safe) + cy).astype(np.int32)
-        in_bounds = valid & (u_proj >= 0) & (u_proj < out_w) & (v_proj >= 0) & (
-            v_proj < out_h)
+        x_norm = cam_points[:, 0] / zs
+        y_norm = -cam_points[:, 1] / zs
+        proj_finite = np.isfinite(x_norm) & np.isfinite(y_norm)
+        valid = valid & proj_finite
+        if not np.any(valid):
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.uint8))
+
+        x_v = x_norm[valid]
+        y_v = y_norm[valid]
+        zs_v = zs[valid]
+        colors_v = colors[valid]
+
+        u_proj = np.rint(fx * x_v + cx).astype(np.int32)
+        v_proj = np.rint(fy * y_v + cy).astype(np.int32)
+        in_bounds = (u_proj >= 0) & (u_proj < out_w) & (v_proj >= 0) & (v_proj <
+                                                                         out_h)
         if not np.any(in_bounds):
             return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
                     np.zeros((out_h, out_w), dtype=np.uint8))
@@ -1363,12 +1381,15 @@ class _PointCloudWarper:
         u_v = u_proj[in_bounds]
         v_v = v_proj[in_bounds]
         zs_v = zs[in_bounds]
-        colors_v = colors[in_bounds]
+        colors_v = colors_v[in_bounds]
 
         if target_depth is not None:
             ref_depths = target_depth[v_v, u_v]
-            margin = ref_depths * 0.05
-            not_occluded = (ref_depths == 0) | (zs_v <= ref_depths + margin)
+            ref_finite = np.isfinite(ref_depths)
+            ref_depths_safe = np.where(ref_finite, ref_depths, 0.0)
+            margin = ref_depths_safe * 0.05
+            not_occluded = (~ref_finite) | (ref_depths_safe == 0) | (
+                zs_v <= ref_depths_safe + margin)
             u_v = u_v[not_occluded]
             v_v = v_v[not_occluded]
             zs_v = zs_v[not_occluded]
