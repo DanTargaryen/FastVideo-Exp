@@ -1586,14 +1586,13 @@ def _load_raw_long_sequence(
     if not mask_dir.is_dir():
         raise FileNotFoundError(f"raw mask dir not found: {mask_dir}")
 
-    rgb_all = _sorted_files(rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
-    depth_all = _sorted_files(depth_dir,
-                              (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
-    mask_all = _sorted_files(mask_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+    # T>0 long causal branch: restrict file discovery to PNG only.
+    rgb_all = _sorted_files(rgb_dir, (".png",))
+    depth_all = _sorted_files(depth_dir, (".png",))
+    mask_all = _sorted_files(mask_dir, (".png",))
     normal_all: list[Path] | None = None
     if normal_dir.is_dir():
-        nfiles = _sorted_files(normal_dir,
-                               (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr"))
+        nfiles = _sorted_files(normal_dir, (".png",))
         if len(nfiles) > 0:
             normal_all = nfiles
     if bool(args.raw_require_normal) and normal_all is None:
@@ -1602,8 +1601,7 @@ def _load_raw_long_sequence(
         )
     masked_rgb_all: list[Path] | None = None
     if masked_rgb_dir.is_dir():
-        mfiles = _sorted_files(masked_rgb_dir,
-                               (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+        mfiles = _sorted_files(masked_rgb_dir, (".png",))
         if len(mfiles) > 0:
             masked_rgb_all = mfiles
 
