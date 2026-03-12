@@ -2783,9 +2783,15 @@ def _causal_dmd_rollout_ti2v_controlnet(
     mode = str(first_frame_condition_mode).lower()
     if mode not in ("hard_replace", "noise_init", "md_align"):
         mode = "hard_replace"
-    # md_align is only implemented in long-causal branch; keep legacy behavior here.
-    use_hard_replace = (mode != "noise_init")
-    use_noise_init = (mode == "noise_init")
+    # For short causal rollout, keep stable legacy behavior.
+    # noise_init/md_align are only supported robustly in long-causal branch.
+    if mode in ("noise_init", "md_align"):
+        logger.warning(
+            "short causal mode: first_frame_condition_mode=%s is unstable; fallback to hard_replace.",
+            mode,
+        )
+    use_hard_replace = True
+    use_noise_init = False
     anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
     if use_noise_init and first_frame_latent_bcfhw is not None:
         first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
