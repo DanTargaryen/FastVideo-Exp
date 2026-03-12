@@ -109,6 +109,70 @@ def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
     raise ValueError(f"{name}: unsupported shape {tuple(x.shape)}")
 
 
+def _infer_valid_k_from_channels(total_c: int, z_dim: int) -> list[int]:
+    cand: list[int] = []
+    # Primary check: (k * z_dim) divisibility.
+    if int(z_dim) > 0:
+        for k in (3, 4):
+            if int(total_c) % (k * int(z_dim)) == 0:
+                cand.append(k)
+    # Fallback for mismatched z_dim metadata.
+    if not cand:
+        for k in (3, 4):
+            if int(total_c) % k == 0:
+                cand.append(k)
+    return cand
+
+
+def _looks_like_control_channel_count(total_c: int, z_dim: int) -> bool:
+    return len(_infer_valid_k_from_channels(int(total_c), int(z_dim))) > 0
+
+
+def _ensure_control_latent_bcfhw(
+    x: torch.Tensor,
+    *,
+    z_dim: int,
+    name: str,
+) -> torch.Tensor:
+    """
+    Ensure control latent is [B, C_total, F, H, W].
+
+    Supports both channel-first and frame-first layouts:
+      - 4D: [C,F,H,W] or [F,C,H,W]
+      - 5D: [B,C,F,H,W] or [B,F,C,H,W]
+    """
+    if x.ndim == 4:
+        c0, f0 = int(x.shape[0]), int(x.shape[1])
+        c0_ok = _looks_like_control_channel_count(c0, int(z_dim))
+        f0_ok = _looks_like_control_channel_count(f0, int(z_dim))
+        if c0_ok and not f0_ok:
+            return x.unsqueeze(0)
+        if f0_ok and not c0_ok:
+            return x.permute(1, 0, 2, 3).contiguous().unsqueeze(0)
+        # Ambiguous fallback: control channels are usually >= latent frames.
+        if c0 >= f0:
+            return x.unsqueeze(0)
+        return x.permute(1, 0, 2, 3).contiguous().unsqueeze(0)
+
+    if x.ndim == 5:
+        c1, f1 = int(x.shape[1]), int(x.shape[2])
+        c1_ok = _looks_like_control_channel_count(c1, int(z_dim))
+        f1_ok = _looks_like_control_channel_count(f1, int(z_dim))
+        if c1_ok and not f1_ok:
+            return x
+        if f1_ok and not c1_ok:
+            return x.permute(0, 2, 1, 3, 4).contiguous()
+        if c1 >= f1:
+            return x
+        return x.permute(0, 2, 1, 3, 4).contiguous()
+
+    if x.ndim == 3:
+        # Rare case: [C,H,W] -> [1,C,1,H,W]
+        return x.unsqueeze(0).unsqueeze(2)
+
+    raise ValueError(f"{name}: unsupported shape {tuple(x.shape)}")
+
+
 def _infer_split_k(total_c: int, z_dim: int, *, prefer_three: bool) -> int:
     # Choose 3 or 4 based on z_dim and total channels.
     cand = []
@@ -184,11 +248,15 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    cols = ["id", "control_latent_bytes", "control_latent_shape",
-            "control_latent_dtype"]
+    cols = [
+        "id",
+        "num_frames",
+        "control_latent_bytes",
+        "control_latent_shape",
+        "control_latent_dtype",
+    ]
     row = _read_row_by_global_index(args.data_path, int(args.index), cols)
-    control_latent = _ensure_bcfhw(_decode_tensor(row, "control_latent"),
-                                   name="control_latent").float()
+    raw_control_latent = _decode_tensor(row, "control_latent")
 
     # Load VAE
     model_path = args.base_model
@@ -220,9 +288,19 @@ def main() -> None:
         z_dim = getattr(getattr(vae, "config", None), "z_dim", None)
     if z_dim is None:
         z_dim = 16
+    control_latent = _ensure_control_latent_bcfhw(
+        raw_control_latent,
+        z_dim=int(z_dim),
+        name="control_latent",
+    ).float()
+
     total_c = int(control_latent.shape[1])
     k = _infer_split_k(total_c, int(z_dim), prefer_three=not bool(args.prefer_four))
     c = total_c // k
+    print(
+        f"[decode] id={row.get('id', '')} raw_shape={tuple(raw_control_latent.shape)} "
+        f"-> control_bcfhw={tuple(control_latent.shape)} z_dim={int(z_dim)} split_k={k} chunk_c={c}"
+    )
     depth_lat = control_latent[:, :c]
     if k == 4:
         normal_lat = control_latent[:, c:2 * c]
