@@ -258,10 +258,24 @@ def _load_depth_sequence(
     pmax: float,
     invert_depth: bool,
 ) -> torch.Tensor:
+    # NOTE:
+    # This function intentionally matches FastVideo/run_wan_contorlnet_union.md
+    # process_depth logic for strict alignment:
+    # 1) per-frame near/far invalid filtering
+    # 2) global min/max normalization across the whole clip
+    # 3) invalid -> far(1.0)
+    # 4) map [0,1] -> [-1,1]
+    #
+    # `pmin/pmax` are kept in the signature for CLI compatibility but are not
+    # used in this strict md-aligned path.
+    _ = (pmin, pmax)
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
     for p in depth_paths:
         d = _read_depth_any(p)
+        if np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
+            d = d / 65535.0
+
         h0, w0 = d.shape
         current_ratio = float(w0) / float(h0)
         if current_ratio > target_ratio:
@@ -274,14 +288,9 @@ def _load_depth_sequence(
             d = d[top:top + new_h, :]
         d = np.array(Image.fromarray(d).resize((int(width), int(height)), resample=Image.NEAREST)).astype(np.float32)
 
-        # Heuristic: if depth looks like centimeters or millimeters, scale down.
-        mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
-        if mx > 1000.0:
-            d = d / 1000.0
-        elif mx > 100.0:
-            d = d / 100.0
-
-        valid = np.isfinite(d) & (d > 1e-6)
+        near_mask = d < 0.0015
+        far_mask = d > (65500.0 / 65535.0)
+        valid = np.isfinite(d) & (~near_mask) & (~far_mask)
         d[~valid] = np.nan
         depths.append(d)
 
@@ -290,21 +299,20 @@ def _load_depth_sequence(
     if valid_vals.size == 0:
         lo, hi = 0.0, 1.0
     else:
-        lo = float(np.percentile(valid_vals, pmin))
-        hi = float(np.percentile(valid_vals, pmax))
+        lo = float(np.nanmin(valid_vals))
+        hi = float(np.nanmax(valid_vals))
         if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
-            lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
-            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
-                lo, hi = 0.0, 1.0
+            lo, hi = 0.0, 1.0
 
     out = []
-    denom = max(hi - lo, 1e-6)
+    denom = max(hi - lo, 1e-8)
     for d in depths:
         dn = (d - lo) / denom
         dn = np.clip(dn, 0.0, 1.0)
         if invert_depth:
             dn = 1.0 - dn
-        dn = np.nan_to_num(dn, nan=-1.0)
+        dn = np.nan_to_num(dn, nan=1.0, posinf=1.0, neginf=1.0)
+        dn = dn * 2.0 - 1.0
         t = torch.from_numpy(dn).float().unsqueeze(0).repeat(3, 1, 1)
         out.append(t)
     return torch.stack(out, dim=0)
@@ -587,15 +595,25 @@ def parse_args() -> argparse.Namespace:
                    action="store_true",
                    help="Invert mask after loading/binarization (1->0, 0->1).")
     p.add_argument("--depth_dir", type=str, default="", help="Optional direct depth directory aligned to rgb (png/exr).")
-    p.add_argument("--depth_percentile_min", type=float, default=5.0)
-    p.add_argument("--depth_percentile_max", type=float, default=95.0)
+    p.add_argument(
+        "--depth_percentile_min",
+        type=float,
+        default=5.0,
+        help="Compatibility arg (unused in strict md depth logic).",
+    )
+    p.add_argument(
+        "--depth_percentile_max",
+        type=float,
+        default=95.0,
+        help="Compatibility arg (unused in strict md depth logic).",
+    )
     depth_inv_group = p.add_mutually_exclusive_group()
     depth_inv_group.add_argument(
         "--depth_invert",
         dest="depth_invert",
         action="store_true",
-        default=True,
-        help="Use 1-depth mapping after normalization (near->1, far->0).",
+        default=False,
+        help="Optional 1-depth mapping after normalization (near->1, far->0). Disabled by default.",
     )
     depth_inv_group.add_argument(
         "--no_depth_invert",

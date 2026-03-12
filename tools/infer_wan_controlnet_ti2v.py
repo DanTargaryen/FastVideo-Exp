@@ -1701,6 +1701,7 @@ def _causal_dmd_rollout_one_window_with_cache(
     first_frame_timestep_zero: bool,
     expand_timesteps: bool,
     disable_cache_update: bool,
+    first_frame_anchor_latent_frames: int,
     seed: int,
     dtype: torch.dtype,
     global_start_latent: int,
@@ -1762,6 +1763,7 @@ def _causal_dmd_rollout_one_window_with_cache(
     start_index = 0
     for _block_idx in range(num_blocks):
         current_num_frames = num_frames_per_block
+        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(current_num_frames)))
         current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
@@ -1781,12 +1783,14 @@ def _causal_dmd_rollout_one_window_with_cache(
                     device=device,
                     dtype=dtype,
                 )
-                first_frame_mask[:, :, 0] = 0
+                first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
             elif first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
-                latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+                    -1, -1, anchor_t, -1, -1)
+                latent_model_input[:, :, :anchor_t] = anchor_lat
             latent_model_input = latent_model_input.to(dtype=dtype)
 
             timestep = torch.ones((1, current_num_frames),
@@ -1795,7 +1799,7 @@ def _causal_dmd_rollout_one_window_with_cache(
             if (first_frame_timestep_zero or
                     (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
                 timestep = timestep.clone()
-                timestep[:, 0] = 0
+                timestep[:, :anchor_t] = 0
 
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
@@ -1883,7 +1887,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                                       dtype=torch.float32) * t_cur
                 if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
                     timestep = timestep.clone()
-                    timestep[:, 0] = 0
+                    timestep[:, :anchor_t] = 0
 
                 denoised_pred = pred_noise_to_pred_video(
                     pred_noise=pred_flow_btchw.flatten(0, 1),
@@ -1956,13 +1960,14 @@ def _causal_dmd_rollout_one_window_with_cache(
                     device=device,
                     dtype=dtype,
                 )
-                first_frame_mask[:, :, 0] = 0
+                first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
             elif first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
-                context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                                      dtype=dtype)
+                anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+                    -1, -1, anchor_t, -1, -1)
+                context_bcfhw[:, :, :anchor_t] = anchor_lat
             context_bcfhw = context_bcfhw.to(dtype=dtype)
 
             with torch.autocast(device_type="cuda", dtype=dtype,
@@ -2024,18 +2029,21 @@ def _causal_dmd_rollout_one_window_with_cache(
         start_index += current_num_frames
 
     if expand_timesteps and first_frame_latent_bcfhw is not None:
+        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
         first_frame_mask = torch.ones(
             (1, 1, latent_t, latent_h, latent_w),
             device=device,
             dtype=dtype,
         )
-        first_frame_mask[:, :, 0] = 0
+        first_frame_mask[:, :, :anchor_t] = 0
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
     elif first_frame_latent_bcfhw is not None:
+        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
         latents = latents.clone()
-        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                        dtype=dtype)
+        anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+            -1, -1, anchor_t, -1, -1)
+        latents[:, :, :anchor_t] = anchor_lat
     return latents
 
 
@@ -2331,6 +2339,7 @@ def _run_causal_long_warp_rollout(
             expand_timesteps=bool(
                 getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
             disable_cache_update=bool(args.disable_cache_update),
+            first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
             seed=int(sample_seed + win_idx),
             dtype=dtype,
             global_start_latent=int(global_start_latent),
@@ -2357,6 +2366,13 @@ def _run_causal_long_warp_rollout(
         if win_idx == 0:
             decoded_window_tchw = decoded_window_tchw.clone()
             decoded_window_tchw[0] = global_first_rgb
+            blend_frames = int(max(0, int(args.first_frame_blend_frames)))
+            if blend_frames > 0:
+                n_blend = min(blend_frames, int(window_frames) - 1)
+                for k in range(1, n_blend + 1):
+                    alpha = 1.0 - float(k) / float(n_blend + 1)
+                    decoded_window_tchw[k] = alpha * global_first_rgb + (
+                        1.0 - alpha) * decoded_window_tchw[k]
             write_frames = decoded_window_tchw
         else:
             write_frames = decoded_window_tchw[overlap_frames:]
@@ -3620,6 +3636,24 @@ def main() -> None:
         help=(
             "Force the first latent frame's timestep to 0 (Diff-Factory expand_timesteps behavior). "
             "Default OFF to match FastVideo self-forcing training."
+        ),
+    )
+    parser.add_argument(
+        "--first_frame_anchor_latent_frames",
+        type=int,
+        default=1,
+        help=(
+            "How many leading latent frames to anchor to the conditioning first-frame latent "
+            "in long causal rollout. 1 means only the first latent frame."
+        ),
+    )
+    parser.add_argument(
+        "--first_frame_blend_frames",
+        type=int,
+        default=0,
+        help=(
+            "For long causal rollout output only: blend the first N decoded frames toward the "
+            "conditioning first RGB frame to reduce frame0->frame1 jump. 0 disables blending."
         ),
     )
     parser.add_argument(
