@@ -1680,6 +1680,366 @@ def _load_raw_long_sequence(
 
 
 @torch.no_grad()
+def _causal_dmd_rollout_one_window_with_cache(
+    *,
+    transformer,
+    controlnet,
+    scheduler: FlowMatchEulerDiscreteScheduler | FlowUniPCMultistepScheduler,
+    prompt_embeds_list: list[torch.Tensor],
+    negative_prompt_embeds_list: list[torch.Tensor] | None,
+    guidance_scale: float,
+    first_frame_latent_bcfhw: torch.Tensor | None,
+    control_latent_bcfhw: torch.Tensor,
+    num_frames: int,
+    schedule_num_inference_steps: int,
+    dmd_steps: list[int] | None,
+    timestep_indices: list[int] | None,
+    context_noise: int,
+    warp_denoising_step: bool,
+    update_rule: str,
+    full_schedule: bool,
+    first_frame_timestep_zero: bool,
+    expand_timesteps: bool,
+    disable_cache_update: bool,
+    seed: int,
+    dtype: torch.dtype,
+    global_start_latent: int,
+    frame_seq_length: int,
+    batch: ForwardBatch,
+    kv_cache: list[dict],
+    crossattn_cache: list[dict],
+    kv_cache_uncond: list[dict] | None,
+    crossattn_cache_uncond: list[dict] | None,
+    control_kv_cache: list[dict],
+    control_crossattn_cache: list[dict],
+    control_kv_cache_uncond: list[dict] | None,
+    control_crossattn_cache_uncond: list[dict] | None,
+) -> torch.Tensor:
+    device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+    latent_t = int(control_latent_bcfhw.shape[2])
+    latent_h = int(control_latent_bcfhw.shape[3])
+    latent_w = int(control_latent_bcfhw.shape[4])
+    if first_frame_latent_bcfhw is not None:
+        if (first_frame_latent_bcfhw.shape[3] != latent_h
+                or first_frame_latent_bcfhw.shape[4] != latent_w):
+            raise ValueError(
+                "first_frame_latent and control_latent spatial sizes mismatch: "
+                f"first_frame={tuple(first_frame_latent_bcfhw.shape)} control={tuple(control_latent_bcfhw.shape)}"
+            )
+
+    is_unipc = isinstance(scheduler, FlowUniPCMultistepScheduler)
+    use_step_schedule = is_unipc or bool(full_schedule)
+    if use_step_schedule:
+        scheduler.set_timesteps(int(schedule_num_inference_steps), device=device)
+        t_list_full = scheduler.timesteps.to(device=device)
+    else:
+        t_list_full = _build_rollout_timesteps(
+            scheduler=scheduler,
+            schedule_num_inference_steps=schedule_num_inference_steps,
+            dmd_steps=dmd_steps,
+            timestep_indices=timestep_indices,
+            warp_denoising_step=warp_denoising_step,
+            full_schedule=False,
+            device=device,
+        )
+
+    latents = torch.randn(
+        (1, transformer.num_channels_latents, latent_t, latent_h, latent_w),
+        device=device,
+        dtype=dtype,
+    )
+
+    num_frames_per_block = transformer.config.arch_config.num_frames_per_block
+    if latents.shape[2] % num_frames_per_block != 0:
+        raise ValueError(
+            f"latent_t={latents.shape[2]} must be divisible by num_frames_per_block={num_frames_per_block}"
+        )
+
+    num_blocks = latents.shape[2] // num_frames_per_block
+    start_index = 0
+    for _block_idx in range(num_blocks):
+        current_num_frames = num_frames_per_block
+        current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
+        control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
+                                             current_num_frames].to(device=device,
+                                                                    dtype=dtype)
+        num_channels_latents = getattr(transformer, "num_channels_latents",
+                                       control_chunk.shape[1] // 3)
+
+        current_start_abs = (global_start_latent + start_index) * frame_seq_length
+        start_frame_abs = global_start_latent + start_index
+
+        def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
+            t_scalar = t_scalar.to(dtype=torch.float32)
+            latent_model_input = current_latents
+            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+                first_frame_mask = torch.ones(
+                    (1, 1, current_num_frames, latent_h, latent_w),
+                    device=device,
+                    dtype=dtype,
+                )
+                first_frame_mask[:, :, 0] = 0
+                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
+            elif first_frame_latent_bcfhw is not None and start_index == 0:
+                latent_model_input = latent_model_input.clone()
+                latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+            latent_model_input = latent_model_input.to(dtype=dtype)
+
+            timestep = torch.ones((1, current_num_frames),
+                                  device=device,
+                                  dtype=torch.float32) * t_scalar
+            if (first_frame_timestep_zero or
+                    (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
+                timestep = timestep.clone()
+                timestep[:, 0] = 0
+
+            with torch.autocast(device_type="cuda",
+                                dtype=dtype,
+                                enabled=(dtype != torch.float32)):
+                with set_forward_context(current_timestep=int(step_index),
+                                         attn_metadata=None,
+                                         forward_batch=batch):
+                    control_res_cond = controlnet(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds_list,
+                        timestep=timestep,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
+                        kv_cache=control_kv_cache,
+                        crossattn_cache=control_crossattn_cache,
+                        current_start=current_start_abs,
+                        start_frame=start_frame_abs,
+                    )
+                    pred_flow_cond_btchw = transformer(
+                        latent_model_input,
+                        prompt_embeds_list,
+                        timestep,
+                        block_controlnet_hidden_states=control_res_cond,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start_abs,
+                        start_frame=start_frame_abs,
+                    ).permute(0, 2, 1, 3, 4)
+
+                if guidance_scale != 1.0:
+                    if (negative_prompt_embeds_list is None or
+                            kv_cache_uncond is None or crossattn_cache_uncond is None
+                            or control_kv_cache_uncond is None
+                            or control_crossattn_cache_uncond is None):
+                        raise ValueError(
+                            "guidance_scale != 1.0 requires unconditional embeddings and caches."
+                        )
+                    with set_forward_context(current_timestep=int(step_index),
+                                             attn_metadata=None,
+                                             forward_batch=batch):
+                        control_res_uncond = controlnet(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=negative_prompt_embeds_list,
+                            timestep=timestep,
+                            **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                       num_channels_latents),
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=current_start_abs,
+                            start_frame=start_frame_abs,
+                        )
+                        pred_flow_uncond_btchw = transformer(
+                            latent_model_input,
+                            negative_prompt_embeds_list,
+                            timestep,
+                            block_controlnet_hidden_states=control_res_uncond,
+                            kv_cache=kv_cache_uncond,
+                            crossattn_cache=crossattn_cache_uncond,
+                            current_start=current_start_abs,
+                            start_frame=start_frame_abs,
+                        ).permute(0, 2, 1, 3, 4)
+                    return pred_flow_uncond_btchw + float(guidance_scale) * (pred_flow_cond_btchw - pred_flow_uncond_btchw)
+
+            return pred_flow_cond_btchw
+
+        if use_step_schedule:
+            scheduler.set_timesteps(int(schedule_num_inference_steps), device=device)
+            t_list_full = scheduler.timesteps.to(device=device)
+            for step_i, t_cur in enumerate(t_list_full):
+                t_cur_f = t_cur.to(dtype=torch.float32)
+                pred_flow_btchw = _predict_flow_at_t(t_cur_f, step_index=step_i)
+                pred_flow_bcfhw = pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+                current_latents = scheduler.step(
+                    pred_flow_bcfhw,
+                    t_cur,
+                    current_latents,
+                ).prev_sample
+        elif update_rule == "renoise_x0":
+            for step_i, t_cur in enumerate(t_list_full):
+                noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+                pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+
+                timestep = torch.ones((1, current_num_frames),
+                                      device=device,
+                                      dtype=torch.float32) * t_cur
+                if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
+                    timestep = timestep.clone()
+                    timestep[:, 0] = 0
+
+                denoised_pred = pred_noise_to_pred_video(
+                    pred_noise=pred_flow_btchw.flatten(0, 1),
+                    noise_input_latent=noisy_input_bfchw.flatten(0, 1),
+                    timestep=timestep,
+                    scheduler=scheduler,
+                ).unflatten(0, pred_flow_btchw.shape[:2])
+
+                if step_i < len(t_list_full) - 1:
+                    next_timestep = t_list_full[step_i + 1]
+                    noise = torch.randn_like(denoised_pred.flatten(0, 1))
+                    noisy_input_bfchw = scheduler.add_noise(
+                        denoised_pred.flatten(0, 1),
+                        noise,
+                        next_timestep * torch.ones(
+                            (1 * current_num_frames),
+                            device=device,
+                            dtype=torch.long,
+                        ),
+                    ).unflatten(0, denoised_pred.shape[:2])
+                    current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
+                else:
+                    current_latents = denoised_pred.permute(0, 2, 1, 3, 4).contiguous()
+        elif update_rule == "euler_dt":
+            if t_list_full.numel() < 2:
+                raise ValueError("euler_dt requires at least 2 timesteps (need a next timestep).")
+            timesteps_1d = scheduler.timesteps.to(device=device, dtype=torch.float32)
+            sigmas_1d = scheduler.sigmas.to(device=device, dtype=torch.float32)
+            for step_i in range(int(t_list_full.numel()) - 1):
+                t_cur = t_list_full[step_i]
+                t_next = t_list_full[step_i + 1]
+                pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
+
+                idx_cur = torch.argmin((timesteps_1d - t_cur.float()).abs())
+                idx_next = torch.argmin((timesteps_1d - t_next.float()).abs())
+                sigma_cur = sigmas_1d[idx_cur]
+                sigma_next = sigmas_1d[idx_next]
+                dt = (sigma_next - sigma_cur).to(dtype=pred_flow_btchw.dtype)
+                current_latents = current_latents + dt * pred_flow_btchw.permute(0, 2, 1, 3, 4).contiguous()
+        else:
+            raise ValueError(f"Unsupported update_rule: {update_rule!r}")
+
+        latents[:, :, start_index:start_index + current_num_frames] = current_latents
+
+        if not disable_cache_update:
+            context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
+            context_timestep = torch.ones((1, current_num_frames),
+                                          device=device,
+                                          dtype=torch.float32) * float(context_noise)
+            if float(context_noise) <= 0.0:
+                context_timestep = context_timestep.zero_()
+            else:
+                if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
+                    schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
+                    t_flat = context_timestep.flatten()
+                    diff = (t_flat[:, None] - schedule_ts[None, :]).abs()
+                    nearest_idx = diff.argmin(dim=1)
+                    context_timestep = schedule_ts.index_select(0, nearest_idx).view_as(context_timestep)
+                ctx_noise = torch.randn_like(context_btchw.flatten(0, 1))
+                context_btchw = scheduler.add_noise(
+                    context_btchw.flatten(0, 1),
+                    ctx_noise,
+                    context_timestep.flatten(),
+                ).unflatten(0, context_btchw.shape[:2])
+
+            context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
+            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+                first_frame_mask = torch.ones(
+                    (1, 1, current_num_frames, latent_h, latent_w),
+                    device=device,
+                    dtype=dtype,
+                )
+                first_frame_mask[:, :, 0] = 0
+                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
+            elif first_frame_latent_bcfhw is not None and start_index == 0:
+                context_bcfhw = context_bcfhw.clone()
+                context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                                      dtype=dtype)
+            context_bcfhw = context_bcfhw.to(dtype=dtype)
+
+            with torch.autocast(device_type="cuda", dtype=dtype,
+                                enabled=(dtype != torch.float32)), \
+                    set_forward_context(current_timestep=0,
+                                        attn_metadata=None,
+                                        forward_batch=batch):
+                control_res_ctx = controlnet(
+                    hidden_states=context_bcfhw,
+                    encoder_hidden_states=prompt_embeds_list,
+                    timestep=context_timestep,
+                    **_build_controlnet_kwargs(controlnet, control_chunk,
+                                               num_channels_latents),
+                    kv_cache=control_kv_cache,
+                    crossattn_cache=control_crossattn_cache,
+                    current_start=current_start_abs,
+                    start_frame=start_frame_abs,
+                )
+                _ = transformer(
+                    context_bcfhw,
+                    prompt_embeds_list,
+                    context_timestep,
+                    block_controlnet_hidden_states=control_res_ctx,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start_abs,
+                    start_frame=start_frame_abs,
+                )
+                if guidance_scale != 1.0:
+                    if (negative_prompt_embeds_list is None or
+                            kv_cache_uncond is None or crossattn_cache_uncond is None
+                            or control_kv_cache_uncond is None
+                            or control_crossattn_cache_uncond is None):
+                        raise ValueError(
+                            "guidance_scale != 1.0 requires unconditional embeddings and caches."
+                        )
+                    control_res_ctx_uncond = controlnet(
+                        hidden_states=context_bcfhw,
+                        encoder_hidden_states=negative_prompt_embeds_list,
+                        timestep=context_timestep,
+                        **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                   num_channels_latents),
+                        kv_cache=control_kv_cache_uncond,
+                        crossattn_cache=control_crossattn_cache_uncond,
+                        current_start=current_start_abs,
+                        start_frame=start_frame_abs,
+                    )
+                    _ = transformer(
+                        context_bcfhw,
+                        negative_prompt_embeds_list,
+                        context_timestep,
+                        block_controlnet_hidden_states=control_res_ctx_uncond,
+                        kv_cache=kv_cache_uncond,
+                        crossattn_cache=crossattn_cache_uncond,
+                        current_start=current_start_abs,
+                        start_frame=start_frame_abs,
+                    )
+
+        start_index += current_num_frames
+
+    if expand_timesteps and first_frame_latent_bcfhw is not None:
+        first_frame_mask = torch.ones(
+            (1, 1, latent_t, latent_h, latent_w),
+            device=device,
+            dtype=dtype,
+        )
+        first_frame_mask[:, :, 0] = 0
+        image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
+    elif first_frame_latent_bcfhw is not None:
+        latents = latents.clone()
+        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
+                                                        dtype=dtype)
+    return latents
+
+
+@torch.no_grad()
 def _run_causal_long_warp_rollout(
     *,
     sequence: RawLongSequence,
@@ -1726,17 +2086,46 @@ def _run_causal_long_warp_rollout(
     target_c = int(getattr(transformer, "num_channels_latents", 16))
     H = int(args.height)
     W = int(args.width)
+    rollout_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+    global_first_rgb = _load_rgb_frame(sequence.rgb_paths[0], H, W)
+    global_first_frame_latent = _encode_first_frame_latent(
+        vae=vae,
+        first_rgb_chw=global_first_rgb,
+        target_c=target_c,
+        inference_device=inference_device,
+        compute_dtype=dtype,
+    ).to(device="cuda", dtype=dtype)
 
     depth_path_by_id = {
         int(fid): p
         for fid, p in zip(sequence.frame_ids, sequence.depth_paths)
     }
 
-    stitched_chunks: list[torch.Tensor] = []
+    final_tchw = torch.empty((total_required, 3, H, W), dtype=torch.float32)
+    write_ptr = 0
+
     carry_keyframes_tchw: torch.Tensor | None = None
     carry_keyframe_ids: list[int] | None = None
     warped_masked_rgb_next: torch.Tensor | None = None
     warped_mask_next: torch.Tensor | None = None
+
+    # Keep one shared cache state for all long windows.
+    batch = ForwardBatch(data_type="ti2v_controlnet")
+    batch.prompt_embeds = [prompt_embeds]
+    batch.height = H
+    batch.width = W
+    batch.num_frames = window_frames
+    frame_seq_length: int | None = None
+    global_start_latent = 0
+
+    kv_cache: list[dict] | None = None
+    crossattn_cache: list[dict] | None = None
+    kv_cache_uncond: list[dict] | None = None
+    crossattn_cache_uncond: list[dict] | None = None
+    control_kv_cache: list[dict] | None = None
+    control_crossattn_cache: list[dict] | None = None
+    control_kv_cache_uncond: list[dict] | None = None
+    control_crossattn_cache_uncond: list[dict] | None = None
 
     num_windows = int(args.T) + 1
     for win_idx in range(num_windows):
@@ -1749,7 +2138,7 @@ def _run_causal_long_warp_rollout(
             )
 
         if win_idx == 0:
-            first_rgb = _load_rgb_frame(sequence.rgb_paths[0], H, W)
+            first_rgb = global_first_rgb
             mask_tchw = torch.stack(
                 [
                     _load_mask_frame(
@@ -1779,7 +2168,6 @@ def _run_causal_long_warp_rollout(
             if (carry_keyframes_tchw is None or carry_keyframe_ids is None
                     or warped_masked_rgb_next is None or warped_mask_next is None):
                 raise RuntimeError("Missing carry-over warp state for long causal rollout.")
-            first_rgb = carry_keyframes_tchw[0]
             mask_tchw = torch.cat(
                 [
                     torch.ones((overlap_frames, 1, H, W), dtype=torch.float32),
@@ -1811,13 +2199,7 @@ def _run_causal_long_warp_rollout(
                 dim=0,
             )
 
-        first_frame_latent = _encode_first_frame_latent(
-            vae=vae,
-            first_rgb_chw=first_rgb,
-            target_c=target_c,
-            inference_device=inference_device,
-            compute_dtype=dtype,
-        ).to(device="cuda", dtype=dtype)
+        first_frame_latent = global_first_frame_latent
 
         control_latent = _encode_control_latent_from_tchw(
             vae=vae,
@@ -1840,7 +2222,94 @@ def _run_causal_long_warp_rollout(
             control_latent = control_latent.clone()
             control_latent[:, base_c:] = 0
 
-        latents = _causal_dmd_rollout_ti2v_controlnet(
+        if frame_seq_length is None:
+            latent_t = int(control_latent.shape[2])
+            latent_h = int(control_latent.shape[3])
+            latent_w = int(control_latent.shape[4])
+            latent_seq_length = latent_h * latent_w
+            patch_ratio = int(transformer.config.arch_config.patch_size[-1] *
+                              transformer.config.arch_config.patch_size[-2])
+            if patch_ratio <= 0 or latent_seq_length % patch_ratio != 0:
+                raise ValueError(
+                    f"Invalid patch_ratio={patch_ratio} for latent HxW={latent_h}x{latent_w}"
+                )
+            frame_seq_length = latent_seq_length // patch_ratio
+
+            # For global-attention checkpoints (local_attn_size=-1), allocate enough cache
+            # space for all windows in this rollout.
+            total_latent_frames = latent_t * num_windows
+
+            kv_cache = _initialize_kv_cache(
+                model=transformer,
+                batch_size=1,
+                dtype=dtype,
+                device=rollout_device,
+                frame_seq_length=frame_seq_length,
+                sliding_window_num_frames_override=total_latent_frames,
+            )
+            crossattn_cache = _initialize_crossattn_cache(
+                model=transformer,
+                batch_size=1,
+                max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
+                dtype=dtype,
+                device=rollout_device,
+            )
+            control_kv_cache = _initialize_kv_cache(
+                model=controlnet,
+                batch_size=1,
+                dtype=dtype,
+                device=rollout_device,
+                frame_seq_length=frame_seq_length,
+                sliding_window_num_frames_override=total_latent_frames,
+            )
+            control_crossattn_cache = _initialize_crossattn_cache(
+                model=controlnet,
+                batch_size=1,
+                max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
+                dtype=dtype,
+                device=rollout_device,
+            )
+            if float(args.guidance_scale) != 1.0:
+                kv_cache_uncond = _initialize_kv_cache(
+                    model=transformer,
+                    batch_size=1,
+                    dtype=dtype,
+                    device=rollout_device,
+                    frame_seq_length=frame_seq_length,
+                    sliding_window_num_frames_override=total_latent_frames,
+                )
+                crossattn_cache_uncond = _initialize_crossattn_cache(
+                    model=transformer,
+                    batch_size=1,
+                    max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
+                    dtype=dtype,
+                    device=rollout_device,
+                )
+                control_kv_cache_uncond = _initialize_kv_cache(
+                    model=controlnet,
+                    batch_size=1,
+                    dtype=dtype,
+                    device=rollout_device,
+                    frame_seq_length=frame_seq_length,
+                    sliding_window_num_frames_override=total_latent_frames,
+                )
+                control_crossattn_cache_uncond = _initialize_crossattn_cache(
+                    model=controlnet,
+                    batch_size=1,
+                    max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
+                    dtype=dtype,
+                    device=rollout_device,
+                )
+            if bool(args.reset_cache_each_block):
+                logger.warning(
+                    "causal-long streaming mode ignores --reset_cache_each_block to preserve cross-window cache reuse."
+                )
+
+        if (frame_seq_length is None or kv_cache is None or crossattn_cache is None
+                or control_kv_cache is None or control_crossattn_cache is None):
+            raise RuntimeError("Failed to initialize causal-long caches.")
+
+        latents = _causal_dmd_rollout_one_window_with_cache(
             transformer=transformer,
             controlnet=controlnet,
             scheduler=scheduler,
@@ -1850,8 +2319,6 @@ def _run_causal_long_warp_rollout(
             guidance_scale=float(args.guidance_scale),
             first_frame_latent_bcfhw=first_frame_latent,
             control_latent_bcfhw=control_latent,
-            height=H,
-            width=W,
             num_frames=window_frames,
             schedule_num_inference_steps=int(args.schedule_num_inference_steps),
             dmd_steps=dmd_steps_list,
@@ -1863,11 +2330,22 @@ def _run_causal_long_warp_rollout(
             first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
             expand_timesteps=bool(
                 getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
-            reset_cache_each_block=bool(args.reset_cache_each_block),
             disable_cache_update=bool(args.disable_cache_update),
             seed=int(sample_seed + win_idx),
             dtype=dtype,
+            global_start_latent=int(global_start_latent),
+            frame_seq_length=int(frame_seq_length),
+            batch=batch,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            kv_cache_uncond=kv_cache_uncond,
+            crossattn_cache_uncond=crossattn_cache_uncond,
+            control_kv_cache=control_kv_cache,
+            control_crossattn_cache=control_crossattn_cache,
+            control_kv_cache_uncond=control_kv_cache_uncond,
+            control_crossattn_cache_uncond=control_crossattn_cache_uncond,
         )
+        global_start_latent += int(control_latent.shape[2])
 
         decoded_window = decoding.decode(latents, fastvideo_args).cpu().float()
         decoded_window_tchw = decoded_window[0].permute(1, 0, 2, 3).contiguous()
@@ -1877,9 +2355,18 @@ def _run_causal_long_warp_rollout(
             )
 
         if win_idx == 0:
-            stitched_chunks.append(decoded_window_tchw)
+            decoded_window_tchw = decoded_window_tchw.clone()
+            decoded_window_tchw[0] = global_first_rgb
+            write_frames = decoded_window_tchw
         else:
-            stitched_chunks.append(decoded_window_tchw[overlap_frames:])
+            write_frames = decoded_window_tchw[overlap_frames:]
+        write_count = int(write_frames.shape[0])
+        if write_ptr + write_count > total_required:
+            raise RuntimeError(
+                f"Final write overflow at win={win_idx}: write_ptr={write_ptr} count={write_count} total={total_required}"
+            )
+        final_tchw[write_ptr:write_ptr + write_count] = write_frames
+        write_ptr += write_count
 
         if win_idx < num_windows - 1:
             tail = decoded_window_tchw[-overlap_frames:].contiguous()
@@ -1907,7 +2394,10 @@ def _run_causal_long_warp_rollout(
                     f"Warp output frame count mismatch at win={win_idx}: got maskrgb={warped_masked_rgb_next.shape[0]} mask={warped_mask_next.shape[0]} expected={stride}"
                 )
 
-    final_tchw = torch.cat(stitched_chunks, dim=0)
+    if write_ptr != total_required:
+        raise RuntimeError(
+            f"Final frame count mismatch: wrote {write_ptr}, expected {total_required}"
+        )
     return final_tchw.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
