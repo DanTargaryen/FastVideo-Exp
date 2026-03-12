@@ -1560,6 +1560,11 @@ def _encode_control_latent_from_tchw(
     return control_lat.unsqueeze(0)
 
 
+def _latent_frames_from_video_frames(num_frames: int) -> int:
+    # Wan-style temporal compression: 1 + floor((T-1)/4)
+    return int(max(1, (int(num_frames) - 1) // 4 + 1))
+
+
 def _load_raw_long_sequence(
     *,
     sample_root: Path,
@@ -1702,6 +1707,7 @@ def _causal_dmd_rollout_one_window_with_cache(
     expand_timesteps: bool,
     disable_cache_update: bool,
     first_frame_anchor_latent_frames: int,
+    first_frame_condition_mode: str,
     seed: int,
     dtype: torch.dtype,
     global_start_latent: int,
@@ -1752,6 +1758,28 @@ def _causal_dmd_rollout_one_window_with_cache(
         device=device,
         dtype=dtype,
     )
+    anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
+    use_hard_replace = (str(first_frame_condition_mode).lower() != "noise_init")
+    if (not use_hard_replace) and first_frame_latent_bcfhw is not None:
+        # Replace the initial noisy state of the first anchor latents with q(x_t | x0, eps)
+        # so the first-frame condition participates in the initial sampling state.
+        first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+            -1, -1, anchor_t_global, -1, -1)
+        first_anchor_btchw = first_anchor.permute(0, 2, 1, 3, 4).contiguous()
+        anchor_noise_btchw = torch.randn_like(first_anchor_btchw)
+        t_init = t_list_full[0].to(device=device, dtype=torch.float32)
+        t_init_vec = torch.ones(
+            (first_anchor_btchw.shape[0] * first_anchor_btchw.shape[1], ),
+            device=device,
+            dtype=torch.float32,
+        ) * t_init
+        noisy_anchor_btchw = scheduler.add_noise(
+            first_anchor_btchw.flatten(0, 1),
+            anchor_noise_btchw.flatten(0, 1),
+            t_init_vec,
+        ).unflatten(0, first_anchor_btchw.shape[:2])
+        latents[:, :, :anchor_t_global] = noisy_anchor_btchw.permute(
+            0, 2, 1, 3, 4).contiguous().to(dtype=dtype)
 
     num_frames_per_block = transformer.config.arch_config.num_frames_per_block
     if latents.shape[2] % num_frames_per_block != 0:
@@ -1777,7 +1805,7 @@ def _causal_dmd_rollout_one_window_with_cache(
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
-            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -1786,7 +1814,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                 first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
-            elif first_frame_latent_bcfhw is not None and start_index == 0:
+            elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
                 anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
                     -1, -1, anchor_t, -1, -1)
@@ -1954,7 +1982,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                 ).unflatten(0, context_btchw.shape[:2])
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
-            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -1963,7 +1991,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                 first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
-            elif first_frame_latent_bcfhw is not None and start_index == 0:
+            elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
                 anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
                     -1, -1, anchor_t, -1, -1)
@@ -2028,7 +2056,7 @@ def _causal_dmd_rollout_one_window_with_cache(
 
         start_index += current_num_frames
 
-    if expand_timesteps and first_frame_latent_bcfhw is not None:
+    if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None:
         anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
         first_frame_mask = torch.ones(
             (1, 1, latent_t, latent_h, latent_w),
@@ -2038,7 +2066,7 @@ def _causal_dmd_rollout_one_window_with_cache(
         first_frame_mask[:, :, :anchor_t] = 0
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
-    elif first_frame_latent_bcfhw is not None:
+    elif use_hard_replace and first_frame_latent_bcfhw is not None:
         anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
         latents = latents.clone()
         anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
@@ -2125,6 +2153,7 @@ def _run_causal_long_warp_rollout(
     batch.num_frames = window_frames
     frame_seq_length: int | None = None
     global_start_latent = 0
+    latent_stride_t: int | None = None
 
     kv_cache: list[dict] | None = None
     crossattn_cache: list[dict] | None = None
@@ -2234,6 +2263,8 @@ def _run_causal_long_warp_rollout(
             latent_t = int(control_latent.shape[2])
             latent_h = int(control_latent.shape[3])
             latent_w = int(control_latent.shape[4])
+            overlap_latent_t = _latent_frames_from_video_frames(overlap_frames)
+            latent_stride_t = max(1, latent_t - overlap_latent_t)
             latent_seq_length = latent_h * latent_w
             patch_ratio = int(transformer.config.arch_config.patch_size[-1] *
                               transformer.config.arch_config.patch_size[-2])
@@ -2245,7 +2276,7 @@ def _run_causal_long_warp_rollout(
 
             # For global-attention checkpoints (local_attn_size=-1), allocate enough cache
             # space for all windows in this rollout.
-            total_latent_frames = latent_t * num_windows
+            total_latent_frames = latent_t + max(0, num_windows - 1) * latent_stride_t
 
             kv_cache = _initialize_kv_cache(
                 model=transformer,
@@ -2312,9 +2343,14 @@ def _run_causal_long_warp_rollout(
                 logger.warning(
                     "causal-long streaming mode ignores --reset_cache_each_block to preserve cross-window cache reuse."
                 )
+            if not bool(args.first_frame_timestep_zero):
+                logger.info(
+                    "causal-long mode: forcing first-frame timestep=0 for stronger global anchor."
+                )
 
         if (frame_seq_length is None or kv_cache is None or crossattn_cache is None
-                or control_kv_cache is None or control_crossattn_cache is None):
+                or control_kv_cache is None or control_crossattn_cache is None
+                or latent_stride_t is None):
             raise RuntimeError("Failed to initialize causal-long caches.")
 
         latents = _causal_dmd_rollout_one_window_with_cache(
@@ -2335,11 +2371,12 @@ def _run_causal_long_warp_rollout(
             warp_denoising_step=bool(args.warp_denoising_step),
             update_rule=args.update_rule,
             full_schedule=bool(args.full_schedule),
-            first_frame_timestep_zero=bool(args.first_frame_timestep_zero),
+            first_frame_timestep_zero=True,
             expand_timesteps=bool(
                 getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
             disable_cache_update=bool(args.disable_cache_update),
             first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
+            first_frame_condition_mode=str(args.first_frame_condition_mode),
             seed=int(sample_seed + win_idx),
             dtype=dtype,
             global_start_latent=int(global_start_latent),
@@ -2354,7 +2391,7 @@ def _run_causal_long_warp_rollout(
             control_kv_cache_uncond=control_kv_cache_uncond,
             control_crossattn_cache_uncond=control_crossattn_cache_uncond,
         )
-        global_start_latent += int(control_latent.shape[2])
+        global_start_latent += int(latent_stride_t)
 
         decoded_window = decoding.decode(latents, fastvideo_args).cpu().float()
         decoded_window_tchw = decoded_window[0].permute(1, 0, 2, 3).contiguous()
@@ -2365,7 +2402,8 @@ def _run_causal_long_warp_rollout(
 
         if win_idx == 0:
             decoded_window_tchw = decoded_window_tchw.clone()
-            decoded_window_tchw[0] = global_first_rgb
+            if str(args.first_frame_condition_mode).lower() != "noise_init":
+                decoded_window_tchw[0] = global_first_rgb
             blend_frames = int(max(0, int(args.first_frame_blend_frames)))
             if blend_frames > 0:
                 n_blend = min(blend_frames, int(window_frames) - 1)
@@ -3636,6 +3674,17 @@ def main() -> None:
         help=(
             "Force the first latent frame's timestep to 0 (Diff-Factory expand_timesteps behavior). "
             "Default OFF to match FastVideo self-forcing training."
+        ),
+    )
+    parser.add_argument(
+        "--first_frame_condition_mode",
+        type=str,
+        default="hard_replace",
+        choices=["hard_replace", "noise_init"],
+        help=(
+            "How to inject first-frame condition in causal rollout. "
+            "'hard_replace': overwrite anchor latents with first-frame latent (original behavior). "
+            "'noise_init': initialize anchor latents as q(x_t|x0,eps) at first timestep and avoid hard overwrite."
         ),
     )
     parser.add_argument(
