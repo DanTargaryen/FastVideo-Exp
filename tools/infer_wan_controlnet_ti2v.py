@@ -2177,6 +2177,13 @@ def _run_causal_long_warp_rollout(
     timestep_indices_list: list[int] | None,
     inference_device: torch.device,
 ) -> torch.Tensor:
+    condition_mode = str(args.first_frame_condition_mode).lower()
+    if condition_mode == "md_align":
+        logger.warning(
+            "first_frame_condition_mode=md_align is unstable for long causal rollout; "
+            "falling back to hard_replace in this branch."
+        )
+        condition_mode = "hard_replace"
     window_frames = int(args.causal_window_frames)
     overlap_frames = int(args.causal_overlap_frames)
     if overlap_frames <= 0 or overlap_frames >= window_frames:
@@ -2427,7 +2434,7 @@ def _run_causal_long_warp_rollout(
                 logger.warning(
                     "causal-long streaming mode ignores --reset_cache_each_block to preserve cross-window cache reuse."
                 )
-            if (str(args.first_frame_condition_mode).lower() != "md_align"
+            if (condition_mode != "md_align"
                     and not bool(args.first_frame_timestep_zero)):
                 logger.info(
                     "causal-long mode: forcing first-frame timestep=0 for stronger global anchor."
@@ -2458,12 +2465,12 @@ def _run_causal_long_warp_rollout(
             full_schedule=bool(args.full_schedule),
             first_frame_timestep_zero=(
                 bool(args.first_frame_timestep_zero)
-                or str(args.first_frame_condition_mode).lower() != "md_align"),
+                or condition_mode != "md_align"),
             expand_timesteps=bool(
                 getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
             disable_cache_update=bool(args.disable_cache_update),
             first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
-            first_frame_condition_mode=str(args.first_frame_condition_mode),
+            first_frame_condition_mode=condition_mode,
             seed=int(sample_seed + win_idx),
             dtype=dtype,
             global_start_latent=int(global_start_latent),
@@ -2489,7 +2496,7 @@ def _run_causal_long_warp_rollout(
 
         if win_idx == 0:
             decoded_window_tchw = decoded_window_tchw.clone()
-            if str(args.first_frame_condition_mode).lower() == "hard_replace":
+            if condition_mode == "hard_replace":
                 decoded_window_tchw[0] = global_first_rgb
             blend_frames = int(max(0, int(args.first_frame_blend_frames)))
             if blend_frames > 0:
