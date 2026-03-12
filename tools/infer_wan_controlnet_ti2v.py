@@ -1998,7 +1998,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                         next_timestep * torch.ones(
                             (1 * current_num_frames),
                             device=device,
-                            dtype=torch.long,
+                            dtype=torch.float32,
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
                     current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
@@ -2710,6 +2710,8 @@ def _causal_dmd_rollout_ti2v_controlnet(
     full_schedule: bool,
     first_frame_timestep_zero: bool,
     expand_timesteps: bool,
+    first_frame_anchor_latent_frames: int,
+    first_frame_condition_mode: str,
     reset_cache_each_block: bool,
     disable_cache_update: bool,
     seed: int,
@@ -2778,6 +2780,31 @@ def _causal_dmd_rollout_ti2v_controlnet(
         device=device,
         dtype=dtype,
     )
+    mode = str(first_frame_condition_mode).lower()
+    if mode not in ("hard_replace", "noise_init", "md_align"):
+        mode = "hard_replace"
+    # md_align is only implemented in long-causal branch; keep legacy behavior here.
+    use_hard_replace = (mode != "noise_init")
+    use_noise_init = (mode == "noise_init")
+    anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
+    if use_noise_init and first_frame_latent_bcfhw is not None:
+        first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+            -1, -1, anchor_t_global, -1, -1)
+        first_anchor_btchw = first_anchor.permute(0, 2, 1, 3, 4).contiguous()
+        anchor_noise_btchw = torch.randn_like(first_anchor_btchw)
+        t_init = t_list_full[0].to(device=device, dtype=torch.float32)
+        t_init_vec = torch.ones(
+            (first_anchor_btchw.shape[0] * first_anchor_btchw.shape[1], ),
+            device=device,
+            dtype=torch.float32,
+        ) * t_init
+        noisy_anchor_btchw = scheduler.add_noise(
+            first_anchor_btchw.flatten(0, 1),
+            anchor_noise_btchw.flatten(0, 1),
+            t_init_vec,
+        ).unflatten(0, first_anchor_btchw.shape[:2])
+        latents[:, :, :anchor_t_global] = noisy_anchor_btchw.permute(
+            0, 2, 1, 3, 4).contiguous().to(dtype=dtype)
 
     num_frames_per_block = transformer.config.arch_config.num_frames_per_block
     if latents.shape[2] % num_frames_per_block != 0:
@@ -2850,6 +2877,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             _reset_kv_and_crossattn_caches(kv_cache=control_kv_cache_uncond, crossattn_cache=control_crossattn_cache_uncond)
 
         current_num_frames = num_frames_per_block
+        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(current_num_frames)))
         # Slice the global noise tensor for this block (do NOT resample).
         current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
 
@@ -2866,18 +2894,19 @@ def _causal_dmd_rollout_ti2v_controlnet(
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
-            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
                     dtype=dtype,
                 )
-                first_frame_mask[:, :, 0] = 0
+                first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
-            elif first_frame_latent_bcfhw is not None and start_index == 0:
+            elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
-                latent_model_input[:, :, :1] = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                latent_model_input[:, :, :anchor_t] = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
+                    -1, -1, anchor_t, -1, -1)
             latent_model_input = latent_model_input.to(dtype=dtype)
 
             timestep = torch.ones((1, current_num_frames),
@@ -2889,9 +2918,9 @@ def _causal_dmd_rollout_ti2v_controlnet(
             # Keep the original timestep by default; allow forcing to 0 for Diff-Factory-style
             # expand_timesteps debugging via `--first_frame_timestep_zero`.
             if (first_frame_timestep_zero or
-                    (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
+                    (use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
                 timestep = timestep.clone()
-                timestep[:, 0] = 0
+                timestep[:, :anchor_t] = 0
 
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
@@ -2977,7 +3006,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                                       dtype=torch.float32) * t_cur
                 if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
                     timestep = timestep.clone()
-                    timestep[:, 0] = 0
+                    timestep[:, :anchor_t] = 0
 
                 denoised_pred = pred_noise_to_pred_video(
                     pred_noise=pred_flow_btchw.flatten(0, 1),
@@ -2995,7 +3024,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         next_timestep * torch.ones(
                             (1 * current_num_frames),
                             device=device,
-                            dtype=torch.long,
+                            dtype=torch.float32,
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
                     current_latents = noisy_input_bfchw.permute(0, 2, 1, 3, 4).contiguous()
@@ -3061,19 +3090,20 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
-            if expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
                     dtype=dtype,
                 )
-                first_frame_mask[:, :, 0] = 0
+                first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
-            elif first_frame_latent_bcfhw is not None and start_index == 0:
+            elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
-                context_bcfhw[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                                      dtype=dtype)
+                context_bcfhw[:, :, :anchor_t] = first_frame_latent_bcfhw.to(device=device,
+                                                                              dtype=dtype).expand(
+                                                                                  -1, -1, anchor_t, -1, -1)
             context_bcfhw = context_bcfhw.to(dtype=dtype)
 
             with torch.autocast(device_type="cuda", dtype=dtype,
@@ -3131,19 +3161,20 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
         start_index += current_num_frames
 
-    if expand_timesteps and first_frame_latent_bcfhw is not None:
+    if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None:
         first_frame_mask = torch.ones(
             (1, 1, latent_t, latent_h, latent_w),
             device=device,
             dtype=dtype,
         )
-        first_frame_mask[:, :, 0] = 0
+        first_frame_mask[:, :, :anchor_t_global] = 0
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
-    elif first_frame_latent_bcfhw is not None:
+    elif use_hard_replace and first_frame_latent_bcfhw is not None:
         latents = latents.clone()
-        latents[:, :, :1] = first_frame_latent_bcfhw.to(device=device,
-                                                        dtype=dtype)
+        latents[:, :, :anchor_t_global] = first_frame_latent_bcfhw.to(device=device,
+                                                                       dtype=dtype).expand(
+                                                                           -1, -1, anchor_t_global, -1, -1)
     return latents
 
 
@@ -4426,6 +4457,8 @@ def main() -> None:
                 first_frame_timestep_zero=effective_first_frame_timestep_zero,
                 expand_timesteps=bool(
                     getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
+                first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
+                first_frame_condition_mode=str(args.first_frame_condition_mode),
                 reset_cache_each_block=bool(args.reset_cache_each_block),
                 disable_cache_update=bool(args.disable_cache_update),
                 seed=args.seed + i,

@@ -381,7 +381,7 @@ def _infer_target_num_channels_latents(model_path: str, z_dim: int) -> int:
     """
     Infer target latent channel count (C) for Wan DiT/ControlNet inputs.
     Prefer `num_channels_latents` from transformer config. If missing,
-    fall back to in_channels/z_dim.
+    fall back to transformer `in_channels` directly.
     """
     cfg_path = Path(model_path) / "transformer" / "config.json"
     if not cfg_path.exists():
@@ -404,8 +404,8 @@ def _infer_target_num_channels_latents(model_path: str, z_dim: int) -> int:
     in_channels = cfg.get("in_channels")
     if isinstance(in_channels, (int, float)):
         in_channels = int(in_channels)
-        if in_channels > 0 and int(z_dim) > 0 and in_channels % int(z_dim) == 0:
-            candidates.append(in_channels // int(z_dim))
+        if in_channels > 0:
+            candidates.append(in_channels)
 
     # Keep only sane candidates:
     # - do not allow shrinking below VAE z_dim (would truncate latent channels badly),
