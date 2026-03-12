@@ -536,6 +536,40 @@ def _slice_by_id_or_index(files: list[Path], start: int, end: int) -> list[Path]
     return []
 
 
+def _resolve_clip_start_offset(
+    window_files: list[Path],
+    clip_start: int,
+    window_start: int,
+) -> int:
+    """
+    Convert clip_start to window-relative offset.
+
+    MatrixCity mask clips usually name clip_start as absolute frame id/index in the
+    full street sequence, while this script slices from per-window lists. This
+    helper maps clip_start to the correct offset in window_files.
+    """
+    if not window_files:
+        return 0
+
+    # Prefer frame-id alignment when filenames carry numeric frame ids.
+    parsed_ids = [_frame_index_from_stem(p.stem) for p in window_files]
+    if all(fid is not None for fid in parsed_ids):
+        ids = [int(fid) for fid in parsed_ids]
+        # Use the first frame whose id is >= clip_start.
+        for i, fid in enumerate(ids):
+            if fid >= int(clip_start):
+                return i
+        # clip_start is after window tail: extrapolate so caller can pad.
+        return max(0, int(clip_start) - int(ids[0]))
+
+    # Fallback for non-numeric names:
+    # treat clip_start as global index first; if invalid, treat as local offset.
+    rel = int(clip_start) - int(window_start)
+    if rel < 0:
+        rel = int(clip_start)
+    return max(0, rel)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Preprocess MatrixCity clips to TI2V+ControlNet parquet")
     p.add_argument("--model_path", type=str, required=True)
@@ -902,14 +936,29 @@ def main() -> None:
                 logger.warning("Empty depth dir for %s (street=%s); skip clip", clip_dir, street_name)
             continue
 
-        needed = clip_start + int(args.clip_length)
+        clip_start_in_window = _resolve_clip_start_offset(
+            window_files=window_files,
+            clip_start=clip_start,
+            window_start=window_start,
+        )
+        if bool(args.debug_timing):
+            logger.info(
+                "[sampling] %s window=%s clip_start=%d -> offset=%d (window_len=%d)",
+                clip_dir,
+                window_dir.name,
+                int(clip_start),
+                int(clip_start_in_window),
+                len(window_files),
+            )
+
+        needed = clip_start_in_window + int(args.clip_length)
         if needed > len(window_files):
             window_files = window_files + [window_files[-1]] * (needed - len(window_files))
         if needed > len(depth_window):
             depth_window = depth_window + [depth_window[-1]] * (needed - len(depth_window))
 
-        rgb_paths = window_files[clip_start:clip_start + int(args.clip_length)]
-        depth_paths = depth_window[clip_start:clip_start + int(args.clip_length)]
+        rgb_paths = window_files[clip_start_in_window:clip_start_in_window + int(args.clip_length)]
+        depth_paths = depth_window[clip_start_in_window:clip_start_in_window + int(args.clip_length)]
 
         mask_dir = clip_dir / "mask"
         if not mask_dir.is_dir():
@@ -1001,11 +1050,11 @@ def main() -> None:
                     if len(normal_window) < len(window_files):
                         normal_window = normal_window + [normal_window[-1]] * (
                             len(window_files) - len(normal_window))
-                    needed_n = clip_start + int(args.clip_length)
+                    needed_n = clip_start_in_window + int(args.clip_length)
                     if needed_n > len(normal_window):
                         normal_window = normal_window + [normal_window[-1]] * (
                             needed_n - len(normal_window))
-                    normal_paths = normal_window[clip_start:clip_start +
+                    normal_paths = normal_window[clip_start_in_window:clip_start_in_window +
                                                  int(args.clip_length)]
                     break
 
