@@ -1876,8 +1876,9 @@ def _causal_dmd_rollout_one_window_with_cache(
                     dtype=dtype,
                 )
                 first_frame_mask[:, :, :anchor_t] = 0
-                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
-                latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
+                first_latents_local = first_frame_latent_bcfhw.to(device=device,
+                                                                  dtype=dtype)
+                latent_model_input = (1 - first_frame_mask) * first_latents_local + first_frame_mask * current_latents
             elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
                 anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
@@ -2071,8 +2072,9 @@ def _causal_dmd_rollout_one_window_with_cache(
                     dtype=dtype,
                 )
                 first_frame_mask[:, :, :anchor_t] = 0
-                image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
-                context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
+                first_latents_local = first_frame_latent_bcfhw.to(device=device,
+                                                                  dtype=dtype)
+                context_bcfhw = (1 - first_frame_mask) * first_latents_local + first_frame_mask * context_bcfhw
             elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
                 anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
