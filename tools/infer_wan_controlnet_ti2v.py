@@ -1758,9 +1758,50 @@ def _causal_dmd_rollout_one_window_with_cache(
         device=device,
         dtype=dtype,
     )
+    mode = str(first_frame_condition_mode).lower()
+    if mode not in ("hard_replace", "noise_init", "md_align"):
+        mode = "hard_replace"
+    use_hard_replace = (mode == "hard_replace")
+    use_noise_init = (mode == "noise_init")
+    use_md_align = (mode == "md_align")
+    image_latents = (first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+                     if first_frame_latent_bcfhw is not None else None)
+
+    latent_input_mode = "latents_only"
+    image_latents_concat_global = None
+    if use_md_align and (not expand_timesteps) and image_latents is not None:
+        expected_hidden_channels = int(
+            getattr(transformer, "in_channels",
+                    getattr(transformer, "num_channels_latents", latents.shape[1])))
+        if _is_union_controlnet(controlnet):
+            expected_hidden_channels = int(
+                getattr(controlnet, "in_channels",
+                        expected_hidden_channels * 3) // 3)
+        latent_channels = int(latents.shape[1])
+        image_channels = int(image_latents.shape[1])
+        concat_channels = latent_channels + image_channels
+        if concat_channels == expected_hidden_channels:
+            latent_input_mode = "concat_channels"
+            image_latents_concat_global = image_latents
+            if int(image_latents_concat_global.shape[2]) == 1 and latent_t > 1:
+                image_latents_full = torch.zeros(
+                    (image_latents_concat_global.shape[0], image_latents_concat_global.shape[1],
+                     latent_t, image_latents_concat_global.shape[3], image_latents_concat_global.shape[4]),
+                    device=device,
+                    dtype=dtype,
+                )
+                image_latents_full[:, :, :1] = image_latents_concat_global
+                image_latents_concat_global = image_latents_full
+        elif latent_channels == expected_hidden_channels:
+            # Fallback for checkpoints that do not support concat TI2V input channels.
+            latent_input_mode = "overwrite_first_frame"
+        else:
+            raise RuntimeError(
+                "Unsupported causal md_align hidden-state channels: "
+                f"latent_channels={latent_channels}, image_channels={image_channels}, "
+                f"expected_hidden_channels={expected_hidden_channels}.")
     anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
-    use_hard_replace = (str(first_frame_condition_mode).lower() != "noise_init")
-    if (not use_hard_replace) and first_frame_latent_bcfhw is not None:
+    if use_noise_init and first_frame_latent_bcfhw is not None:
         # Replace the initial noisy state of the first anchor latents with q(x_t | x0, eps)
         # so the first-frame condition participates in the initial sampling state.
         first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
@@ -1791,7 +1832,10 @@ def _causal_dmd_rollout_one_window_with_cache(
     start_index = 0
     for _block_idx in range(num_blocks):
         current_num_frames = num_frames_per_block
-        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(current_num_frames)))
+        if use_md_align:
+            anchor_t = 1
+        else:
+            anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(current_num_frames)))
         current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
@@ -1805,7 +1849,27 @@ def _causal_dmd_rollout_one_window_with_cache(
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
-            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_md_align:
+                if expand_timesteps:
+                    if image_latents is not None and start_index == 0:
+                        first_frame_mask = torch.ones(
+                            (1, 1, current_num_frames, latent_h, latent_w),
+                            device=device,
+                            dtype=dtype,
+                        )
+                        first_frame_mask[:, :, 0] = 0
+                        latent_model_input = (1 - first_frame_mask) * image_latents + first_frame_mask * current_latents
+                else:
+                    if image_latents is not None:
+                        if latent_input_mode == "concat_channels":
+                            if image_latents_concat_global is None:
+                                raise RuntimeError("image_latents_concat_global is None in concat_channels mode.")
+                            image_chunk = image_latents_concat_global[:, :, start_index:start_index + current_num_frames]
+                            latent_model_input = torch.cat([current_latents, image_chunk], dim=1)
+                        elif latent_input_mode == "overwrite_first_frame" and start_index == 0:
+                            latent_model_input = latent_model_input.clone()
+                            latent_model_input[:, :, :1] = image_latents[:, :, :1]
+            elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -1982,7 +2046,25 @@ def _causal_dmd_rollout_one_window_with_cache(
                 ).unflatten(0, context_btchw.shape[:2])
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
-            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if use_md_align:
+                if expand_timesteps and image_latents is not None and start_index == 0:
+                    first_frame_mask = torch.ones(
+                        (1, 1, current_num_frames, latent_h, latent_w),
+                        device=device,
+                        dtype=dtype,
+                    )
+                    first_frame_mask[:, :, 0] = 0
+                    context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
+                elif (not expand_timesteps) and image_latents is not None:
+                    if latent_input_mode == "concat_channels":
+                        if image_latents_concat_global is None:
+                            raise RuntimeError("image_latents_concat_global is None in concat_channels mode.")
+                        image_chunk = image_latents_concat_global[:, :, start_index:start_index + current_num_frames]
+                        context_bcfhw = torch.cat([context_bcfhw, image_chunk], dim=1)
+                    elif latent_input_mode == "overwrite_first_frame" and start_index == 0:
+                        context_bcfhw = context_bcfhw.clone()
+                        context_bcfhw[:, :, :1] = image_latents[:, :, :1]
+            elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -2343,7 +2425,8 @@ def _run_causal_long_warp_rollout(
                 logger.warning(
                     "causal-long streaming mode ignores --reset_cache_each_block to preserve cross-window cache reuse."
                 )
-            if not bool(args.first_frame_timestep_zero):
+            if (str(args.first_frame_condition_mode).lower() != "md_align"
+                    and not bool(args.first_frame_timestep_zero)):
                 logger.info(
                     "causal-long mode: forcing first-frame timestep=0 for stronger global anchor."
                 )
@@ -2371,7 +2454,9 @@ def _run_causal_long_warp_rollout(
             warp_denoising_step=bool(args.warp_denoising_step),
             update_rule=args.update_rule,
             full_schedule=bool(args.full_schedule),
-            first_frame_timestep_zero=True,
+            first_frame_timestep_zero=(
+                bool(args.first_frame_timestep_zero)
+                or str(args.first_frame_condition_mode).lower() != "md_align"),
             expand_timesteps=bool(
                 getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
             disable_cache_update=bool(args.disable_cache_update),
@@ -2402,7 +2487,7 @@ def _run_causal_long_warp_rollout(
 
         if win_idx == 0:
             decoded_window_tchw = decoded_window_tchw.clone()
-            if str(args.first_frame_condition_mode).lower() != "noise_init":
+            if str(args.first_frame_condition_mode).lower() == "hard_replace":
                 decoded_window_tchw[0] = global_first_rgb
             blend_frames = int(max(0, int(args.first_frame_blend_frames)))
             if blend_frames > 0:
@@ -3680,11 +3765,13 @@ def main() -> None:
         "--first_frame_condition_mode",
         type=str,
         default="hard_replace",
-        choices=["hard_replace", "noise_init"],
+        choices=["hard_replace", "noise_init", "md_align"],
         help=(
             "How to inject first-frame condition in causal rollout. "
             "'hard_replace': overwrite anchor latents with first-frame latent (original behavior). "
-            "'noise_init': initialize anchor latents as q(x_t|x0,eps) at first timestep and avoid hard overwrite."
+            "'noise_init': initialize anchor latents as q(x_t|x0,eps) at first timestep and avoid hard overwrite. "
+            "'md_align': align with run_wan_controlnet_union.md behavior (prefer concat TI2V input when supported, "
+            "no output-frame hard replacement)."
         ),
     )
     parser.add_argument(
