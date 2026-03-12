@@ -385,22 +385,64 @@ def _infer_target_num_channels_latents(model_path: str, z_dim: int) -> int:
     """
     cfg_path = Path(model_path) / "transformer" / "config.json"
     if not cfg_path.exists():
+        logger.info(
+            "Transformer config not found at %s, fallback target_num_channels_latents=z_dim=%d",
+            cfg_path,
+            int(z_dim),
+        )
         return int(z_dim)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except Exception:
         return int(z_dim)
 
+    candidates: list[int] = []
     c = cfg.get("num_channels_latents")
     if isinstance(c, (int, float)) and int(c) > 0:
-        return int(c)
+        candidates.append(int(c))
 
     in_channels = cfg.get("in_channels")
     if isinstance(in_channels, (int, float)):
         in_channels = int(in_channels)
-        if in_channels > 0 and in_channels % int(z_dim) == 0:
-            return in_channels // int(z_dim)
+        if in_channels > 0 and int(z_dim) > 0 and in_channels % int(z_dim) == 0:
+            candidates.append(in_channels // int(z_dim))
 
+    # Keep only sane candidates:
+    # - do not allow shrinking below VAE z_dim (would truncate latent channels badly),
+    # - and require compatibility with z_dim.
+    sane: list[int] = []
+    for cand in candidates:
+        if cand < int(z_dim):
+            logger.warning(
+                "Ignoring suspicious target latent channels from config: %d < z_dim=%d",
+                int(cand),
+                int(z_dim),
+            )
+            continue
+        if cand == int(z_dim) or (cand % int(z_dim) == 0):
+            sane.append(int(cand))
+        else:
+            logger.warning(
+                "Ignoring incompatible target latent channels from config: %d (z_dim=%d)",
+                int(cand),
+                int(z_dim),
+            )
+
+    if sane:
+        chosen = int(sane[0])
+        logger.info(
+            "Infer target_num_channels_latents: z_dim=%d raw_candidates=%s sane_candidates=%s chosen=%d",
+            int(z_dim),
+            [int(x) for x in candidates],
+            [int(x) for x in sane],
+            int(chosen),
+        )
+        return chosen
+    logger.warning(
+        "No sane target_num_channels_latents from config (z_dim=%d raw_candidates=%s), fallback to z_dim",
+        int(z_dim),
+        [int(x) for x in candidates],
+    )
     return int(z_dim)
 
 
@@ -679,6 +721,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--latent_repeat", type=int, default=0)
     p.add_argument(
+        "--target_num_channels_latents",
+        type=int,
+        default=0,
+        help=(
+            "Optional override for per-branch latent channel count C (e.g. 48). "
+            "0 means auto infer from config/z_dim."
+        ),
+    )
+    p.add_argument(
         "--write_vae_latent",
         action="store_true",
         help=(
@@ -781,9 +832,19 @@ def main() -> None:
         z_dim = getattr(getattr(vae, "config", None), "z_dim", None)
     if z_dim is None:
         z_dim = 16
-    target_num_channels_latents = _infer_target_num_channels_latents(
-        model_path, int(z_dim)
-    )
+    if int(args.target_num_channels_latents) > 0:
+        target_num_channels_latents = int(args.target_num_channels_latents)
+        if target_num_channels_latents < int(z_dim):
+            logger.warning(
+                "target_num_channels_latents=%d < z_dim=%d; forcing to z_dim to avoid truncation.",
+                int(target_num_channels_latents),
+                int(z_dim),
+            )
+            target_num_channels_latents = int(z_dim)
+    else:
+        target_num_channels_latents = _infer_target_num_channels_latents(
+            model_path, int(z_dim)
+        )
     if int(args.latent_repeat) > 0:
         latent_repeat = int(args.latent_repeat)
     else:
@@ -1216,10 +1277,36 @@ def main() -> None:
             masked_lat, target_num_channels_latents, "masked_lat"
         )
         mask_lat = _align_latent_channels(mask_lat, target_num_channels_latents, "mask_lat")
+        branch_c = int(target_num_channels_latents)
+        bad_shape_reason = ""
+        if int(depth_lat.shape[0]) != branch_c:
+            bad_shape_reason = f"depth_lat C={int(depth_lat.shape[0])} expected={branch_c}"
+        elif int(masked_lat.shape[0]) != branch_c:
+            bad_shape_reason = f"masked_lat C={int(masked_lat.shape[0])} expected={branch_c}"
+        elif int(mask_lat.shape[0]) != branch_c:
+            bad_shape_reason = f"mask_lat C={int(mask_lat.shape[0])} expected={branch_c}"
+        elif normal_tchw is not None and int(normal_lat.shape[0]) != branch_c:
+            bad_shape_reason = f"normal_lat C={int(normal_lat.shape[0])} expected={branch_c}"
+        if bad_shape_reason:
+            logger.warning(
+                "Skip clip due to latent channel mismatch: %s clip=%s",
+                bad_shape_reason,
+                clip_dir,
+            )
+            continue
         if normal_tchw is not None:
             control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
         else:
             control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+        expected_total_c = branch_c * (4 if normal_tchw is not None else 3)
+        if int(control_lat.shape[0]) != int(expected_total_c):
+            logger.warning(
+                "Skip clip due to control_lat total channel mismatch: got=%d expected=%d clip=%s",
+                int(control_lat.shape[0]),
+                int(expected_total_c),
+                clip_dir,
+            )
+            continue
         control_lat_np = control_lat.numpy()
         if bool(args.debug_timing):
             logger.info("[timing] %s control_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)

@@ -295,6 +295,14 @@ def main() -> None:
     ).float()
 
     total_c = int(control_latent.shape[1])
+    valid_k = _infer_valid_k_from_channels(total_c, int(z_dim))
+    if not valid_k:
+        raise ValueError(
+            "Invalid control_latent channels from parquet: "
+            f"total_c={total_c}, z_dim={int(z_dim)}, raw_shape={tuple(raw_control_latent.shape)}, "
+            f"bcfhw_shape={tuple(control_latent.shape)}. "
+            "Expected total_c to be divisible by 3*z_dim or 4*z_dim."
+        )
     k = _infer_split_k(total_c, int(z_dim), prefer_three=not bool(args.prefer_four))
     c = total_c // k
     print(
