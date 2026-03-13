@@ -3722,6 +3722,14 @@ def main() -> None:
             "Disables conditioning-image RGB rebuild path."
         ),
     )
+    parser.add_argument(
+        "--bidir_force_firstframe_zero_tail",
+        action="store_true",
+        help=(
+            "Bidirectional only. Force TI2V image_latent to be synthesized from first_frame_latent "
+            "(frame0 + zero tail), even if parquet provides image_latent/vae_latent."
+        ),
+    )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
     parser.add_argument("--raw_mask_invert", action="store_true")
     parser.add_argument("--raw_require_normal", action="store_true")
@@ -4393,7 +4401,16 @@ def main() -> None:
                 getattr(transformer, "num_channels_latents",
                         first_frame_latent.shape[1]))
             target_f = int(control_latent.shape[2])
-            if image_latent is not None:
+            if bool(args.bidir_force_firstframe_zero_tail):
+                image_latent = _build_image_latent_from_first_frame_latent(
+                    first_frame_latent_bcfhw=first_frame_latent,
+                    target_frames=target_f,
+                )
+                logger.info(
+                    "bidir strict latent align: force frame0+zero-tail image_latent, shape=%s",
+                    tuple(image_latent.shape),
+                )
+            elif image_latent is not None:
                 image_latent = _align_latent_channels(image_latent[0], target_c,
                                                       "image_latent").unsqueeze(0)
                 if int(image_latent.shape[2]) != target_f:
