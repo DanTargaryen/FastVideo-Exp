@@ -3267,6 +3267,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     update_rule: str,
     full_schedule: bool,
     first_frame_timestep_zero: bool,
+    bidir_sync_first_frame_state: bool,
     expand_timesteps: bool,
     trace_jsonl_path: str | None,
     trace_sample_id: str,
@@ -3510,6 +3511,28 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
         latent_l2_before = _tensor_or_list_l2(latents)
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
+        if (bidir_sync_first_frame_state and (not expand_timesteps)
+                and image_latents is not None
+                and latent_input_mode == "overwrite_first_frame"):
+            # Keep latent state aligned with the same first-frame anchor path used
+            # at model input, to prevent frame0 drifting into an out-of-distribution
+            # state while still using anchored input every step.
+            anchor_state = image_latents[:, :, :1]
+            if (not bool(first_frame_timestep_zero)
+                    and first_frame_anchor_noise is not None
+                    and hasattr(scheduler, "add_noise")
+                    and (step_i + 1) < int(timesteps.numel())):
+                try:
+                    t_next = timesteps[step_i + 1:step_i + 2].to(
+                        device=device, dtype=torch.float32)
+                    anchor_state = scheduler.add_noise(
+                        image_latents[:, :, :1],
+                        first_frame_anchor_noise,
+                        t_next,
+                    ).to(dtype=dtype)
+                except Exception:
+                    anchor_state = image_latents[:, :, :1]
+            latents[:, :, :1] = anchor_state.to(device=device, dtype=dtype)
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
             trace_jsonl_path,
@@ -3759,6 +3782,15 @@ def main() -> None:
         help=(
             "Bidirectional only. Force TI2V image_latent to be synthesized from first_frame_latent "
             "(frame0 + zero tail), even if parquet provides image_latent/vae_latent."
+        ),
+    )
+    parser.add_argument(
+        "--bidir_sync_first_frame_state",
+        action="store_true",
+        help=(
+            "Bidirectional only. After each denoising step, sync latent state frame0 to the same "
+            "first-frame anchor trajectory used by model input (q(x_t|x0,eps) when timestep-zero is OFF). "
+            "Helps reduce first-frame color drift/flicker."
         ),
     )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
@@ -4580,6 +4612,8 @@ def main() -> None:
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=effective_first_frame_timestep_zero,
+                bidir_sync_first_frame_state=bool(
+                    args.bidir_sync_first_frame_state),
                 expand_timesteps=bool(
                     getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
                 trace_jsonl_path=(trace_jsonl_path if trace_jsonl_path else None),
