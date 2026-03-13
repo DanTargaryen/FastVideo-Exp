@@ -3219,6 +3219,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
+    # Inference must run with eval mode; train-mode stochastic layers can
+    # introduce temporal flicker/drift in bidirectional rollout.
+    transformer.eval()
+    controlnet.eval()
 
     batch = ForwardBatch(data_type="ti2v_controlnet")
     batch.prompt_embeds = prompt_embeds_list
@@ -3265,10 +3269,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             "bidir parquet mode: forcing first-frame anchor with timestep[0]=0 at every denoising step."
         )
 
-    patch_size = getattr(getattr(transformer.config, "arch_config", None),
-                         "patch_size", (2, 2))
-    patch_h = int(patch_size[-2])
-    patch_w = int(patch_size[-1])
     expected_hidden_channels = int(
         getattr(transformer, "in_channels",
                 getattr(transformer, "num_channels_latents", latents.shape[1])))
@@ -3342,9 +3342,12 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
             if anchor_first_frame:
-                temp_ts = (first_frame_mask[0, 0] * t_cur.to(dtype=torch.float32))
-                temp_ts = temp_ts[:, ::patch_h, ::patch_w].flatten()
-                return temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                timestep = torch.ones((latents.shape[0], latent_t),
+                                      device=device,
+                                      dtype=torch.float32) * t_cur.to(
+                                          dtype=torch.float32)
+                timestep[:, 0] = 0
+                return timestep
             if first_frame_timestep_zero and image_latents is not None:
                 timestep = torch.ones((latents.shape[0], latent_t),
                                       device=device,
