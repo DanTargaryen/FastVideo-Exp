@@ -85,6 +85,26 @@ def _decode_tensor(row: dict, prefix: str) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
+def _try_decode_optional_tensor(data_path: str, index: int,
+                                prefix: str) -> torch.Tensor | None:
+    """
+    Try reading an optional latent field from parquet.
+    Returns None when the field is absent or malformed.
+    """
+    try:
+        row = _read_row_by_global_index(
+            data_path,
+            index,
+            [f"{prefix}_bytes", f"{prefix}_shape", f"{prefix}_dtype"],
+        )
+    except Exception:
+        return None
+    try:
+        return _decode_tensor(row, prefix)
+    except Exception:
+        return None
+
+
 def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
     """
     Ensure tensor is shaped [B, C, F, H, W].
@@ -246,6 +266,14 @@ def main() -> None:
         help=
         "Binarize decoded mask before saving (>=thr -> 1, else 0). Set <0 to disable.",
     )
+    p.add_argument(
+        "--decode_vae_latent",
+        action="store_true",
+        help=(
+            "Also decode `vae_latent_*` from parquet (if present) and save as "
+            "vae_latent.mp4 / frames_vae_latent."
+        ),
+    )
     args = p.parse_args()
 
     cols = [
@@ -351,6 +379,26 @@ def main() -> None:
         _save_video(decoded_normal, out_dir / "normal.mp4", args.fps, as_gray=False)
         if args.save_frames:
             _save_frames(decoded_normal, out_dir / "frames_normal", "normal", as_gray=False)
+
+    if bool(args.decode_vae_latent):
+        raw_vae_latent = _try_decode_optional_tensor(
+            args.data_path,
+            int(args.index),
+            "vae_latent",
+        )
+        if raw_vae_latent is None:
+            print("[decode] vae_latent is not present in this parquet row; skipped.")
+        else:
+            vae_latent = _ensure_bcfhw(raw_vae_latent, name="vae_latent").float()
+            print(
+                f"[decode] vae_latent raw_shape={tuple(raw_vae_latent.shape)} "
+                f"-> bcfhw={tuple(vae_latent.shape)}"
+            )
+            decoded_vae = _decode(vae_latent)
+            _save_video(decoded_vae, out_dir / "vae_latent.mp4", args.fps, as_gray=False)
+            if args.save_frames:
+                _save_frames(decoded_vae, out_dir / "frames_vae_latent", "vae_latent",
+                             as_gray=False)
 
     print(f"Saved to: {out_dir}")
 
