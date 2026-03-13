@@ -3371,7 +3371,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 ) -> torch.Tensor:
     # Keep signature stable; these args are causal-only.
     del dmd_steps, timestep_indices, context_noise, warp_denoising_step, update_rule, full_schedule
-    del bidir_sync_first_frame_state
 
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     torch.manual_seed(int(seed))
@@ -3415,7 +3414,11 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     if image_latents is not None:
         first_frame_mask[:, :, 0] = 0
 
-    # Diff-Factory bidirectional non-expanded path starts from pure noise latents.
+    # Keep frame-0 latent anchored when requested; otherwise the model only sees
+    # the first-frame condition through the forward input path and frame0 can
+    # still drift or decode as noise.
+    if (not expand_timesteps) and image_latents is not None and bool(first_frame_timestep_zero):
+        latents[:, :, :1] = image_latents[:, :, :1]
 
     expected_hidden_channels = int(
         getattr(transformer, "in_channels",
@@ -3556,6 +3559,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         else:
             raise RuntimeError(
                 f"Unsupported scheduler.step output type: {type(step_out)}")
+
+        if (not expand_timesteps) and image_latents is not None and bool(bidir_sync_first_frame_state):
+            latents[:, :, :1] = image_latents[:, :, :1].to(device=device, dtype=dtype)
 
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
