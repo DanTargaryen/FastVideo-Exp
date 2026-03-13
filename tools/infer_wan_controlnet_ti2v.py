@@ -3389,10 +3389,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 ).to(dtype=dtype)
             except Exception:
                 first_frame_anchor_noise = None
-    if bool(bidir_sync_first_frame_state):
-        logger.info(
-            "bidir alignment: ignoring per-step first-frame latent state sync to match Diff-Factory."
-        )
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
                          "patch_size", (1, 2, 2))
     patch_h = int(patch_size[-2])
@@ -3549,17 +3545,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             noise_uncond = None
             control_res_uncond = None
             if float(guidance_scale) != 1.0:
-                # IMPORTANT: do not reuse conditional control residuals for uncond branch.
-                # Reusing cond residuals biases CFG and can cause temporal flicker/drift.
-                control_res_uncond = controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=negative_prompt_embeds_list,
-                    timestep=timestep,
-                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
-                                               num_channels_latents),
-                )
-                control_res_uncond = _scale_control_residual(control_res_uncond,
-                                                             scale=controlnet_weight)
+                # Diff-Factory alignment: reuse conditional ControlNet residuals
+                # for unconditional branch.
+                control_res_uncond = control_res
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -3570,6 +3558,28 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
         latent_l2_before = _tensor_or_list_l2(latents)
         latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
+        if (bidir_sync_first_frame_state and (not expand_timesteps)
+                and image_latents is not None
+                and latent_input_mode == "overwrite_first_frame"):
+            # Keep latent state aligned with the same first-frame anchor path used
+            # at model input, to prevent frame0 drifting into an out-of-distribution
+            # state while still using anchored input every step.
+            anchor_state = image_latents[:, :, :1]
+            if (not bool(first_frame_timestep_zero)
+                    and first_frame_anchor_noise is not None
+                    and hasattr(scheduler, "add_noise")
+                    and (step_i + 1) < int(timesteps.numel())):
+                try:
+                    t_next = timesteps[step_i + 1:step_i + 2].to(
+                        device=device, dtype=torch.float32)
+                    anchor_state = scheduler.add_noise(
+                        image_latents[:, :, :1],
+                        first_frame_anchor_noise,
+                        t_next,
+                    ).to(dtype=dtype)
+                except Exception:
+                    anchor_state = image_latents[:, :, :1]
+            latents[:, :, :1] = anchor_state.to(device=device, dtype=dtype)
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
             trace_jsonl_path,
