@@ -485,19 +485,58 @@ def _list_caption_files(clip_dir: Path, pattern: str) -> list[Path]:
     return sorted([p for p in clip_dir.glob(pattern) if p.is_file()], key=lambda p: p.name)
 
 
-def _pick_indexed_files(files: dict[int, Path], length: int) -> list[Path]:
+def _pick_indexed_files(
+    files: dict[int, Path],
+    length: int,
+    *,
+    offset_candidates: list[int] | None = None,
+) -> list[Path]:
+    """
+    Pick a length-long frame list from indexed files.
+
+    Supports both local clip indices (0..N-1) and absolute/global frame ids
+    by testing multiple offset candidates and choosing the one with most hits.
+    """
     if not files:
         raise ValueError("Empty files map")
+    if int(length) <= 0:
+        raise ValueError("length must be > 0")
+
     available = sorted(files.keys())
+    # Deduplicate while preserving order.
+    cand = list(dict.fromkeys(offset_candidates or [0]))
+    if not cand:
+        cand = [0]
+
+    best_off = cand[0]
+    best_hits = -1
+    for off in cand:
+        hits = 0
+        base = int(off)
+        for i in range(int(length)):
+            if (base + i) in files:
+                hits += 1
+        if hits > best_hits:
+            best_hits = hits
+            best_off = base
+
+    # If no candidate matches at all, fall back to chronological order.
+    if best_hits <= 0:
+        seq = [files[k] for k in available]
+        if len(seq) >= int(length):
+            return seq[:int(length)]
+        return seq + [seq[-1]] * (int(length) - len(seq))
+
     out: list[Path] = []
-    for i in range(length):
-        if i in files:
-            out.append(files[i])
+    for i in range(int(length)):
+        target = int(best_off) + i
+        if target in files:
+            out.append(files[target])
             continue
-        # nearest <= i
+        # nearest <= target, else the first available
         j = None
         for a in reversed(available):
-            if a <= i:
+            if a <= target:
                 j = a
                 break
         if j is None:
@@ -558,10 +597,8 @@ def _slice_by_id_or_index(files: list[Path], start: int, end: int) -> list[Path]
     if not files:
         return []
     n = len(files)
-    # index-range
-    if 0 <= start <= end < n:
-        return files[start:end + 1]
-    # id-range
+    # Prefer id-range when numeric frame ids are available and overlap exists.
+    # This avoids cross-modality drift when some modalities have dropped frames.
     parsed_ids = [_frame_index_from_stem(p.stem) for p in files]
     if all(fid is not None for fid in parsed_ids):
         ids = [int(fid) for fid in parsed_ids]
@@ -575,6 +612,9 @@ def _slice_by_id_or_index(files: list[Path], start: int, end: int) -> list[Path]
                 hi = i
         if lo is not None and hi is not None and lo <= hi:
             return files[lo:hi + 1]
+    # fallback index-range
+    if 0 <= start <= end < n:
+        return files[start:end + 1]
     return []
 
 
@@ -1032,7 +1072,12 @@ def main() -> None:
                     mask_files_map[idx] = p
         if not mask_files_map:
             continue
-        mask_paths = _pick_indexed_files(mask_files_map, int(args.clip_length))
+        idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+        mask_paths = _pick_indexed_files(
+            mask_files_map,
+            int(args.clip_length),
+            offset_candidates=idx_cands,
+        )
 
         masked_rgb_dir = clip_dir / "masked_rgb"
         masked_rgb_paths: list[Path] | None = None
@@ -1044,7 +1089,12 @@ def main() -> None:
                     if idx is not None:
                         mr_map[idx] = p
             if mr_map:
-                masked_rgb_paths = _pick_indexed_files(mr_map, int(args.clip_length))
+                idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                masked_rgb_paths = _pick_indexed_files(
+                    mr_map,
+                    int(args.clip_length),
+                    offset_candidates=idx_cands,
+                )
         if bool(args.require_masked_rgb) and masked_rgb_paths is None:
             continue
 
@@ -1059,7 +1109,12 @@ def main() -> None:
                     if idx is not None:
                         n_map[idx] = p
             if n_map:
-                normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
+                idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                normal_paths = _pick_indexed_files(
+                    n_map,
+                    int(args.clip_length),
+                    offset_candidates=idx_cands,
+                )
 
         # Priority 2: external normal_root.
         if normal_paths is None and normal_root is not None:
@@ -1079,7 +1134,12 @@ def main() -> None:
                         if idx is not None:
                             n_map[idx] = p
                 if n_map:
-                    normal_paths = _pick_indexed_files(n_map, int(args.clip_length))
+                    idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                    normal_paths = _pick_indexed_files(
+                        n_map,
+                        int(args.clip_length),
+                        offset_candidates=idx_cands,
+                    )
                     break
 
             # 2b) MatrixCity sequence hierarchy:
