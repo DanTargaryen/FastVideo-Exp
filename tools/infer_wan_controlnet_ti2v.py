@@ -3399,12 +3399,24 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             noise_pred_cond = noise_pred
 
             noise_uncond = None
+            control_res_uncond = None
             if float(guidance_scale) != 1.0:
+                # IMPORTANT: do not reuse conditional control residuals for uncond branch.
+                # Reusing cond residuals biases CFG and can cause temporal flicker/drift.
+                control_res_uncond = controlnet(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=negative_prompt_embeds_list,
+                    timestep=timestep,
+                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                               num_channels_latents),
+                )
+                control_res_uncond = _scale_control_residual(control_res_uncond,
+                                                             scale=controlnet_weight)
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
                     timestep,
-                    block_controlnet_hidden_states=control_res,
+                    block_controlnet_hidden_states=control_res_uncond,
                 )
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
@@ -3425,7 +3437,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "control_scale": float(controlnet_weight),
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
-                "control_uncond_l2": float(_tensor_or_list_l2(control_res if float(guidance_scale) != 1.0 else None)),
+                "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond)),
                 "noise_cond_l2": float(_tensor_or_list_l2(noise_pred_cond)),
                 "noise_uncond_l2": float(_tensor_or_list_l2(noise_uncond)),
                 "noise_final_l2": float(_tensor_or_list_l2(noise_pred)),
