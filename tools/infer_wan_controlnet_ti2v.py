@@ -697,6 +697,61 @@ def _build_image_latent_from_first_frame_latent(
     return out
 
 
+@torch.no_grad()
+def _build_unmasked_mask_latent_from_ones(
+    *,
+    vae,
+    height: int,
+    width: int,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Build a latent for an all-ones mask frame (no mask), shape [1,C,1,H,W] in latent space.
+    """
+    ones_tchw = torch.ones((1, 3, int(height), int(width)), dtype=torch.float32)
+    ones_bcthw = _to_vae_input(ones_tchw, normalize=False).to(
+        device=inference_device, dtype=compute_dtype)
+    ones_lat = _encode_video_latents(
+        vae,
+        ones_bcthw,
+        sample_mode="mode",
+        compute_dtype=compute_dtype,
+    )
+    ones_lat_cf = _align_latent_channels(ones_lat[0], int(target_c),
+                                         "unmasked_mask_latent")
+    return ones_lat_cf.unsqueeze(0)
+
+
+def _apply_unmasked_first_frame_to_union_control_latent(
+    *,
+    control_latent_bcfhw: torch.Tensor,
+    first_frame_latent_bcfhw: torch.Tensor,
+    unmasked_mask_latent_bcfhw: torch.Tensor,
+    num_channels_latents: int,
+) -> torch.Tensor:
+    """
+    For union control latent, enforce frame-0 as "no mask":
+    - masked_latent(frame0) <- first_frame_latent(frame0)
+    - mask(frame0) <- latent(all-ones mask frame)
+    """
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent_bcfhw, int(num_channels_latents))
+    c = int(num_channels_latents)
+    first_lat = _align_latent_channels(first_frame_latent_bcfhw[0], c,
+                                       "first_frame_latent_for_masked").unsqueeze(0)
+    mask_lat = _align_latent_channels(unmasked_mask_latent_bcfhw[0], c,
+                                      "unmasked_mask_latent_for_mask").unsqueeze(0)
+    masked = masked.clone()
+    mask = mask.clone()
+    masked[:, :, :1] = first_lat[:, :, :1].to(device=masked.device, dtype=masked.dtype)
+    mask[:, :, :1] = mask_lat[:, :, :1].to(device=mask.device, dtype=mask.dtype)
+    if normal is None:
+        return torch.cat([depth, masked, mask], dim=1)
+    return torch.cat([depth, normal, masked, mask], dim=1)
+
+
 def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
     if lat.ndim != 4:
         raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
@@ -3784,6 +3839,23 @@ def main() -> None:
             "(frame0 + zero tail), even if parquet provides image_latent/vae_latent."
         ),
     )
+    bidir_unmask_group = parser.add_mutually_exclusive_group()
+    bidir_unmask_group.add_argument(
+        "--bidir_unmask_first_frame",
+        dest="bidir_unmask_first_frame",
+        action="store_true",
+        help=(
+            "Bidirectional only. Enforce frame-0 as unmasked in control latent: "
+            "masked_latent(frame0)=first_frame_latent(frame0), mask(frame0)=all-ones-mask latent."
+        ),
+    )
+    bidir_unmask_group.add_argument(
+        "--no_bidir_unmask_first_frame",
+        dest="bidir_unmask_first_frame",
+        action="store_false",
+        help="Disable bidirectional frame-0 unmask enforcement.",
+    )
+    parser.set_defaults(bidir_unmask_first_frame=True)
     parser.add_argument(
         "--bidir_sync_first_frame_state",
         action="store_true",
@@ -4546,6 +4618,38 @@ def main() -> None:
                 base_c,
                 total_c - base_c,
             )
+        if (args.attention_mode == "bidirectional"
+                and bool(args.bidir_unmask_first_frame)
+                and _is_union_controlnet(controlnet)
+                and first_frame_latent is not None):
+            total_c = int(control_latent.shape[1])
+            target_c = int(getattr(transformer, "num_channels_latents",
+                                   first_frame_latent.shape[1]))
+            if total_c in (3 * target_c, 4 * target_c):
+                unmasked_mask_lat = _build_unmasked_mask_latent_from_ones(
+                    vae=vae,
+                    height=int(args.height),
+                    width=int(args.width),
+                    target_c=target_c,
+                    inference_device=inference_device,
+                    compute_dtype=dtype,
+                )
+                control_latent = _apply_unmasked_first_frame_to_union_control_latent(
+                    control_latent_bcfhw=control_latent,
+                    first_frame_latent_bcfhw=first_frame_latent,
+                    unmasked_mask_latent_bcfhw=unmasked_mask_lat,
+                    num_channels_latents=target_c,
+                )
+                logger.info(
+                    "bidir alignment: enforced unmasked first frame in union control latent (C=%s).",
+                    target_c,
+                )
+            else:
+                logger.warning(
+                    "bidir_unmask_first_frame skipped: control channels=%s not in {3*C,4*C} (C=%s).",
+                    total_c,
+                    target_c,
+                )
         effective_first_frame_timestep_zero = bool(args.first_frame_timestep_zero)
         if (args.attention_mode == "bidirectional"
                 and effective_first_frame_timestep_zero):
