@@ -3511,6 +3511,18 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             raise RuntimeError(
                 "Bidirectional latent_model_input channel mismatch: "
                 f"got {int(latent_model_input.shape[1])}, expected {expected_hidden_channels}.")
+        latent_model_input_scaled = latent_model_input
+        if hasattr(scheduler, "scale_model_input"):
+            try:
+                latent_model_input_scaled = scheduler.scale_model_input(
+                    latent_model_input, t_cur).to(device=device, dtype=dtype)
+            except Exception as exc:
+                if step_i == 0:
+                    logger.warning(
+                        "bidir alignment: scheduler.scale_model_input failed once; fallback to raw latent_model_input. err=%s",
+                        str(exc),
+                    )
+                latent_model_input_scaled = latent_model_input
         timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
         if timestep.dim() == 2:
             expected_ts_len = int(latent_t * frame_seq_len)
@@ -3525,7 +3537,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                  attn_metadata=None,
                                  forward_batch=batch):
             control_res = controlnet(
-                hidden_states=latent_model_input,
+                hidden_states=latent_model_input_scaled,
                 encoder_hidden_states=prompt_embeds_list,
                 timestep=timestep,
                 **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
@@ -3535,7 +3547,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                                                   scale=controlnet_weight)
 
             noise_pred = transformer(
-                latent_model_input,
+                latent_model_input_scaled,
                 prompt_embeds_list,
                 timestep,
                 block_controlnet_hidden_states=control_res,
@@ -3548,7 +3560,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 # IMPORTANT: do not reuse conditional control residuals for uncond branch.
                 # Reusing cond residuals biases CFG and can cause temporal flicker/drift.
                 control_res_uncond = controlnet(
-                    hidden_states=latent_model_input,
+                    hidden_states=latent_model_input_scaled,
                     encoder_hidden_states=negative_prompt_embeds_list,
                     timestep=timestep,
                     **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
@@ -3557,7 +3569,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 control_res_uncond = _scale_control_residual(control_res_uncond,
                                                              scale=controlnet_weight)
                 noise_uncond = transformer(
-                    latent_model_input,
+                    latent_model_input_scaled,
                     negative_prompt_embeds_list,
                     timestep,
                     block_controlnet_hidden_states=control_res_uncond,
