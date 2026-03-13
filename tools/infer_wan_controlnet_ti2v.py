@@ -670,6 +670,33 @@ def _build_online_image_latent_from_rgb(
     return latent_condition_cf.unsqueeze(0)
 
 
+def _build_image_latent_from_first_frame_latent(
+    *,
+    first_frame_latent_bcfhw: torch.Tensor,
+    target_frames: int,
+) -> torch.Tensor:
+    """
+    Build a full-length TI2V image_latent in latent space only:
+    keep frame-0 latent from first_frame_latent, zero-fill the tail.
+    """
+    if first_frame_latent_bcfhw.ndim != 5:
+        raise ValueError(
+            "first_frame_latent_bcfhw must be [B,C,F,H,W], "
+            f"got shape={tuple(first_frame_latent_bcfhw.shape)}")
+    if int(first_frame_latent_bcfhw.shape[2]) != 1:
+        raise ValueError(
+            "first_frame_latent_bcfhw must have F==1, "
+            f"got shape={tuple(first_frame_latent_bcfhw.shape)}")
+    t = int(target_frames)
+    if t <= 0:
+        raise ValueError(f"target_frames must be > 0, got {t}")
+    out = first_frame_latent_bcfhw.new_zeros(
+        (first_frame_latent_bcfhw.shape[0], first_frame_latent_bcfhw.shape[1], t,
+         first_frame_latent_bcfhw.shape[3], first_frame_latent_bcfhw.shape[4]))
+    out[:, :, :1] = first_frame_latent_bcfhw[:, :, :1]
+    return out
+
+
 def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
     if lat.ndim != 4:
         raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
@@ -831,6 +858,24 @@ def _load_sample(data_path: str, index: int) -> Sample:
         name="control_latent",
     )
 
+    image_latent: torch.Tensor | None = None
+    try:
+        image_row = _read_row_by_global_index(
+            data_path,
+            index,
+            [
+                "image_latent_bytes",
+                "image_latent_shape",
+                "image_latent_dtype",
+            ],
+        )
+        if image_row.get("image_latent_bytes") is not None and image_row.get(
+                "image_latent_shape") is not None:
+            image_latent = _ensure_bcfhw(_decode_tensor(image_row, "image_latent"),
+                                         name="image_latent")
+    except Exception:
+        image_latent = None
+
     sample_id = str(row.get("id", f"index_{index:06d}"))
     caption = str(row.get("caption", ""))
     fps_val = int(row.get("fps", 30) or 30)
@@ -840,7 +885,7 @@ def _load_sample(data_path: str, index: int) -> Sample:
                   text_embedding_bld=text_embedding,
                   first_frame_latent_bcfhw=first_frame_latent,
                   control_latent_bcfhw=control_latent,
-                  image_latent_bcfhw=None)
+                  image_latent_bcfhw=image_latent)
 
 
 def _read_caption_json(path: Path, caption_key: str) -> str:
@@ -3655,6 +3700,15 @@ def main() -> None:
             "Default OFF because parquet bidirectional often works better with the built-in first_frame_latent anchor path."
         ),
     )
+    parser.add_argument(
+        "--bidir_strict_latent_align",
+        action="store_true",
+        help=(
+            "Bidirectional only. Keep alignment fully in latent space: prefer parquet image_latent; "
+            "if absent, synthesize full-length image_latent from first_frame_latent (frame0 + zero tail). "
+            "Disables conditioning-image RGB rebuild path."
+        ),
+    )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
     parser.add_argument("--raw_mask_invert", action="store_true")
     parser.add_argument("--raw_require_normal", action="store_true")
@@ -4304,9 +4358,59 @@ def main() -> None:
         logger.info("sample=%s idx=%s caption=%s", sample.sample_id, sample_idx,
                     sample.caption)
 
-        image_latent = sample.image_latent_bcfhw
-        if (image_latent is None and bool(args.use_conditioning_image_latent)
-                and str(args.conditioning_image_path).strip()):
+        prompt_embeds = sample.text_embedding_bld.to(device="cuda",
+                                                     dtype=dtype)
+        negative_prompt_embeds = None
+        if float(args.guidance_scale) != 1.0:
+            if negative_prompt_embeds_global is not None:
+                negative_prompt_embeds = negative_prompt_embeds_global
+            else:
+                # Match FastVideo training convention: unconditional prompt embedding is all-zeros.
+                negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+        first_frame_latent = sample.first_frame_latent_bcfhw.to(device="cuda",
+                                                                dtype=dtype)
+        control_latent = sample.control_latent_bcfhw.to(device="cuda",
+                                                        dtype=dtype)
+        image_latent = (sample.image_latent_bcfhw.to(device="cuda", dtype=dtype)
+                        if sample.image_latent_bcfhw is not None else None)
+
+        if (args.attention_mode == "bidirectional"
+                and bool(args.bidir_strict_latent_align)):
+            target_c = int(
+                getattr(transformer, "num_channels_latents",
+                        first_frame_latent.shape[1]))
+            target_f = int(control_latent.shape[2])
+            if image_latent is not None:
+                image_latent = _align_latent_channels(image_latent[0], target_c,
+                                                      "image_latent").unsqueeze(0)
+                if int(image_latent.shape[2]) != target_f:
+                    if int(image_latent.shape[2]) == 1:
+                        image_latent = _build_image_latent_from_first_frame_latent(
+                            first_frame_latent_bcfhw=image_latent,
+                            target_frames=target_f,
+                        )
+                    else:
+                        raise ValueError(
+                            "bidir_strict_latent_align requires image_latent F to match control F "
+                            f"(or be 1). Got image_latent F={int(image_latent.shape[2])}, "
+                            f"control F={target_f}."
+                        )
+                logger.info(
+                    "bidir strict latent align: using parquet image_latent with shape=%s",
+                    tuple(image_latent.shape),
+                )
+            else:
+                image_latent = _build_image_latent_from_first_frame_latent(
+                    first_frame_latent_bcfhw=first_frame_latent,
+                    target_frames=target_f,
+                )
+                logger.info(
+                    "bidir strict latent align: parquet has no image_latent; synthesized from first_frame_latent "
+                    "as frame0 + zero tail, shape=%s",
+                    tuple(image_latent.shape),
+                )
+        elif (image_latent is None and bool(args.use_conditioning_image_latent)
+              and str(args.conditioning_image_path).strip()):
             cond_img_path = Path(str(args.conditioning_image_path)).expanduser()
             if not cond_img_path.is_file():
                 raise FileNotFoundError(
@@ -4335,20 +4439,6 @@ def main() -> None:
                 "conditioning_image_path was provided but ignored because --use_conditioning_image_latent is OFF; "
                 "keeping parquet first_frame_latent anchor path."
             )
-
-        prompt_embeds = sample.text_embedding_bld.to(device="cuda",
-                                                     dtype=dtype)
-        negative_prompt_embeds = None
-        if float(args.guidance_scale) != 1.0:
-            if negative_prompt_embeds_global is not None:
-                negative_prompt_embeds = negative_prompt_embeds_global
-            else:
-                # Match FastVideo training convention: unconditional prompt embedding is all-zeros.
-                negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-        first_frame_latent = sample.first_frame_latent_bcfhw.to(device="cuda",
-                                                                dtype=dtype)
-        control_latent = sample.control_latent_bcfhw.to(device="cuda",
-                                                        dtype=dtype)
         if args.control_depth_only:
             total_c = int(control_latent.shape[1])
             if total_c % 3 != 0:
