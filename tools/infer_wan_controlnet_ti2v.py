@@ -474,7 +474,26 @@ def _read_depth_any(path: Path) -> np.ndarray:
             return arr.astype(np.float32)
         except Exception:
             pass
-    arr = imageio.imread(path)
+    # Avoid imageio/pyav plugin instability on some environments by preferring
+    # raster readers (OpenCV/PIL) for non-EXR depth files.
+    try:
+        import cv2
+
+        arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if arr is not None:
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            return arr.astype(np.float32)
+    except Exception:
+        pass
+    try:
+        with Image.open(path) as img:
+            arr = np.asarray(img)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read depth frame with cv2/PIL: {path}. "
+            "Please ensure depth files are valid image rasters (e.g., .png/.exr)."
+        ) from exc
     if arr.ndim == 3:
         arr = arr[..., 0]
     return arr.astype(np.float32)
@@ -495,7 +514,28 @@ def _read_normal_any(path: Path) -> np.ndarray:
             return arr.astype(np.float32)
         except Exception:
             pass
-    arr = imageio.imread(path)
+    try:
+        import cv2
+
+        arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if arr is not None:
+            if arr.ndim == 2:
+                arr = np.repeat(arr[..., None], 3, axis=2)
+            elif arr.ndim == 3 and arr.shape[2] >= 3:
+                # cv2 loads color as BGR; convert to RGB to keep downstream
+                # normal orientation consistent with existing logic.
+                arr = arr[..., :3][..., ::-1]
+            return arr.astype(np.float32)
+    except Exception:
+        pass
+    try:
+        with Image.open(path) as img:
+            arr = np.asarray(img)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read normal frame with cv2/PIL: {path}. "
+            "Please ensure normal files are valid image rasters (e.g., .png/.exr)."
+        ) from exc
     if arr.ndim == 2:
         arr = np.repeat(arr[..., None], 3, axis=2)
     elif arr.ndim == 3 and arr.shape[2] > 3:
