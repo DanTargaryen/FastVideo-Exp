@@ -4159,10 +4159,13 @@ def main() -> None:
                 "For --input_mode raw, provide --raw_sample_root or --data_path"
             )
     if str(args.attention_mode) == "bidirectional" and str(
-            args.input_mode) != "parquet":
-        raise ValueError(
-            "Bidirectional inference is locked to parquet mode in this Diff-Factory-aligned path. "
-            "Please set --input_mode parquet and provide --data_path.")
+            args.input_mode) == "raw":
+        logger.info(
+            "bidirectional + raw mode enabled (for mask/depth ablation). "
+            "raw_mask_threshold=%s raw_depth_invert=%s",
+            str(args.raw_mask_threshold),
+            bool(args.raw_depth_invert),
+        )
     if int(args.T) < 0:
         raise ValueError("--T must be >= 0")
     if int(args.T) > 0:
