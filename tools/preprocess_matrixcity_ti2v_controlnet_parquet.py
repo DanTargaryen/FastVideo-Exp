@@ -590,13 +590,28 @@ def _pick_by_target_ids(
 def _count_pair_id_mismatch(a: list[Path], b: list[Path]) -> int:
     n = min(len(a), len(b))
     bad = 0
+    direct_pairs: list[tuple[int, int]] = []
     for i in range(n):
         ia = _frame_index_from_stem(a[i].stem)
         ib = _frame_index_from_stem(b[i].stem)
         if ia is None or ib is None:
             continue
-        if int(ia) != int(ib):
+        ia_i = int(ia)
+        ib_i = int(ib)
+        direct_pairs.append((ia_i, ib_i))
+        if ia_i != ib_i:
             bad += 1
+    # Some modalities are saved with local clip indices (0..clip_len-1),
+    # while RGB/depth often use global frame ids. Treat constant-offset ids
+    # as aligned (compare relative progress within the clip).
+    if direct_pairs:
+        a0 = direct_pairs[0][0]
+        b0 = direct_pairs[0][1]
+        rel_bad = 0
+        for ia_i, ib_i in direct_pairs:
+            if (ia_i - a0) != (ib_i - b0):
+                rel_bad += 1
+        bad = min(bad, rel_bad)
     return bad
 
 
