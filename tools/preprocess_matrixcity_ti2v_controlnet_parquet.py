@@ -548,6 +548,58 @@ def _pick_indexed_files(
     return out
 
 
+def _build_numeric_file_map(files: list[Path]) -> dict[int, Path]:
+    out: dict[int, Path] = {}
+    for p in files:
+        idx = _frame_index_from_stem(p.stem)
+        if idx is not None:
+            out[int(idx)] = p
+    return out
+
+
+def _pick_by_target_ids(
+    files: dict[int, Path],
+    target_ids: list[int],
+) -> list[Path]:
+    """
+    Pick sequence frames by global target frame ids.
+    Missing ids fall back to nearest previous available id, else earliest.
+    """
+    if not files:
+        raise ValueError("Empty files map")
+    if not target_ids:
+        raise ValueError("Empty target_ids")
+    available = sorted(files.keys())
+    out: list[Path] = []
+    for tid in target_ids:
+        t = int(tid)
+        if t in files:
+            out.append(files[t])
+            continue
+        chosen = None
+        for a in reversed(available):
+            if a <= t:
+                chosen = a
+                break
+        if chosen is None:
+            chosen = available[0]
+        out.append(files[chosen])
+    return out
+
+
+def _count_pair_id_mismatch(a: list[Path], b: list[Path]) -> int:
+    n = min(len(a), len(b))
+    bad = 0
+    for i in range(n):
+        ia = _frame_index_from_stem(a[i].stem)
+        ib = _frame_index_from_stem(b[i].stem)
+        if ia is None or ib is None:
+            continue
+        if int(ia) != int(ib):
+            bad += 1
+    return bad
+
+
 def _frame_index_from_stem(stem: str) -> int | None:
     if stem.isdigit():
         return int(stem)
@@ -691,6 +743,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--street_dir", type=str, default="", help="Optional single street_dir to process (e.g. small_city_road_down_dense).")
     p.add_argument("--clip_length", type=int, default=81)
     p.add_argument("--window_len", type=int, default=243, help="Pad each window to at least this many frames by repeating last.")
+    clip_id_group = p.add_mutually_exclusive_group()
+    clip_id_group.add_argument(
+        "--use_clip_start_global_ids",
+        dest="use_clip_start_global_ids",
+        action="store_true",
+        help=(
+            "Use clip_start as global frame-id anchor: select rgb/depth/normal by "
+            "target ids [clip_start, clip_start+clip_length-1]. "
+            "This matches MatrixCity mask clip semantics and enforces cross-modality alignment."
+        ),
+    )
+    clip_id_group.add_argument(
+        "--no_use_clip_start_global_ids",
+        dest="use_clip_start_global_ids",
+        action="store_false",
+        help="Fallback to legacy window-slice behavior.",
+    )
+    p.set_defaults(use_clip_start_global_ids=True)
     p.add_argument(
         "--first_frame_source",
         type=str,
@@ -1022,47 +1092,106 @@ def main() -> None:
             depth_files_cache[depth_cache_key] = depth_files_local
         depth_files = depth_files_cache[depth_cache_key]
 
-        window_files = _slice_by_id_or_index(rgb_files, window_start, window_end)
-        if not window_files:
-            continue
-        if len(window_files) < int(args.window_len):
-            window_files = window_files + [window_files[-1]] * (int(args.window_len) - len(window_files))
+        clip_start_in_window = 0
+        target_frame_ids = [int(clip_start) + i for i in range(int(args.clip_length))]
+        window_files: list[Path] = []
+        depth_window: list[Path] = []
+
+        if bool(args.use_clip_start_global_ids):
+            rgb_map = _build_numeric_file_map(rgb_files)
+            if rgb_map:
+                rgb_paths = _pick_by_target_ids(rgb_map, target_frame_ids)
+                window_files = list(rgb_paths)
+            else:
+                # fallback to legacy slicing when RGB filenames do not carry frame ids
+                window_files = _slice_by_id_or_index(rgb_files, window_start, window_end)
+                if not window_files:
+                    continue
+                if len(window_files) < int(args.window_len):
+                    window_files = window_files + [window_files[-1]] * (int(args.window_len) - len(window_files))
+                clip_start_in_window = _resolve_clip_start_offset(
+                    window_files=window_files,
+                    clip_start=clip_start,
+                    window_start=window_start,
+                )
+                needed = clip_start_in_window + int(args.clip_length)
+                if needed > len(window_files):
+                    window_files = window_files + [window_files[-1]] * (needed - len(window_files))
+                rgb_paths = window_files[
+                    clip_start_in_window:clip_start_in_window + int(args.clip_length)
+                ]
+        else:
+            window_files = _slice_by_id_or_index(rgb_files, window_start, window_end)
+            if not window_files:
+                continue
+            if len(window_files) < int(args.window_len):
+                window_files = window_files + [window_files[-1]] * (int(args.window_len) - len(window_files))
+            clip_start_in_window = _resolve_clip_start_offset(
+                window_files=window_files,
+                clip_start=clip_start,
+                window_start=window_start,
+            )
+            needed = clip_start_in_window + int(args.clip_length)
+            if needed > len(window_files):
+                window_files = window_files + [window_files[-1]] * (needed - len(window_files))
+            rgb_paths = window_files[
+                clip_start_in_window:clip_start_in_window + int(args.clip_length)
+            ]
 
         if depth_files is not None and len(depth_files) > 0:
-            depth_window = _slice_by_id_or_index(depth_files, window_start, window_end)
-            if not depth_window:
-                depth_window = [depth_files[min(max(window_start, 0), len(depth_files) - 1)]]
-            if len(depth_window) < len(window_files):
-                depth_window = depth_window + [depth_window[-1]] * (len(window_files) - len(depth_window))
+            if bool(args.use_clip_start_global_ids):
+                depth_map = _build_numeric_file_map(depth_files)
+                if depth_map:
+                    depth_paths = _pick_by_target_ids(depth_map, target_frame_ids)
+                    depth_window = list(depth_paths)
+                else:
+                    depth_window = _slice_by_id_or_index(depth_files, window_start, window_end)
+                    if not depth_window:
+                        depth_window = [depth_files[min(max(window_start, 0), len(depth_files) - 1)]]
+                    if len(depth_window) < len(window_files):
+                        depth_window = depth_window + [depth_window[-1]] * (len(window_files) - len(depth_window))
+                    needed = clip_start_in_window + int(args.clip_length)
+                    if needed > len(depth_window):
+                        depth_window = depth_window + [depth_window[-1]] * (needed - len(depth_window))
+                    depth_paths = depth_window[
+                        clip_start_in_window:clip_start_in_window + int(args.clip_length)
+                    ]
+            else:
+                depth_window = _slice_by_id_or_index(depth_files, window_start, window_end)
+                if not depth_window:
+                    depth_window = [depth_files[min(max(window_start, 0), len(depth_files) - 1)]]
+                if len(depth_window) < len(window_files):
+                    depth_window = depth_window + [depth_window[-1]] * (len(window_files) - len(depth_window))
+                needed = clip_start_in_window + int(args.clip_length)
+                if needed > len(depth_window):
+                    depth_window = depth_window + [depth_window[-1]] * (needed - len(depth_window))
+                depth_paths = depth_window[
+                    clip_start_in_window:clip_start_in_window + int(args.clip_length)
+                ]
         else:
             # If no depth is provided, we can't build a valid union control latent; skip.
             if depth_files is not None and len(depth_files) == 0:
                 logger.warning("Empty depth dir for %s (street=%s); skip clip", clip_dir, street_name)
             continue
 
-        clip_start_in_window = _resolve_clip_start_offset(
-            window_files=window_files,
-            clip_start=clip_start,
-            window_start=window_start,
-        )
         if bool(args.debug_timing):
             logger.info(
-                "[sampling] %s window=%s clip_start=%d -> offset=%d (window_len=%d)",
+                "[sampling] %s window=%s clip_start=%d -> offset=%d (mode=%s)",
                 clip_dir,
                 window_dir.name,
                 int(clip_start),
                 int(clip_start_in_window),
-                len(window_files),
+                "global_ids" if bool(args.use_clip_start_global_ids) else "window_slice",
             )
-
-        needed = clip_start_in_window + int(args.clip_length)
-        if needed > len(window_files):
-            window_files = window_files + [window_files[-1]] * (needed - len(window_files))
-        if needed > len(depth_window):
-            depth_window = depth_window + [depth_window[-1]] * (needed - len(depth_window))
-
-        rgb_paths = window_files[clip_start_in_window:clip_start_in_window + int(args.clip_length)]
-        depth_paths = depth_window[clip_start_in_window:clip_start_in_window + int(args.clip_length)]
+        if bool(args.use_clip_start_global_ids):
+            mm_rgb_depth = _count_pair_id_mismatch(rgb_paths, depth_paths)
+            if mm_rgb_depth > 0:
+                logger.warning(
+                    "rgb-depth frame-id mismatch=%d for %s (sampled by global ids); "
+                    "this usually means missing frames in one modality.",
+                    int(mm_rgb_depth),
+                    clip_dir,
+                )
 
         mask_dir = clip_dir / "mask"
         if not mask_dir.is_dir():
@@ -1167,20 +1296,54 @@ def main() -> None:
                     nfiles = normal_seq_files_cache[nd_key]
                     if not nfiles:
                         continue
-                    normal_window = _slice_by_id_or_index(
-                        nfiles, window_start, window_end)
-                    if not normal_window:
-                        continue
-                    if len(normal_window) < len(window_files):
-                        normal_window = normal_window + [normal_window[-1]] * (
-                            len(window_files) - len(normal_window))
-                    needed_n = clip_start_in_window + int(args.clip_length)
-                    if needed_n > len(normal_window):
-                        normal_window = normal_window + [normal_window[-1]] * (
-                            needed_n - len(normal_window))
-                    normal_paths = normal_window[clip_start_in_window:clip_start_in_window +
-                                                 int(args.clip_length)]
-                    break
+                    if bool(args.use_clip_start_global_ids):
+                        n_map = _build_numeric_file_map(nfiles)
+                        if not n_map:
+                            continue
+                        normal_paths = _pick_by_target_ids(
+                            n_map,
+                            target_frame_ids,
+                        )
+                        break
+                    else:
+                        normal_window = _slice_by_id_or_index(
+                            nfiles, window_start, window_end)
+                        if not normal_window:
+                            continue
+                        if len(normal_window) < len(window_files):
+                            normal_window = normal_window + [normal_window[-1]] * (
+                                len(window_files) - len(normal_window))
+                        needed_n = clip_start_in_window + int(args.clip_length)
+                        if needed_n > len(normal_window):
+                            normal_window = normal_window + [normal_window[-1]] * (
+                                needed_n - len(normal_window))
+                        normal_paths = normal_window[clip_start_in_window:clip_start_in_window +
+                                                     int(args.clip_length)]
+                        break
+
+        mm_rgb_mask = _count_pair_id_mismatch(rgb_paths, mask_paths)
+        if mm_rgb_mask > 0:
+            logger.warning(
+                "rgb-mask frame-id mismatch=%d for %s",
+                int(mm_rgb_mask),
+                clip_dir,
+            )
+        if masked_rgb_paths is not None:
+            mm_rgb_masked = _count_pair_id_mismatch(rgb_paths, masked_rgb_paths)
+            if mm_rgb_masked > 0:
+                logger.warning(
+                    "rgb-masked_rgb frame-id mismatch=%d for %s",
+                    int(mm_rgb_masked),
+                    clip_dir,
+                )
+        if normal_paths is not None:
+            mm_rgb_normal = _count_pair_id_mismatch(rgb_paths, normal_paths)
+            if mm_rgb_normal > 0:
+                logger.warning(
+                    "rgb-normal frame-id mismatch=%d for %s",
+                    int(mm_rgb_normal),
+                    clip_dir,
+                )
 
         if bool(args.require_normal) and normal_paths is None:
             continue
