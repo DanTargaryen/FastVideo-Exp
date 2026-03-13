@@ -3369,11 +3369,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     seed: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # Keep signature stable; these args are causal-only.
+    del dmd_steps, timestep_indices, context_noise, warp_denoising_step, update_rule, full_schedule
+    del bidir_sync_first_frame_state
+
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
-    # Inference must run with eval mode; train-mode stochastic layers can
-    # introduce temporal flicker/drift in bidirectional rollout.
     transformer.eval()
     controlnet.eval()
 
@@ -3390,7 +3392,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     scheduler.set_timesteps(int(schedule_num_inference_steps), device=device)
     timesteps = scheduler.timesteps.to(device=device)
     logger.info(
-        "bidir rollout (diff-factory): num_steps=%s timesteps[0..3]=%s",
+        "bidir rollout: num_steps=%s timesteps[0..3]=%s",
         int(schedule_num_inference_steps),
         [int(x) for x in timesteps[:4].detach().cpu().tolist()],
     )
@@ -3402,24 +3404,18 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     )
 
     image_latents = None
-    first_frame_mask = torch.ones(
-        (1, 1, latent_t, latent_h, latent_w),
-        device=device,
-        dtype=torch.float32,
-    )
-    if not expand_timesteps and image_latent_bcfhw is not None:
+    if image_latent_bcfhw is not None:
         image_latents = image_latent_bcfhw.to(device=device, dtype=dtype)
     elif first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+
+    first_frame_mask = torch.ones((1, 1, latent_t, latent_h, latent_w),
+                                  device=device,
+                                  dtype=torch.float32)
+    if image_latents is not None:
         first_frame_mask[:, :, 0] = 0
-    if (not expand_timesteps) and image_latents is not None and bool(
-            first_frame_timestep_zero):
-        latents[:, :, :1] = image_latents[:, :, :1]
-    patch_size = getattr(getattr(transformer.config, "arch_config", None),
-                         "patch_size", (1, 2, 2))
-    patch_h = int(patch_size[-2])
-    patch_w = int(patch_size[-1])
-    frame_seq_len = max(1, int((latent_h * latent_w) // max(1, patch_h * patch_w)))
+
+    # Diff-Factory bidirectional non-expanded path starts from pure noise latents.
 
     expected_hidden_channels = int(
         getattr(transformer, "in_channels",
@@ -3435,21 +3431,10 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         latent_channels = int(latents.shape[1])
         image_channels = int(image_latents.shape[1])
         concat_channels = latent_channels + image_channels
-        if latent_channels == expected_hidden_channels:
-            latent_input_mode = "overwrite_first_frame"
-            logger.info(
-                "bidir alignment: using first-frame overwrite for non-expanded TI2V input "
-                "(latent_channels=%s, expected_hidden_channels=%s).",
-                latent_channels,
-                expected_hidden_channels,
-            )
-        elif concat_channels == expected_hidden_channels:
+        if concat_channels == expected_hidden_channels:
             latent_input_mode = "concat_channels"
             image_latents_concat = image_latents
             if int(image_latents_concat.shape[2]) == 1 and latent_t > 1:
-                # Diff-Factory non-expanded TI2V expects a full-length image-conditioning latent.
-                # Our parquet/raw path only stores the first latent frame, so approximate the
-                # original video-conditioned encode with zeros on later latent frames.
                 image_latents_full = torch.zeros(
                     (image_latents_concat.shape[0], image_latents_concat.shape[1],
                      latent_t, image_latents_concat.shape[3], image_latents_concat.shape[4]),
@@ -3458,16 +3443,19 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 )
                 image_latents_full[:, :, :1] = image_latents_concat
                 image_latents_concat = image_latents_full
-                logger.info(
-                    "bidir alignment: expanded first_frame_latent from F=1 to F=%s with zero tail for "
-                    "non-expanded TI2V concat input.",
-                    latent_t,
-                )
             logger.info(
-                "bidir alignment: using channel concat for non-expanded TI2V input "
+                "bidir input mode: concat_channels "
                 "(latent_channels=%s, image_channels=%s, expected_hidden_channels=%s).",
                 latent_channels,
                 image_channels,
+                expected_hidden_channels,
+            )
+        elif latent_channels == expected_hidden_channels:
+            latent_input_mode = "overwrite_first_frame"
+            logger.info(
+                "bidir input mode: overwrite_first_frame "
+                "(latent_channels=%s, expected_hidden_channels=%s).",
+                latent_channels,
                 expected_hidden_channels,
             )
         else:
@@ -3492,9 +3480,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         return latents
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
+        # Non-expanded TI2V path: scalar timestep per sample.
         if not expand_timesteps:
-            # Diff-Factory non-expanded TI2V path uses scalar timestep per sample.
             return t_cur.expand(latents.shape[0])
+        patch_size = getattr(getattr(transformer.config, "arch_config", None),
+                             "patch_size", (1, 2, 2))
+        patch_h = int(patch_size[-2])
+        patch_w = int(patch_size[-1])
         temp_ts = (first_frame_mask[0, 0] * t_cur)
         if first_frame_timestep_zero and image_latents is not None:
             temp_ts = temp_ts.clone()
@@ -3518,14 +3510,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "Bidirectional latent_model_input channel mismatch: "
                 f"got {int(latent_model_input.shape[1])}, expected {expected_hidden_channels}.")
         timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
-        if timestep.dim() == 2:
-            expected_ts_len = int(latent_t * frame_seq_len)
-            if int(timestep.shape[1]) not in (1, expected_ts_len):
-                raise RuntimeError(
-                    "Bidirectional timestep token length mismatch: "
-                    f"got {tuple(timestep.shape)}, expected second dim in {{1, {expected_ts_len}}} "
-                    f"(latent_t={latent_t}, frame_seq_len={frame_seq_len})."
-                )
 
         with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
@@ -3537,7 +3521,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
                                            num_channels_latents),
             )
-            # Align Diff-Factory union inference: keep ControlNet residual scale as-is.
+            # Diff-Factory union pipeline does not apply explicit controlnet_weight scaling
+            # in the denoising loop (keeps residual as returned by controlnet).
 
             noise_pred = transformer(
                 latent_model_input,
@@ -3550,8 +3535,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             noise_uncond = None
             control_res_uncond = None
             if float(guidance_scale) != 1.0:
-                # Diff-Factory alignment: reuse conditional ControlNet residuals
-                # for unconditional branch.
+                # Reuse conditional control residual for uncond branch.
                 control_res_uncond = control_res
                 noise_uncond = transformer(
                     latent_model_input,
@@ -3562,15 +3546,17 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 noise_pred = noise_uncond + float(guidance_scale) * (noise_pred - noise_uncond)
 
         latent_l2_before = _tensor_or_list_l2(latents)
-        latents = scheduler.step(noise_pred, t_cur, latents).prev_sample
-        if (bidir_sync_first_frame_state and (not expand_timesteps)
-                and image_latents is not None
-                and latent_input_mode == "overwrite_first_frame"):
-            # Keep latent state aligned with the same first-frame anchor path used
-            # at model input, to prevent frame0 drifting into an out-of-distribution
-            # state while still using anchored input every step.
-            anchor_state = image_latents[:, :, :1]
-            latents[:, :, :1] = anchor_state.to(device=device, dtype=dtype)
+        step_out = scheduler.step(noise_pred, t_cur, latents)
+        if hasattr(step_out, "prev_sample"):
+            latents = step_out.prev_sample
+        elif isinstance(step_out, (tuple, list)) and len(step_out) > 0:
+            latents = step_out[0]
+        elif torch.is_tensor(step_out):
+            latents = step_out
+        else:
+            raise RuntimeError(
+                f"Unsupported scheduler.step output type: {type(step_out)}")
+
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
             trace_jsonl_path,
