@@ -209,25 +209,24 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
     n = _read_normal_any(path)
     if n.ndim != 3 or n.shape[2] < 3:
         raise ValueError(f"Invalid normal shape from {path}: {tuple(n.shape)}")
-
-    # Range normalization:
-    # - EXR normals are often in [-1, 1]
-    # - PNG/JPG normals are often in [0, 255]
+    n = n[..., :3].astype(np.float32)
     finite = np.isfinite(n)
     if not finite.any():
         n = np.zeros_like(n, dtype=np.float32)
     else:
         vmin = float(np.nanmin(n))
         vmax = float(np.nanmax(n))
-        if vmin >= -1.05 and vmax <= 1.05 and (vmin < -0.05 or vmax > 1.05):
-            n = (n + 1.0) * 0.5
-        elif vmin < -0.05:
-            n = (n + 1.0) * 0.5
-        elif vmax > 1.5:
-            n = n / (65535.0 if vmax > 255.0 else 255.0)
-
-    n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
-    n = np.clip(n[..., :3], 0.0, 1.0)
+        # Match md process_normal semantics:
+        # - uint8/uint16-like [0,255]/[0,65535] -> [-1,1]
+        # - [0,1] -> [-1,1]
+        # - already [-1,1] stays as is
+        if vmax > 1.5:
+            denom = 65535.0 if vmax > 255.0 else 255.0
+            n = (n / denom) * 2.0 - 1.0
+        elif vmin >= 0.0 and vmax <= 1.05:
+            n = n * 2.0 - 1.0
+        n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=-1.0)
+        n = np.clip(n, -1.0, 1.0)
 
     # Center-crop to target aspect ratio, then bilinear resize.
     h0, w0 = n.shape[:2]
@@ -246,7 +245,11 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
     t = torch.nn.functional.interpolate(
         t, size=(int(height), int(width)), mode="bilinear", align_corners=False
     )
-    return t[0]
+    t = t[0]
+    # Match md OpenCV->OpenGL conversion.
+    t[1] = -t[1]
+    t[2] = -t[2]
+    return t
 
 
 def _load_depth_sequence(
