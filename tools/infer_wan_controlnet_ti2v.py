@@ -3372,23 +3372,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     elif first_frame_latent_bcfhw is not None:
         image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
         first_frame_mask[:, :, 0] = 0
-    first_frame_anchor_noise = None
-    if (not expand_timesteps) and image_latents is not None:
-        # R3 fix: initialize latent state with first-frame condition once, so frame0
-        # does not start from pure random noise while only being overwritten in input.
-        if bool(first_frame_timestep_zero):
-            latents[:, :, :1] = image_latents[:, :, :1]
-        elif hasattr(scheduler, "add_noise"):
-            try:
-                first_frame_anchor_noise = torch.randn_like(image_latents[:, :, :1])
-                t0 = timesteps[0:1].to(device=device, dtype=torch.float32)
-                latents[:, :, :1] = scheduler.add_noise(
-                    image_latents[:, :, :1],
-                    first_frame_anchor_noise,
-                    t0,
-                ).to(dtype=dtype)
-            except Exception:
-                first_frame_anchor_noise = None
+    if (not expand_timesteps) and image_latents is not None and bool(
+            first_frame_timestep_zero):
+        latents[:, :, :1] = image_latents[:, :, :1]
     patch_size = getattr(getattr(transformer.config, "arch_config", None),
                          "patch_size", (1, 2, 2))
     patch_h = int(patch_size[-2])
@@ -3450,7 +3436,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 f"latent_channels={latent_channels}, image_channels={image_channels}, "
                 f"expected_hidden_channels={expected_hidden_channels}.")
 
-    def _build_latent_model_input(t_cur: torch.Tensor | None = None) -> torch.Tensor:
+    def _build_latent_model_input() -> torch.Tensor:
         if expand_timesteps:
             if image_latents is None:
                 return latents
@@ -3459,21 +3445,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             return latents
         if latent_input_mode == "overwrite_first_frame":
             latent_model_input = latents.clone()
-            anchor_input = image_latents[:, :, :1]
-            # R3 fix: for non-zero first-frame timestep, inject anchor at the
-            # current denoising noise level (q(x_t|x0, eps)) to reduce mismatch.
-            if (not bool(first_frame_timestep_zero) and t_cur is not None
-                    and first_frame_anchor_noise is not None
-                    and hasattr(scheduler, "add_noise")):
-                try:
-                    anchor_input = scheduler.add_noise(
-                        image_latents[:, :, :1],
-                        first_frame_anchor_noise,
-                        t_cur.reshape(1).to(device=device, dtype=torch.float32),
-                    ).to(dtype=dtype)
-                except Exception:
-                    anchor_input = image_latents[:, :, :1]
-            latent_model_input[:, :, :1] = anchor_input
+            latent_model_input[:, :, :1] = image_latents[:, :, :1]
             return latent_model_input
         if latent_input_mode == "concat_channels":
             return torch.cat([latents, image_latents_concat], dim=1)
@@ -3481,13 +3453,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
-            if first_frame_timestep_zero and image_latents is not None:
-                timestep_frame = torch.ones((latents.shape[0], latent_t),
-                                            device=device,
-                                            dtype=torch.float32) * t_cur.to(
-                                                dtype=torch.float32)
-                timestep_frame[:, 0] = 0
-                return timestep_frame.repeat_interleave(frame_seq_len, dim=1)
+            # Diff-Factory non-expanded TI2V path uses scalar timestep per sample.
             return t_cur.expand(latents.shape[0])
         temp_ts = (first_frame_mask[0, 0] * t_cur)
         if first_frame_timestep_zero and image_latents is not None:
@@ -3505,7 +3471,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "guidance_scale != 1.0 requires negative_prompt_embeds_list."
             )
 
-        latent_model_input = _build_latent_model_input(t_cur.to(dtype=torch.float32)).to(
+        latent_model_input = _build_latent_model_input().to(
             device=device, dtype=dtype)
         if int(latent_model_input.shape[1]) != expected_hidden_channels:
             raise RuntimeError(
@@ -3531,8 +3497,7 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
                                            num_channels_latents),
             )
-            control_res = _scale_control_residual(control_res,
-                                                  scale=controlnet_weight)
+            # Align Diff-Factory union inference: keep ControlNet residual scale as-is.
 
             noise_pred = transformer(
                 latent_model_input,
@@ -3565,20 +3530,6 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             # at model input, to prevent frame0 drifting into an out-of-distribution
             # state while still using anchored input every step.
             anchor_state = image_latents[:, :, :1]
-            if (not bool(first_frame_timestep_zero)
-                    and first_frame_anchor_noise is not None
-                    and hasattr(scheduler, "add_noise")
-                    and (step_i + 1) < int(timesteps.numel())):
-                try:
-                    t_next = timesteps[step_i + 1:step_i + 2].to(
-                        device=device, dtype=torch.float32)
-                    anchor_state = scheduler.add_noise(
-                        image_latents[:, :, :1],
-                        first_frame_anchor_noise,
-                        t_next,
-                    ).to(dtype=dtype)
-                except Exception:
-                    anchor_state = image_latents[:, :, :1]
             latents[:, :, :1] = anchor_state.to(device=device, dtype=dtype)
         latent_l2_after = _tensor_or_list_l2(latents)
         _append_trace_jsonl(
@@ -3589,7 +3540,8 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "step_index": int(step_i),
                 "num_steps": int(timesteps.numel()),
                 "timestep": float(t_cur.detach().float().cpu().item()),
-                "control_scale": float(controlnet_weight),
+                "control_scale": 1.0,
+                "control_scale_requested": float(controlnet_weight),
                 "latent_l2_before": float(latent_l2_before),
                 "control_cond_l2": float(_tensor_or_list_l2(control_res)),
                 "control_uncond_l2": float(_tensor_or_list_l2(control_res_uncond)),
@@ -4206,6 +4158,11 @@ def main() -> None:
             raise ValueError(
                 "For --input_mode raw, provide --raw_sample_root or --data_path"
             )
+    if str(args.attention_mode) == "bidirectional" and str(
+            args.input_mode) != "parquet":
+        raise ValueError(
+            "Bidirectional inference is locked to parquet mode in this Diff-Factory-aligned path. "
+            "Please set --input_mode parquet and provide --data_path.")
     if int(args.T) < 0:
         raise ValueError("--T must be >= 0")
     if int(args.T) > 0:
