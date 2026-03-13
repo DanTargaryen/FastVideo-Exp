@@ -3268,6 +3268,11 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         logger.info(
             "bidir parquet mode: forcing first-frame anchor with timestep[0]=0 at every denoising step."
         )
+    patch_size = getattr(getattr(transformer.config, "arch_config", None),
+                         "patch_size", (1, 2, 2))
+    patch_h = int(patch_size[-2])
+    patch_w = int(patch_size[-1])
+    frame_seq_len = max(1, int((latent_h * latent_w) // max(1, patch_h * patch_w)))
 
     expected_hidden_channels = int(
         getattr(transformer, "in_channels",
@@ -3342,19 +3347,19 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
         if not expand_timesteps:
             if anchor_first_frame:
-                timestep = torch.ones((latents.shape[0], latent_t),
-                                      device=device,
-                                      dtype=torch.float32) * t_cur.to(
-                                          dtype=torch.float32)
-                timestep[:, 0] = 0
-                return timestep
+                timestep_frame = torch.ones((latents.shape[0], latent_t),
+                                            device=device,
+                                            dtype=torch.float32) * t_cur.to(
+                                                dtype=torch.float32)
+                timestep_frame[:, 0] = 0
+                return timestep_frame.repeat_interleave(frame_seq_len, dim=1)
             if first_frame_timestep_zero and image_latents is not None:
-                timestep = torch.ones((latents.shape[0], latent_t),
-                                      device=device,
-                                      dtype=torch.float32) * t_cur.to(
-                                          dtype=torch.float32)
-                timestep[:, 0] = 0
-                return timestep
+                timestep_frame = torch.ones((latents.shape[0], latent_t),
+                                            device=device,
+                                            dtype=torch.float32) * t_cur.to(
+                                                dtype=torch.float32)
+                timestep_frame[:, 0] = 0
+                return timestep_frame.repeat_interleave(frame_seq_len, dim=1)
             return t_cur.expand(latents.shape[0])
         temp_ts = (first_frame_mask[0, 0] * t_cur)
         if first_frame_timestep_zero and image_latents is not None:
@@ -3379,6 +3384,14 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
                 "Bidirectional latent_model_input channel mismatch: "
                 f"got {int(latent_model_input.shape[1])}, expected {expected_hidden_channels}.")
         timestep = _build_timestep_tokens(t_cur.to(dtype=torch.float32))
+        if timestep.dim() == 2:
+            expected_ts_len = int(latent_t * frame_seq_len)
+            if int(timestep.shape[1]) not in (1, expected_ts_len):
+                raise RuntimeError(
+                    "Bidirectional timestep token length mismatch: "
+                    f"got {tuple(timestep.shape)}, expected second dim in {{1, {expected_ts_len}}} "
+                    f"(latent_t={latent_t}, frame_seq_len={frame_seq_len})."
+                )
 
         with set_forward_context(current_timestep=int(step_i),
                                  attn_metadata=None,
