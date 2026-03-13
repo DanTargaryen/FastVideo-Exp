@@ -3420,6 +3420,12 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
     if (not expand_timesteps) and image_latents is not None and bool(first_frame_timestep_zero):
         latents[:, :, :1] = image_latents[:, :, :1]
 
+    patch_size = getattr(getattr(transformer.config, "arch_config", None),
+                         "patch_size", (1, 2, 2))
+    patch_h = int(patch_size[-2])
+    patch_w = int(patch_size[-1])
+    frame_seq_len = max(1, int((latent_h * latent_w) // max(1, patch_h * patch_w)))
+
     expected_hidden_channels = int(
         getattr(transformer, "in_channels",
                 getattr(transformer, "num_channels_latents", latents.shape[1])))
@@ -3483,13 +3489,15 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
         return latents
 
     def _build_timestep_tokens(t_cur: torch.Tensor) -> torch.Tensor:
-        # Non-expanded TI2V path: scalar timestep per sample.
         if not expand_timesteps:
+            if first_frame_timestep_zero and image_latents is not None:
+                timestep_frame = torch.full((latents.shape[0], latent_t),
+                                            float(t_cur.item()),
+                                            device=device,
+                                            dtype=torch.float32)
+                timestep_frame[:, 0] = 0.0
+                return timestep_frame.repeat_interleave(frame_seq_len, dim=1)
             return t_cur.expand(latents.shape[0])
-        patch_size = getattr(getattr(transformer.config, "arch_config", None),
-                             "patch_size", (1, 2, 2))
-        patch_h = int(patch_size[-2])
-        patch_w = int(patch_size[-1])
         temp_ts = (first_frame_mask[0, 0] * t_cur)
         if first_frame_timestep_zero and image_latents is not None:
             temp_ts = temp_ts.clone()
