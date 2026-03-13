@@ -859,22 +859,35 @@ def _load_sample(data_path: str, index: int) -> Sample:
     )
 
     image_latent: torch.Tensor | None = None
-    try:
-        image_row = _read_row_by_global_index(
-            data_path,
-            index,
-            [
-                "image_latent_bytes",
-                "image_latent_shape",
-                "image_latent_dtype",
-            ],
-        )
-        if image_row.get("image_latent_bytes") is not None and image_row.get(
-                "image_latent_shape") is not None:
-            image_latent = _ensure_bcfhw(_decode_tensor(image_row, "image_latent"),
+    # Prefer explicit image_latent columns. For older parquet schemas that only
+    # store vae_latent, treat vae_latent as image_latent fallback.
+    for prefix in ("image_latent", "vae_latent"):
+        try:
+            latent_row = _read_row_by_global_index(
+                data_path,
+                index,
+                [
+                    f"{prefix}_bytes",
+                    f"{prefix}_shape",
+                    f"{prefix}_dtype",
+                ],
+            )
+        except Exception:
+            continue
+        if latent_row.get(f"{prefix}_bytes") is None or latent_row.get(
+                f"{prefix}_shape") is None:
+            continue
+        try:
+            image_latent = _ensure_bcfhw(_decode_tensor(latent_row, prefix),
                                          name="image_latent")
-    except Exception:
-        image_latent = None
+            if prefix == "vae_latent":
+                logger.info(
+                    "parquet alignment: using vae_latent as image_latent fallback for sample index=%s",
+                    int(index),
+                )
+            break
+        except Exception:
+            image_latent = None
 
     sample_id = str(row.get("id", f"index_{index:06d}"))
     caption = str(row.get("caption", ""))
