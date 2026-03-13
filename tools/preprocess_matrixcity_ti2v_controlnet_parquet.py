@@ -707,6 +707,39 @@ def _resolve_clip_start_offset(
     return max(0, rel)
 
 
+def _resolve_clip_start_global_id_for_sampling(
+    *,
+    clip_start: int,
+    window_start: int,
+    window_end: int,
+) -> tuple[int, str]:
+    """
+    Resolve clip_start semantics for global-id sampling.
+
+    MatrixCity variants are inconsistent:
+    - some clips use global frame id in clip_start_XXXX
+    - some clips use window-local offset (relative to window_start)
+
+    We auto-correct local-offset cases following UniDataset MatrixCity scripts:
+    - clip_start is sampled within current window sequence (local offset),
+      then saved as clip_start_XXX.
+    - if `clip_start` is in [0, window_len), treat it as local offset and
+      convert to global id by `window_start + clip_start`.
+    - otherwise, keep it as global id.
+    """
+    cs = int(clip_start)
+    ws = int(window_start)
+    we = int(window_end)
+    window_len = max(1, int(we) - int(ws) + 1)
+    if 0 <= cs < window_len:
+        return ws + cs, "local_offset_window"
+    if cs < ws:
+        # Legacy fallback for malformed naming.
+        return ws + cs, "local_offset_legacy"
+    # keep original behavior for global-id naming
+    return cs, "global_id"
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Preprocess MatrixCity clips to TI2V+ControlNet parquet")
     p.add_argument("--model_path", type=str, required=True)
@@ -1093,7 +1126,24 @@ def main() -> None:
         depth_files = depth_files_cache[depth_cache_key]
 
         clip_start_in_window = 0
-        target_frame_ids = [int(clip_start) + i for i in range(int(args.clip_length))]
+        clip_start_global = int(clip_start)
+        clip_start_mode = "window_slice"
+        if bool(args.use_clip_start_global_ids):
+            clip_start_global, clip_start_mode = _resolve_clip_start_global_id_for_sampling(
+                clip_start=int(clip_start),
+                window_start=int(window_start),
+                window_end=int(window_end),
+            )
+            if clip_start_mode != "global_id":
+                logger.warning(
+                    "auto-fix clip_start semantics for %s: window=%s clip_start=%d -> global_start=%d (%s)",
+                    clip_dir,
+                    window_dir.name,
+                    int(clip_start),
+                    int(clip_start_global),
+                    clip_start_mode,
+                )
+        target_frame_ids = [int(clip_start_global) + i for i in range(int(args.clip_length))]
         window_files: list[Path] = []
         depth_window: list[Path] = []
 
@@ -1176,12 +1226,14 @@ def main() -> None:
 
         if bool(args.debug_timing):
             logger.info(
-                "[sampling] %s window=%s clip_start=%d -> offset=%d (mode=%s)",
+                "[sampling] %s window=%s clip_start=%d -> offset=%d (mode=%s clip_start_global=%d clip_start_mode=%s)",
                 clip_dir,
                 window_dir.name,
                 int(clip_start),
                 int(clip_start_in_window),
                 "global_ids" if bool(args.use_clip_start_global_ids) else "window_slice",
+                int(clip_start_global),
+                clip_start_mode,
             )
         if bool(args.use_clip_start_global_ids):
             mm_rgb_depth = _count_pair_id_mismatch(rgb_paths, depth_paths)
@@ -1204,7 +1256,13 @@ def main() -> None:
                     mask_files_map[idx] = p
         if not mask_files_map:
             continue
-        idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+        idx_cands = [
+            0,
+            int(clip_start),
+            int(clip_start_global),
+            int(window_start),
+            int(clip_start_in_window),
+        ]
         mask_paths = _pick_indexed_files(
             mask_files_map,
             int(args.clip_length),
@@ -1221,7 +1279,13 @@ def main() -> None:
                     if idx is not None:
                         mr_map[idx] = p
             if mr_map:
-                idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                idx_cands = [
+                    0,
+                    int(clip_start),
+                    int(clip_start_global),
+                    int(window_start),
+                    int(clip_start_in_window),
+                ]
                 masked_rgb_paths = _pick_indexed_files(
                     mr_map,
                     int(args.clip_length),
@@ -1241,7 +1305,13 @@ def main() -> None:
                     if idx is not None:
                         n_map[idx] = p
             if n_map:
-                idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                idx_cands = [
+                    0,
+                    int(clip_start),
+                    int(clip_start_global),
+                    int(window_start),
+                    int(clip_start_in_window),
+                ]
                 normal_paths = _pick_indexed_files(
                     n_map,
                     int(args.clip_length),
@@ -1266,7 +1336,13 @@ def main() -> None:
                         if idx is not None:
                             n_map[idx] = p
                 if n_map:
-                    idx_cands = [0, int(clip_start), int(window_start), int(clip_start_in_window)]
+                    idx_cands = [
+                        0,
+                        int(clip_start),
+                        int(clip_start_global),
+                        int(window_start),
+                        int(clip_start_in_window),
+                    ]
                     normal_paths = _pick_indexed_files(
                         n_map,
                         int(args.clip_length),
