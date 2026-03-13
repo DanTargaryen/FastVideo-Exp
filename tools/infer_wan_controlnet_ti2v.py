@@ -3851,6 +3851,18 @@ def main() -> None:
             "(frame0 + zero tail), even if parquet provides image_latent/vae_latent."
         ),
     )
+    parser.add_argument(
+        "--no_bidir_strict_latent_align",
+        dest="bidir_strict_latent_align",
+        action="store_false",
+        help="Disable strict latent-only alignment in bidirectional mode.",
+    )
+    parser.add_argument(
+        "--no_bidir_force_firstframe_zero_tail",
+        dest="bidir_force_firstframe_zero_tail",
+        action="store_false",
+        help="Allow bidirectional mode to use parquet image_latent/vae_latent instead of force frame0+zero-tail.",
+    )
     bidir_unmask_group = parser.add_mutually_exclusive_group()
     bidir_unmask_group.add_argument(
         "--bidir_unmask_first_frame",
@@ -3868,14 +3880,30 @@ def main() -> None:
         help="Disable bidirectional frame-0 unmask enforcement.",
     )
     parser.set_defaults(bidir_unmask_first_frame=True)
-    parser.add_argument(
+    bidir_sync_group = parser.add_mutually_exclusive_group()
+    bidir_sync_group.add_argument(
         "--bidir_sync_first_frame_state",
+        dest="bidir_sync_first_frame_state",
         action="store_true",
         help=(
             "Bidirectional only. After each denoising step, sync latent state frame0 to the same "
             "first-frame anchor trajectory used by model input (q(x_t|x0,eps) when timestep-zero is OFF). "
             "Helps reduce first-frame color drift/flicker."
         ),
+    )
+    bidir_sync_group.add_argument(
+        "--no_bidir_sync_first_frame_state",
+        dest="bidir_sync_first_frame_state",
+        action="store_false",
+        help="Disable bidirectional per-step frame0 latent state sync.",
+    )
+    parser.set_defaults(bidir_sync_first_frame_state=True)
+    # Default bidirectional behavior requested by user:
+    # 1) strict latent align + frame0/zero-tail image_latent
+    # 2) do not consume parquet image_latent/vae_latent by default
+    parser.set_defaults(
+        bidir_strict_latent_align=True,
+        bidir_force_firstframe_zero_tail=True,
     )
     parser.add_argument("--raw_mask_threshold", type=float, default=-1.0)
     parser.add_argument("--raw_mask_invert", action="store_true")
@@ -4037,6 +4065,20 @@ def main() -> None:
             "Default OFF to match FastVideo self-forcing training."
         ),
     )
+    bidir_t0_group = parser.add_mutually_exclusive_group()
+    bidir_t0_group.add_argument(
+        "--bidir_first_frame_timestep_zero",
+        dest="bidir_first_frame_timestep_zero",
+        action="store_true",
+        help="Bidirectional only. Use timestep=0 for the first latent frame (default ON).",
+    )
+    bidir_t0_group.add_argument(
+        "--no_bidir_first_frame_timestep_zero",
+        dest="bidir_first_frame_timestep_zero",
+        action="store_false",
+        help="Bidirectional only. Do not force timestep=0 on first latent frame.",
+    )
+    parser.set_defaults(bidir_first_frame_timestep_zero=True)
     parser.add_argument(
         "--first_frame_condition_mode",
         type=str,
@@ -4554,7 +4596,7 @@ def main() -> None:
                     target_frames=target_f,
                 )
                 logger.info(
-                    "bidir strict latent align: force frame0+zero-tail image_latent, shape=%s",
+                    "bidir strict latent align: force frame0+zero-tail image_latent (ignore parquet image_latent/vae_latent), shape=%s",
                     tuple(image_latent.shape),
                 )
             elif image_latent is not None:
@@ -4663,15 +4705,24 @@ def main() -> None:
                     target_c,
                 )
         effective_first_frame_timestep_zero = bool(args.first_frame_timestep_zero)
-        if (args.attention_mode == "bidirectional"
-                and effective_first_frame_timestep_zero):
+        if args.attention_mode == "bidirectional":
+            # Bidirectional default: first-frame timestep is zero.
+            # `--first_frame_timestep_zero` remains a global explicit ON switch.
+            effective_first_frame_timestep_zero = (
+                bool(args.bidir_first_frame_timestep_zero)
+                or bool(args.first_frame_timestep_zero)
+            )
             logger.info(
-                "bidir alignment: first_frame_timestep_zero=True was requested explicitly."
+                "bidir alignment: effective first_frame_timestep_zero=%s "
+                "(bidir_default=%s explicit_global=%s)",
+                bool(effective_first_frame_timestep_zero),
+                bool(args.bidir_first_frame_timestep_zero),
+                bool(args.first_frame_timestep_zero),
             )
         elif first_frame_latent is not None and not effective_first_frame_timestep_zero:
             logger.warning(
                 "TI2V alignment: first_frame_timestep_zero is OFF. "
-                "This matches the current Diff-Factory default when expand_timesteps=False."
+                "This matches the current FastVideo causal default."
             )
 
         if args.debug_dump:
