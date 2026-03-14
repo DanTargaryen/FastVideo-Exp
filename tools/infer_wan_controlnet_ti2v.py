@@ -786,6 +786,40 @@ def _build_framewise_timestep(
     return timestep
 
 
+def _prepare_first_block_image_latent_mode(
+    *,
+    transformer,
+    controlnet,
+    first_frame_latent_bcfhw: torch.Tensor | None,
+    latent_t: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, str]:
+    if first_frame_latent_bcfhw is None:
+        return None, "latents_only"
+    image_latents_full = _build_image_latent_from_first_frame_latent(
+        first_frame_latent_bcfhw=first_frame_latent_bcfhw.to(device=device,
+                                                             dtype=dtype),
+        target_frames=int(latent_t),
+    )
+    expected_hidden_channels = int(
+        getattr(transformer, "in_channels",
+                getattr(transformer, "num_channels_latents",
+                        image_latents_full.shape[1])))
+    if _is_union_controlnet(controlnet):
+        expected_hidden_channels = int(
+            getattr(controlnet, "in_channels",
+                    expected_hidden_channels * 3) // 3)
+    latent_channels = int(getattr(transformer, "num_channels_latents",
+                                  image_latents_full.shape[1]))
+    image_channels = int(image_latents_full.shape[1])
+    if latent_channels + image_channels == expected_hidden_channels:
+        return image_latents_full, "concat_channels"
+    if latent_channels == expected_hidden_channels:
+        return image_latents_full, "overwrite_first_frame"
+    return None, "latents_only"
+
+
 def _apply_unmasked_first_frame_to_union_control_latent(
     *,
     control_latent_bcfhw: torch.Tensor,
@@ -1941,6 +1975,17 @@ def _causal_dmd_rollout_one_window_with_cache(
     use_md_align = (mode == "md_align")
     image_latents = (first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                      if first_frame_latent_bcfhw is not None else None)
+    first_block_image_latents = None
+    first_block_latent_input_mode = "latents_only"
+    if use_hard_replace:
+        first_block_image_latents, first_block_latent_input_mode = _prepare_first_block_image_latent_mode(
+            transformer=transformer,
+            controlnet=controlnet,
+            first_frame_latent_bcfhw=first_frame_latent_bcfhw,
+            latent_t=latent_t,
+            dtype=dtype,
+            device=device,
+        )
 
     latent_input_mode = "latents_only"
     image_latents_concat_global = None
@@ -2044,6 +2089,15 @@ def _causal_dmd_rollout_one_window_with_cache(
                         elif latent_input_mode == "overwrite_first_frame" and start_index == 0:
                             latent_model_input = latent_model_input.clone()
                             latent_model_input[:, :, :1] = image_latents[:, :, :1]
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "concat_channels"):
+                image_chunk = first_block_image_latents[:, :, :current_num_frames]
+                latent_model_input = torch.cat([current_latents, image_chunk],
+                                               dim=1)
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "overwrite_first_frame"):
+                latent_model_input = latent_model_input.clone()
+                latent_model_input[:, :, :1] = first_block_image_latents[:, :, :1]
             elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
@@ -2242,6 +2296,14 @@ def _causal_dmd_rollout_one_window_with_cache(
                     elif latent_input_mode == "overwrite_first_frame" and start_index == 0:
                         context_bcfhw = context_bcfhw.clone()
                         context_bcfhw[:, :, :1] = image_latents[:, :, :1]
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "concat_channels"):
+                image_chunk = first_block_image_latents[:, :, :current_num_frames]
+                context_bcfhw = torch.cat([context_bcfhw, image_chunk], dim=1)
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "overwrite_first_frame"):
+                context_bcfhw = context_bcfhw.clone()
+                context_bcfhw[:, :, :1] = first_block_image_latents[:, :, :1]
             elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
@@ -2958,6 +3020,14 @@ def _causal_dmd_rollout_ti2v_controlnet(
         )
     use_hard_replace = True
     use_noise_init = False
+    first_block_image_latents, first_block_latent_input_mode = _prepare_first_block_image_latent_mode(
+        transformer=transformer,
+        controlnet=controlnet,
+        first_frame_latent_bcfhw=first_frame_latent_bcfhw,
+        latent_t=latent_t,
+        dtype=dtype,
+        device=device,
+    )
     anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
     if use_noise_init and first_frame_latent_bcfhw is not None:
         first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
@@ -3066,7 +3136,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
         def _predict_flow_at_t(t_scalar: torch.Tensor, *, step_index: int) -> torch.Tensor:
             t_scalar = t_scalar.to(dtype=torch.float32)
             latent_model_input = current_latents
-            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if (start_index == 0 and first_block_image_latents is not None
+                    and first_block_latent_input_mode == "concat_channels"):
+                image_chunk = first_block_image_latents[:, :, :current_num_frames]
+                latent_model_input = torch.cat([current_latents, image_chunk],
+                                               dim=1)
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "overwrite_first_frame"):
+                latent_model_input = latent_model_input.clone()
+                latent_model_input[:, :, :1] = first_block_image_latents[:, :, :1]
+            elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -3259,7 +3338,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
 
             context_bcfhw = context_btchw.permute(0, 2, 1, 3, 4).contiguous()
 
-            if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
+            if (start_index == 0 and first_block_image_latents is not None
+                    and first_block_latent_input_mode == "concat_channels"):
+                image_chunk = first_block_image_latents[:, :, :current_num_frames]
+                context_bcfhw = torch.cat([context_bcfhw, image_chunk], dim=1)
+            elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
                     device=device,
@@ -3268,6 +3351,10 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 first_frame_mask[:, :, :anchor_t] = 0
                 image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
                 context_bcfhw = (1 - first_frame_mask) * image_latents + first_frame_mask * context_bcfhw
+            elif (start_index == 0 and first_block_image_latents is not None
+                  and first_block_latent_input_mode == "overwrite_first_frame"):
+                context_bcfhw = context_bcfhw.clone()
+                context_bcfhw[:, :, :1] = first_block_image_latents[:, :, :1]
             elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
                 context_bcfhw[:, :, :anchor_t] = first_frame_latent_bcfhw.to(device=device,
