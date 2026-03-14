@@ -2042,7 +2042,7 @@ def _causal_dmd_rollout_one_window_with_cache(
             timestep = torch.ones((1, current_num_frames),
                                   device=device,
                                   dtype=torch.float32) * t_scalar
-            if (first_frame_timestep_zero or
+            if ((first_frame_timestep_zero and start_index == 0) or
                     (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
                 timestep = timestep.clone()
                 timestep[:, :anchor_t] = 0
@@ -3076,7 +3076,7 @@ def _causal_dmd_rollout_ti2v_controlnet(
             # overwriting `hidden_states[:, :, 0]`, but does NOT override its timestep.
             # Keep the original timestep by default; allow forcing to 0 for Diff-Factory-style
             # expand_timesteps debugging via `--first_frame_timestep_zero`.
-            if (first_frame_timestep_zero or
+            if ((first_frame_timestep_zero and start_index == 0) or
                     (use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
                 timestep = timestep.clone()
                 timestep[:, :anchor_t] = 0
