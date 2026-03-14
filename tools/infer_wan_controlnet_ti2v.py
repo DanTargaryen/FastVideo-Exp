@@ -792,6 +792,39 @@ def _apply_unmasked_first_frame_to_union_control_latent(
     return torch.cat([depth, normal, masked, mask], dim=1)
 
 
+def _apply_unmasked_first_block_to_union_control_latent(
+    *,
+    control_latent_bcfhw: torch.Tensor,
+    first_frame_latent_bcfhw: torch.Tensor,
+    unmasked_mask_latent_bcfhw: torch.Tensor,
+    num_channels_latents: int,
+    block_latent_frames: int,
+) -> torch.Tensor:
+    """
+    For causal union control latent, enforce the first latent block as "no mask":
+    - masked_latent(first block) <- repeated first_frame_latent(frame0)
+    - mask(first block) <- repeated latent(all-ones mask frame)
+    This keeps depth/normal unchanged and only strengthens the first control block.
+    """
+    depth, normal, masked, mask = _split_union_control_latent(
+        control_latent_bcfhw, int(num_channels_latents))
+    c = int(num_channels_latents)
+    block_t = max(1, min(int(block_latent_frames), int(masked.shape[2])))
+    first_lat = _align_latent_channels(first_frame_latent_bcfhw[0], c,
+                                       "first_frame_latent_for_first_block").unsqueeze(0)
+    mask_lat = _align_latent_channels(unmasked_mask_latent_bcfhw[0], c,
+                                      "unmasked_mask_latent_for_first_block").unsqueeze(0)
+    masked = masked.clone()
+    mask = mask.clone()
+    masked[:, :, :block_t] = first_lat[:, :, :1].to(
+        device=masked.device, dtype=masked.dtype).expand(-1, -1, block_t, -1, -1)
+    mask[:, :, :block_t] = mask_lat[:, :, :1].to(
+        device=mask.device, dtype=mask.dtype).expand(-1, -1, block_t, -1, -1)
+    if normal is None:
+        return torch.cat([depth, masked, mask], dim=1)
+    return torch.cat([depth, normal, masked, mask], dim=1)
+
+
 def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch.Tensor:
     if lat.ndim != 4:
         raise ValueError(f"{name} must be [C,F,H,W], got shape={tuple(lat.shape)}")
@@ -4681,6 +4714,43 @@ def main() -> None:
             else:
                 logger.warning(
                     "bidir_unmask_first_frame skipped: control channels=%s not in {3*C,4*C} (C=%s).",
+                    total_c,
+                    target_c,
+                )
+        if (args.attention_mode == "causal"
+                and _is_union_controlnet(controlnet)
+                and first_frame_latent is not None):
+            total_c = int(control_latent.shape[1])
+            target_c = int(getattr(transformer, "num_channels_latents",
+                                   first_frame_latent.shape[1]))
+            if total_c in (3 * target_c, 4 * target_c):
+                unmasked_mask_lat = _build_unmasked_mask_latent_from_ones(
+                    vae=vae,
+                    height=int(args.height),
+                    width=int(args.width),
+                    target_c=target_c,
+                    inference_device=inference_device,
+                    compute_dtype=dtype,
+                )
+                block_latent_frames = int(
+                    getattr(getattr(transformer.config, "arch_config", None),
+                            "num_frames_per_block", 1))
+                control_latent = _apply_unmasked_first_block_to_union_control_latent(
+                    control_latent_bcfhw=control_latent,
+                    first_frame_latent_bcfhw=first_frame_latent,
+                    unmasked_mask_latent_bcfhw=unmasked_mask_lat,
+                    num_channels_latents=target_c,
+                    block_latent_frames=block_latent_frames,
+                )
+                logger.info(
+                    "causal alignment: enforced unmasked first control block in union control latent "
+                    "(block_latent_frames=%s, C=%s).",
+                    block_latent_frames,
+                    target_c,
+                )
+            else:
+                logger.warning(
+                    "causal first-block unmask skipped: control channels=%s not in {3*C,4*C} (C=%s).",
                     total_c,
                     target_c,
                 )
