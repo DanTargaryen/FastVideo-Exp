@@ -764,6 +764,28 @@ def _build_unmasked_mask_latent_from_ones(
     return ones_lat_cf.unsqueeze(0)
 
 
+def _build_framewise_timestep(
+    *,
+    batch_size: int,
+    num_frames: int,
+    t_scalar: torch.Tensor | float,
+    device: torch.device,
+    anchor_t: int = 0,
+    zero_anchor: bool = False,
+) -> torch.Tensor:
+    if isinstance(t_scalar, torch.Tensor):
+        t_value = float(t_scalar.detach().float().item())
+    else:
+        t_value = float(t_scalar)
+    timestep = torch.full((int(batch_size), int(num_frames)),
+                          t_value,
+                          device=device,
+                          dtype=torch.float32)
+    if bool(zero_anchor) and int(anchor_t) > 0:
+        timestep[:, :int(anchor_t)] = 0.0
+    return timestep
+
+
 def _apply_unmasked_first_frame_to_union_control_latent(
     *,
     control_latent_bcfhw: torch.Tensor,
@@ -787,39 +809,6 @@ def _apply_unmasked_first_frame_to_union_control_latent(
     mask = mask.clone()
     masked[:, :, :1] = first_lat[:, :, :1].to(device=masked.device, dtype=masked.dtype)
     mask[:, :, :1] = mask_lat[:, :, :1].to(device=mask.device, dtype=mask.dtype)
-    if normal is None:
-        return torch.cat([depth, masked, mask], dim=1)
-    return torch.cat([depth, normal, masked, mask], dim=1)
-
-
-def _apply_unmasked_first_block_to_union_control_latent(
-    *,
-    control_latent_bcfhw: torch.Tensor,
-    first_frame_latent_bcfhw: torch.Tensor,
-    unmasked_mask_latent_bcfhw: torch.Tensor,
-    num_channels_latents: int,
-    block_latent_frames: int,
-) -> torch.Tensor:
-    """
-    For causal union control latent, enforce the first latent block as "no mask":
-    - masked_latent(first block) <- repeated first_frame_latent(frame0)
-    - mask(first block) <- repeated latent(all-ones mask frame)
-    This keeps depth/normal unchanged and only strengthens the first control block.
-    """
-    depth, normal, masked, mask = _split_union_control_latent(
-        control_latent_bcfhw, int(num_channels_latents))
-    c = int(num_channels_latents)
-    block_t = max(1, min(int(block_latent_frames), int(masked.shape[2])))
-    first_lat = _align_latent_channels(first_frame_latent_bcfhw[0], c,
-                                       "first_frame_latent_for_first_block").unsqueeze(0)
-    mask_lat = _align_latent_channels(unmasked_mask_latent_bcfhw[0], c,
-                                      "unmasked_mask_latent_for_first_block").unsqueeze(0)
-    masked = masked.clone()
-    mask = mask.clone()
-    masked[:, :, :block_t] = first_lat[:, :, :1].to(
-        device=masked.device, dtype=masked.dtype).expand(-1, -1, block_t, -1, -1)
-    mask[:, :, :block_t] = mask_lat[:, :, :1].to(
-        device=mask.device, dtype=mask.dtype).expand(-1, -1, block_t, -1, -1)
     if normal is None:
         return torch.cat([depth, masked, mask], dim=1)
     return torch.cat([depth, normal, masked, mask], dim=1)
@@ -2072,13 +2061,17 @@ def _causal_dmd_rollout_one_window_with_cache(
                 latent_model_input[:, :, :anchor_t] = anchor_lat
             latent_model_input = latent_model_input.to(dtype=dtype)
 
-            timestep = torch.ones((1, current_num_frames),
-                                  device=device,
-                                  dtype=torch.float32) * t_scalar
-            if ((first_frame_timestep_zero and start_index == 0) or
-                    (expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
-                timestep = timestep.clone()
-                timestep[:, :anchor_t] = 0
+            zero_anchor = ((first_frame_timestep_zero and start_index == 0) or
+                           (expand_timesteps and first_frame_latent_bcfhw is not None
+                            and start_index == 0))
+            timestep = _build_framewise_timestep(
+                batch_size=current_latents.shape[0],
+                num_frames=current_num_frames,
+                t_scalar=t_scalar,
+                device=device,
+                anchor_t=anchor_t,
+                zero_anchor=zero_anchor,
+            )
 
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
@@ -2119,22 +2112,11 @@ def _causal_dmd_rollout_one_window_with_cache(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        control_res_uncond = controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=negative_prompt_embeds_list,
-                            timestep=timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache_uncond,
-                            crossattn_cache=control_crossattn_cache_uncond,
-                            current_start=current_start_abs,
-                            start_frame=start_frame_abs,
-                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_uncond,
+                            block_controlnet_hidden_states=control_res_cond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=current_start_abs,
@@ -2161,12 +2143,16 @@ def _causal_dmd_rollout_one_window_with_cache(
                 noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
                 pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
 
-                timestep = torch.ones((1, current_num_frames),
-                                      device=device,
-                                      dtype=torch.float32) * t_cur
-                if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
-                    timestep = timestep.clone()
-                    timestep[:, :anchor_t] = 0
+                timestep = _build_framewise_timestep(
+                    batch_size=current_latents.shape[0],
+                    num_frames=current_num_frames,
+                    t_scalar=t_cur,
+                    device=device,
+                    anchor_t=anchor_t,
+                    zero_anchor=(first_frame_timestep_zero
+                                 and first_frame_latent_bcfhw is not None
+                                 and start_index == 0),
+                )
 
                 denoised_pred = pred_noise_to_pred_video(
                     pred_noise=pred_flow_btchw.flatten(0, 1),
@@ -2213,11 +2199,16 @@ def _causal_dmd_rollout_one_window_with_cache(
 
         if not disable_cache_update:
             context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-            context_timestep = torch.ones((1, current_num_frames),
-                                          device=device,
-                                          dtype=torch.float32) * float(context_noise)
+            context_timestep = _build_framewise_timestep(
+                batch_size=current_latents.shape[0],
+                num_frames=current_num_frames,
+                t_scalar=float(context_noise),
+                device=device,
+                anchor_t=0,
+                zero_anchor=False,
+            )
             if float(context_noise) <= 0.0:
-                context_timestep = context_timestep.zero_()
+                context_timestep.zero_()
             else:
                 if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
                     schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
@@ -2302,22 +2293,11 @@ def _causal_dmd_rollout_one_window_with_cache(
                         raise ValueError(
                             "guidance_scale != 1.0 requires unconditional embeddings and caches."
                         )
-                    control_res_ctx_uncond = controlnet(
-                        hidden_states=context_bcfhw,
-                        encoder_hidden_states=negative_prompt_embeds_list,
-                        timestep=context_timestep,
-                        **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                   num_channels_latents),
-                        kv_cache=control_kv_cache_uncond,
-                        crossattn_cache=control_crossattn_cache_uncond,
-                        current_start=current_start_abs,
-                        start_frame=start_frame_abs,
-                    )
                     _ = transformer(
                         context_bcfhw,
                         negative_prompt_embeds_list,
                         context_timestep,
-                        block_controlnet_hidden_states=control_res_ctx_uncond,
+                        block_controlnet_hidden_states=control_res_ctx,
                         kv_cache=kv_cache_uncond,
                         crossattn_cache=crossattn_cache_uncond,
                         current_start=current_start_abs,
@@ -3101,18 +3081,17 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     -1, -1, anchor_t, -1, -1)
             latent_model_input = latent_model_input.to(dtype=dtype)
 
-            timestep = torch.ones((1, current_num_frames),
-                                  device=device,
-                                  dtype=torch.float32) * t_scalar
-            # IMPORTANT (training alignment):
-            # In FastVideo self-forcing training, TI2V enforces the first latent frame by
-            # overwriting `hidden_states[:, :, 0]`, but does NOT override its timestep.
-            # Keep the original timestep by default; allow forcing to 0 for Diff-Factory-style
-            # expand_timesteps debugging via `--first_frame_timestep_zero`.
-            if ((first_frame_timestep_zero and start_index == 0) or
-                    (use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0)):
-                timestep = timestep.clone()
-                timestep[:, :anchor_t] = 0
+            zero_anchor = ((first_frame_timestep_zero and start_index == 0) or
+                           (use_hard_replace and expand_timesteps
+                            and first_frame_latent_bcfhw is not None and start_index == 0))
+            timestep = _build_framewise_timestep(
+                batch_size=current_latents.shape[0],
+                num_frames=current_num_frames,
+                t_scalar=t_scalar,
+                device=device,
+                anchor_t=anchor_t,
+                zero_anchor=zero_anchor,
+            )
 
             with torch.autocast(device_type="cuda",
                                 dtype=dtype,
@@ -3148,22 +3127,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        control_res_uncond = controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=negative_prompt_embeds_list,
-                            timestep=timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache_uncond,
-                            crossattn_cache=control_crossattn_cache_uncond,
-                            current_start=start_index * frame_seq_length,
-                            start_frame=start_index,
-                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_uncond,
+                            block_controlnet_hidden_states=control_res_cond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=start_index * frame_seq_length,
@@ -3193,12 +3161,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
                 noisy_input_bfchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
                 pred_flow_btchw = _predict_flow_at_t(t_cur, step_index=step_i)
 
-                timestep = torch.ones((1, current_num_frames),
-                                      device=device,
-                                      dtype=torch.float32) * t_cur
-                if first_frame_timestep_zero and first_frame_latent_bcfhw is not None and start_index == 0:
-                    timestep = timestep.clone()
-                    timestep[:, :anchor_t] = 0
+                timestep = _build_framewise_timestep(
+                    batch_size=current_latents.shape[0],
+                    num_frames=current_num_frames,
+                    t_scalar=t_cur,
+                    device=device,
+                    anchor_t=anchor_t,
+                    zero_anchor=(first_frame_timestep_zero
+                                 and first_frame_latent_bcfhw is not None
+                                 and start_index == 0),
+                )
 
                 denoised_pred = pred_noise_to_pred_video(
                     pred_noise=pred_flow_btchw.flatten(0, 1),
@@ -3260,11 +3232,16 @@ def _causal_dmd_rollout_ti2v_controlnet(
             # Cache update with optional context noise (Self-Forcing style): add context noise then forward once to
             # commit KV cache for the next chunk.
             context_btchw = current_latents.permute(0, 2, 1, 3, 4).contiguous()
-            context_timestep = torch.ones((1, current_num_frames),
-                                          device=device,
-                                          dtype=torch.float32) * float(context_noise)
+            context_timestep = _build_framewise_timestep(
+                batch_size=current_latents.shape[0],
+                num_frames=current_num_frames,
+                t_scalar=float(context_noise),
+                device=device,
+                anchor_t=0,
+                zero_anchor=False,
+            )
             if float(context_noise) <= 0.0:
-                context_timestep = context_timestep.zero_()
+                context_timestep.zero_()
             else:
                 if hasattr(scheduler, "timesteps") and scheduler.timesteps is not None and scheduler.timesteps.numel() > 0:
                     schedule_ts = scheduler.timesteps.to(device=device, dtype=context_timestep.dtype)
@@ -3329,22 +3306,11 @@ def _causal_dmd_rollout_ti2v_controlnet(
                         raise ValueError(
                             "guidance_scale != 1.0 requires negative_prompt_embeds_list."
                         )
-                    control_res_ctx_uncond = controlnet(
-                        hidden_states=context_bcfhw,
-                        encoder_hidden_states=negative_prompt_embeds_list,
-                        timestep=context_timestep,
-                        **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                   num_channels_latents),
-                        kv_cache=control_kv_cache_uncond,
-                        crossattn_cache=control_crossattn_cache_uncond,
-                        current_start=start_index * frame_seq_length,
-                        start_frame=start_index,
-                    )
                     _ = transformer(
                         context_bcfhw,
                         negative_prompt_embeds_list,
                         context_timestep,
-                        block_controlnet_hidden_states=control_res_ctx_uncond,
+                        block_controlnet_hidden_states=control_res_ctx,
                         kv_cache=kv_cache_uncond,
                         crossattn_cache=crossattn_cache_uncond,
                         current_start=start_index * frame_seq_length,
@@ -4714,43 +4680,6 @@ def main() -> None:
             else:
                 logger.warning(
                     "bidir_unmask_first_frame skipped: control channels=%s not in {3*C,4*C} (C=%s).",
-                    total_c,
-                    target_c,
-                )
-        if (args.attention_mode == "causal"
-                and _is_union_controlnet(controlnet)
-                and first_frame_latent is not None):
-            total_c = int(control_latent.shape[1])
-            target_c = int(getattr(transformer, "num_channels_latents",
-                                   first_frame_latent.shape[1]))
-            if total_c in (3 * target_c, 4 * target_c):
-                unmasked_mask_lat = _build_unmasked_mask_latent_from_ones(
-                    vae=vae,
-                    height=int(args.height),
-                    width=int(args.width),
-                    target_c=target_c,
-                    inference_device=inference_device,
-                    compute_dtype=dtype,
-                )
-                block_latent_frames = int(
-                    getattr(getattr(transformer.config, "arch_config", None),
-                            "num_frames_per_block", 1))
-                control_latent = _apply_unmasked_first_block_to_union_control_latent(
-                    control_latent_bcfhw=control_latent,
-                    first_frame_latent_bcfhw=first_frame_latent,
-                    unmasked_mask_latent_bcfhw=unmasked_mask_lat,
-                    num_channels_latents=target_c,
-                    block_latent_frames=block_latent_frames,
-                )
-                logger.info(
-                    "causal alignment: enforced unmasked first control block in union control latent "
-                    "(block_latent_frames=%s, C=%s).",
-                    block_latent_frames,
-                    target_c,
-                )
-            else:
-                logger.warning(
-                    "causal first-block unmask skipped: control channels=%s not in {3*C,4*C} (C=%s).",
                     total_c,
                     target_c,
                 )
