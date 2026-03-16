@@ -138,6 +138,6 @@ wandb_run_name: wan_controlnet_self_forcing_phase2
 wandb_mode: online
 
 # At each checkpoint save, decode the current student "clean" latent prediction and log/save an mp4.
-checkpoint_preview: true
+checkpoint_preview: false
 checkpoint_preview_fps: 16
 checkpoint_preview_max_frames: 0
