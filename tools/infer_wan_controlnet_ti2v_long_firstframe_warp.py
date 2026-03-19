@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +61,53 @@ class RawLongSequenceNoMask:
     crop_params: tuple[int, int, int, int]
 
 
+class _GlobalVoxelVisibilityMap:
+
+    def __init__(self, voxel_size: float = 0.1) -> None:
+        self.voxel_size = float(voxel_size)
+        self.voxel_vis: dict[tuple[int, int, int], set[int]] = defaultdict(set)
+
+    def points_to_voxels(self, points_world: base.np.ndarray) -> set[tuple[int, int, int]]:
+        if int(points_world.shape[0]) == 0:
+            return set()
+        voxels = base.np.floor(points_world / float(self.voxel_size)).astype(base.np.int32)
+        return set(map(tuple, voxels.tolist()))
+
+    def add_view(self, frame_idx: int, points_world: base.np.ndarray) -> None:
+        voxels = self.points_to_voxels(points_world)
+        for voxel in voxels:
+            self.voxel_vis[voxel].add(int(frame_idx))
+
+    def query_top_k_complementary_views(
+        self,
+        *,
+        target_voxels: set[tuple[int, int, int]],
+        k: int,
+        valid_history_ids: set[int] | None = None,
+    ) -> list[int]:
+        remaining_voxels = set(target_voxels)
+        selected_views: list[int] = []
+        for _ in range(int(k)):
+            view_counts: dict[int, int] = defaultdict(int)
+            for voxel in remaining_voxels:
+                for frame_idx in self.voxel_vis.get(voxel, ()):
+                    if valid_history_ids is not None and int(frame_idx) not in valid_history_ids:
+                        continue
+                    if int(frame_idx) in selected_views:
+                        continue
+                    view_counts[int(frame_idx)] += 1
+            if not view_counts:
+                break
+            best_view = max(view_counts, key=view_counts.get)
+            selected_views.append(int(best_view))
+            covered = {
+                voxel for voxel in remaining_voxels
+                if int(best_view) in self.voxel_vis.get(voxel, ())
+            }
+            remaining_voxels -= covered
+        return selected_views
+
+
 def _pad_paths(paths: list[Path], target_len: int) -> list[Path]:
     if len(paths) >= target_len:
         return list(paths[:target_len])
@@ -82,6 +130,191 @@ def _compute_num_windows(total_frames: int, window_frames: int, overlap_frames: 
         return 1
     stride = window_frames - overlap_frames
     return 1 + int(math.ceil(float(total_frames - window_frames) / float(stride)))
+
+
+def _chw_float_to_u8(x_chw: torch.Tensor) -> base.np.ndarray:
+    return (
+        x_chw.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0
+    ).round().astype(base.np.uint8)
+
+
+def _select_keyframes_for_next_window(
+    *,
+    sequence: RawLongSequenceNoMask,
+    visibility_map: _GlobalVoxelVisibilityMap,
+    processed_frame_ids: set[int],
+    history_rgbs_u8: dict[int, base.np.ndarray],
+    target_frame_ids_for_chunk: list[int],
+    depth_path_by_id: dict[int, Path],
+    target_height: int,
+    target_width: int,
+    last_frame_id: int,
+    num_keyframes: int,
+    num_target_samples: int,
+) -> list[int]:
+    if int(last_frame_id) not in history_rgbs_u8:
+        raise KeyError(f"Missing RGB history for overlap frame {int(last_frame_id)}")
+
+    warper = base._PointCloudWarper()
+    target_voxels: set[tuple[int, int, int]] = set()
+    if target_frame_ids_for_chunk:
+        sample_n = max(1, min(int(num_target_samples), len(target_frame_ids_for_chunk)))
+        sample_positions = base.np.linspace(
+            0, len(target_frame_ids_for_chunk) - 1, num=sample_n, dtype=int
+        ).tolist()
+        sampled_ids = [int(target_frame_ids_for_chunk[i]) for i in sample_positions]
+        dummy_rgb = base.np.zeros((int(target_height), int(target_width), 3), dtype=base.np.uint8)
+        for tgt_id in sampled_ids:
+            tgt_depth = base._aligned_physical_depth(
+                depth_path_by_id[int(tgt_id)],
+                sequence.crop_params,
+                int(target_width),
+                int(target_height),
+            )
+            tgt_rt = base._load_camera_matrix(
+                base._resolve_camera_rt_path(sequence.camera_rt_dir, int(tgt_id))
+            )
+            points_world, _ = warper.back_project(
+                dummy_rgb, tgt_depth, sequence.camera_k_aligned, tgt_rt
+            )
+            target_voxels.update(visibility_map.points_to_voxels(points_world))
+
+    k_query = max(0, int(num_keyframes) - 1)
+    best_keys = visibility_map.query_top_k_complementary_views(
+        target_voxels=target_voxels,
+        k=k_query,
+        valid_history_ids=processed_frame_ids,
+    )
+    selected = [int(fid) for fid in best_keys if int(fid) != int(last_frame_id)]
+
+    if len(selected) < k_query:
+        recent_candidates = sorted(
+            [int(fid) for fid in processed_frame_ids if int(fid) != int(last_frame_id)],
+            reverse=True,
+        )
+        for fid in recent_candidates:
+            if fid in selected or fid not in history_rgbs_u8:
+                continue
+            selected.append(fid)
+            if len(selected) >= k_query:
+                break
+
+    selected = selected[:k_query]
+    selected.append(int(last_frame_id))
+    return selected
+
+
+def _update_history_and_visibility(
+    *,
+    sequence: RawLongSequenceNoMask,
+    frame_ids: list[int],
+    frames_tchw: torch.Tensor,
+    history_rgbs_u8: dict[int, base.np.ndarray],
+    processed_frame_ids: set[int],
+    visibility_map: _GlobalVoxelVisibilityMap,
+) -> None:
+    warper = base._PointCloudWarper()
+    H = int(frames_tchw.shape[-2])
+    W = int(frames_tchw.shape[-1])
+    frame_id_to_depth_path = {int(fid): p for fid, p in zip(sequence.frame_ids, sequence.depth_paths)}
+    for local_idx, frame_id in enumerate(frame_ids):
+        frame_id = int(frame_id)
+        rgb_u8 = _chw_float_to_u8(frames_tchw[local_idx])
+        history_rgbs_u8[frame_id] = rgb_u8
+        processed_frame_ids.add(frame_id)
+        depth_path = frame_id_to_depth_path.get(frame_id)
+        if depth_path is None:
+            continue
+        depth_aligned = base._aligned_physical_depth(
+            depth_path,
+            sequence.crop_params,
+            W,
+            H,
+        )
+        rt = base._load_camera_matrix(base._resolve_camera_rt_path(sequence.camera_rt_dir, frame_id))
+        points_world, _ = warper.back_project(rgb_u8, depth_aligned, sequence.camera_k_aligned, rt)
+        visibility_map.add_view(frame_id, points_world)
+
+
+def _warp_maskrgb_from_keyframes_md_aligned(
+    *,
+    keyframe_rgbs_u8: list[base.np.ndarray],
+    keyframe_frame_ids: list[int],
+    target_frame_ids: list[int],
+    depth_path_by_frame_id: dict[int, Path],
+    camera_k_aligned: base.np.ndarray,
+    camera_rt_dir: Path,
+    crop_params: tuple[int, int, int, int],
+    target_height: int,
+    target_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Align the warp kernel to run_wan_controlnet_union_long_w_selection.md:
+    - each source keyframe is independently back-projected and projected
+    - per-target results are merged in keyframe order
+    - mask is a hard visibility union over all warped sources
+    """
+    warper = base._PointCloudWarper()
+    source_clouds: list[tuple[base.np.ndarray, base.np.ndarray]] = []
+    for src_rgb, src_id in zip(keyframe_rgbs_u8, keyframe_frame_ids):
+        if int(src_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for source frame id {int(src_id)}")
+        src_depth = base._aligned_physical_depth(
+            depth_path_by_frame_id[int(src_id)],
+            crop_params,
+            int(target_width),
+            int(target_height),
+        )
+        src_rt = base._load_camera_matrix(
+            base._resolve_camera_rt_path(camera_rt_dir, int(src_id))
+        )
+        points_world, colors = warper.back_project(
+            src_rgb,
+            src_depth,
+            camera_k_aligned,
+            src_rt,
+        )
+        source_clouds.append((points_world, colors))
+
+    merged_rgb_tensors: list[torch.Tensor] = []
+    merged_mask_tensors: list[torch.Tensor] = []
+    for tgt_id in target_frame_ids:
+        if int(tgt_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for target frame id {int(tgt_id)}")
+        tgt_rt = base._load_camera_matrix(
+            base._resolve_camera_rt_path(camera_rt_dir, int(tgt_id))
+        )
+        tgt_depth = base._aligned_physical_depth(
+            depth_path_by_frame_id[int(tgt_id)],
+            crop_params,
+            int(target_width),
+            int(target_height),
+        )
+
+        merged_rgb = base.np.zeros((int(target_height), int(target_width), 3), dtype=base.np.uint8)
+        merged_mask = base.np.zeros((int(target_height), int(target_width)), dtype=base.np.uint8)
+        for points_world, colors in source_clouds:
+            w_rgb, w_mask = warper.project_to_view(
+                points_world,
+                colors,
+                camera_k_aligned,
+                tgt_rt,
+                int(target_height),
+                int(target_width),
+                target_depth=tgt_depth,
+            )
+            valid_area = w_mask > 127.5
+            merged_rgb[valid_area] = w_rgb[valid_area]
+            merged_mask[valid_area] = 255
+
+        merged_rgb_tensors.append(
+            torch.from_numpy(merged_rgb.astype(base.np.float32) / 255.0).permute(2, 0, 1).contiguous()
+        )
+        merged_mask_tensors.append(
+            torch.from_numpy((merged_mask > 127.5).astype(base.np.float32))[None, ...].contiguous()
+        )
+
+    return torch.stack(merged_rgb_tensors, dim=0), torch.stack(merged_mask_tensors, dim=0)
 
 
 def _load_raw_long_sequence_nomask(
@@ -244,6 +477,9 @@ def _run_long_rollout_firstframe_warp(
     depth_path_by_id = {int(fid): p for fid, p in zip(sequence.frame_ids, sequence.depth_paths)}
     final_tchw = torch.empty((total_required, 3, H, W), dtype=torch.float32)
     write_ptr = 0
+    history_rgbs_u8: dict[int, base.np.ndarray] = {}
+    processed_frame_ids: set[int] = set()
+    visibility_map = _GlobalVoxelVisibilityMap(voxel_size=float(args.selection_voxel_size))
 
     carry_keyframes_tchw: torch.Tensor | None = None
     carry_keyframe_ids: list[int] | None = None
@@ -299,7 +535,7 @@ def _run_long_rollout_firstframe_warp(
             ).round().astype(base.np.uint8)
             target_ids = sequence.frame_ids[start_pos + 1:end_pos_valid]
             if len(target_ids) > 0:
-                warped_masked_rgb_valid, warped_mask_valid = base._warp_maskrgb_from_keyframes(
+                warped_masked_rgb_valid, warped_mask_valid = _warp_maskrgb_from_keyframes_md_aligned(
                     keyframe_rgbs_u8=[first_rgb_u8],
                     keyframe_frame_ids=[int(sequence.frame_ids[0])],
                     target_frame_ids=target_ids,
@@ -530,24 +766,58 @@ def _run_long_rollout_firstframe_warp(
         final_tchw[write_ptr:write_ptr + write_count] = write_frames
         write_ptr += write_count
 
+        current_frame_ids = [int(fid) for fid in sequence.frame_ids[start_pos:end_pos_valid]]
+        _update_history_and_visibility(
+            sequence=sequence,
+            frame_ids=current_frame_ids,
+            frames_tchw=decoded_window_tchw[:valid_window],
+            history_rgbs_u8=history_rgbs_u8,
+            processed_frame_ids=processed_frame_ids,
+            visibility_map=visibility_map,
+        )
+
         if win_idx < num_windows - 1:
-            keyframe_count = min(4, int(valid_window))
-            tail = decoded_window_tchw[valid_window - keyframe_count:valid_window].contiguous()
-            carry_keyframes_tchw = tail
-            carry_keyframe_ids = [
-                int(fid) for fid in sequence.frame_ids[end_pos_valid - keyframe_count:end_pos_valid]
+            last_frame_id = int(sequence.frame_ids[end_pos_valid - 1])
+
+            next_chunk_start = max(0, int(end_pos_valid - overlap_frames))
+            next_chunk_end = min(next_chunk_start + window_frames, total_required)
+            target_frame_ids_for_chunk = [
+                int(fid) for fid in sequence.frame_ids[next_chunk_start:next_chunk_end]
             ]
+            selected_keyframe_ids = _select_keyframes_for_next_window(
+                sequence=sequence,
+                visibility_map=visibility_map,
+                processed_frame_ids=processed_frame_ids,
+                history_rgbs_u8=history_rgbs_u8,
+                target_frame_ids_for_chunk=target_frame_ids_for_chunk,
+                depth_path_by_id=depth_path_by_id,
+                target_height=H,
+                target_width=W,
+                last_frame_id=last_frame_id,
+                num_keyframes=int(args.warp_num_keyframes),
+                num_target_samples=int(args.selection_num_target_samples),
+            )
+            logger.info(
+                "window=%s next_chunk_start=%s selected_keyframes=%s",
+                int(win_idx),
+                int(next_chunk_start),
+                [int(x) for x in selected_keyframe_ids],
+            )
+            keyframe_rgbs_u8 = [history_rgbs_u8[int(fid)] for fid in selected_keyframe_ids]
+            carry_keyframe_ids = [int(fid) for fid in selected_keyframe_ids]
+            carry_keyframes_tchw = torch.stack(
+                [
+                    torch.from_numpy(rgb.astype(base.np.float32) / 255.0).permute(2, 0, 1).contiguous()
+                    for rgb in keyframe_rgbs_u8
+                ],
+                dim=0,
+            )
 
             next_start = int(end_pos_valid)
             next_valid_new = min(stride, total_required - next_start)
             target_ids_next = sequence.frame_ids[next_start:next_start + next_valid_new]
 
-            keyframe_rgbs_u8 = []
-            for k in range(int(carry_keyframes_tchw.shape[0])):
-                frame = carry_keyframes_tchw[k].permute(1, 2, 0).clamp(0, 1).numpy()
-                keyframe_rgbs_u8.append((frame * 255.0).round().astype(base.np.uint8))
-
-            warped_masked_rgb_next_valid, warped_mask_next_valid = base._warp_maskrgb_from_keyframes(
+            warped_masked_rgb_next_valid, warped_mask_next_valid = _warp_maskrgb_from_keyframes_md_aligned(
                 keyframe_rgbs_u8=keyframe_rgbs_u8,
                 keyframe_frame_ids=carry_keyframe_ids,
                 target_frame_ids=target_ids_next,
@@ -610,6 +880,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--causal_overlap_frames", type=int, default=1)
     p.add_argument("--local_attn_size", type=int, default=21)
     p.add_argument("--sink_size", type=int, default=1)
+    p.add_argument("--warp_num_keyframes", type=int, default=4)
+    p.add_argument("--selection_num_target_samples", type=int, default=3)
+    p.add_argument("--selection_voxel_size", type=float, default=0.1)
     p.add_argument("--context_noise", type=int, default=0)
     p.add_argument("--disable_cache_update", action="store_true")
     p.add_argument("--first_frame_timestep_zero", action="store_true")
