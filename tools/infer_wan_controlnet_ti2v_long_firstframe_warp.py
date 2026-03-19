@@ -273,6 +273,18 @@ def _run_long_rollout_firstframe_warp(
         if valid_window <= 0:
             break
         end_pos_valid = int(start_pos + valid_window)
+        window_first_rgb = global_first_rgb if win_idx == 0 else carry_keyframe_tchw[0]
+        window_first_frame_latent = (
+            global_first_frame_latent
+            if win_idx == 0
+            else base._encode_first_frame_latent(
+                vae=vae,
+                first_rgb_chw=window_first_rgb,
+                target_c=target_c,
+                inference_device=inference_device,
+                compute_dtype=dtype,
+            ).to(device="cuda", dtype=dtype)
+        )
 
         depth_window_paths = _pad_paths(sequence.depth_paths[start_pos:end_pos_valid], window_frames)
         if sequence.normal_paths is not None:
@@ -447,7 +459,7 @@ def _run_long_rollout_firstframe_warp(
                 [negative_prompt_embeds] if negative_prompt_embeds is not None else None
             ),
             guidance_scale=float(args.guidance_scale),
-            first_frame_latent_bcfhw=global_first_frame_latent,
+            first_frame_latent_bcfhw=window_first_frame_latent,
             control_latent_bcfhw=control_latent,
             num_frames=window_frames,
             schedule_num_inference_steps=int(args.schedule_num_inference_steps),
@@ -480,10 +492,10 @@ def _run_long_rollout_firstframe_warp(
 
         decoded_window = decoding.decode(latents, fastvideo_args).cpu().float()
         decoded_window_tchw = decoded_window[0].permute(1, 0, 2, 3).contiguous()
+        decoded_window_tchw = decoded_window_tchw.clone()
+        if condition_mode == "hard_replace":
+            decoded_window_tchw[0] = window_first_rgb
         if win_idx == 0:
-            decoded_window_tchw = decoded_window_tchw.clone()
-            if condition_mode == "hard_replace":
-                decoded_window_tchw[0] = global_first_rgb
             blend_frames = int(max(0, int(args.first_frame_blend_frames)))
             if blend_frames > 0:
                 n_blend = min(blend_frames, int(window_frames) - 1)
