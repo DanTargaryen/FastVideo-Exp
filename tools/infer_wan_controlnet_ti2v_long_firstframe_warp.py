@@ -6,9 +6,11 @@ Long causal TI2V + ControlNet inference with online warp-generated mask/masked_r
 Behavior:
 - First window: use only frame0 RGB as the source keyframe and warp to the first
   `causal_window_frames` targets. Frame0 itself is forced visible.
-- Later windows: use the decoded last `causal_overlap_frames` frames from the
-  previous window, warp them to the next `window-overlap` targets, and combine
-  them with the overlapped decoded tail as control.
+- Later windows: use only the decoded last frame from the previous window as the
+  source keyframe. The next window has a 1-frame visual overlap:
+  `[source_frame] + [warped next 80 frames]` for an 81-frame window.
+- Temporal continuity is carried by both the 1-frame visual overlap and the
+  causal KV-cache.
 
 This keeps the rollout semantics aligned with long causal inference while
 removing the dependency on precomputed mask/masked_rgb clips.
@@ -208,6 +210,10 @@ def _run_long_rollout_firstframe_warp(
     total_required = int(args.num_frames)
     window_frames = int(args.causal_window_frames)
     overlap_frames = int(args.causal_overlap_frames)
+    if overlap_frames != 1:
+        raise ValueError(
+            f"This script currently expects causal_overlap_frames=1, got {overlap_frames}"
+        )
     stride = int(window_frames - overlap_frames)
     num_windows = _compute_num_windows(total_required, window_frames, overlap_frames)
 
@@ -238,8 +244,8 @@ def _run_long_rollout_firstframe_warp(
     final_tchw = torch.empty((total_required, 3, H, W), dtype=torch.float32)
     write_ptr = 0
 
-    carry_keyframes_tchw: torch.Tensor | None = None
-    carry_keyframe_ids: list[int] | None = None
+    carry_keyframe_tchw: torch.Tensor | None = None
+    carry_keyframe_id: int | None = None
     warped_masked_rgb_next: torch.Tensor | None = None
     warped_mask_next: torch.Tensor | None = None
 
@@ -297,18 +303,25 @@ def _run_long_rollout_firstframe_warp(
             mask_tchw[0] = 1.0
             masked_rgb_tchw[0] = global_first_rgb
         else:
-            if (carry_keyframes_tchw is None or carry_keyframe_ids is None or
-                    warped_masked_rgb_next is None or warped_mask_next is None):
+            if (
+                carry_keyframe_tchw is None
+                or carry_keyframe_id is None
+                or warped_masked_rgb_next is None
+                or warped_mask_next is None
+            ):
                 raise RuntimeError("Missing carry-over warp state for window > 0")
             mask_tchw = torch.cat(
                 [
-                    torch.ones((overlap_frames, 1, H, W), dtype=torch.float32),
+                    torch.ones((1, 1, H, W), dtype=torch.float32),
                     warped_mask_next,
                 ],
                 dim=0,
             )
             masked_rgb_tchw = torch.cat(
-                [carry_keyframes_tchw, warped_masked_rgb_next],
+                [
+                    carry_keyframe_tchw,
+                    warped_masked_rgb_next,
+                ],
                 dim=0,
             )
 
@@ -479,6 +492,7 @@ def _run_long_rollout_firstframe_warp(
                     decoded_window_tchw[k] = alpha * global_first_rgb + (
                         1.0 - alpha
                     ) * decoded_window_tchw[k]
+        if win_idx == 0:
             write_frames = decoded_window_tchw[:valid_window]
         else:
             valid_new = max(0, valid_window - overlap_frames)
@@ -489,22 +503,20 @@ def _run_long_rollout_firstframe_warp(
         write_ptr += write_count
 
         if win_idx < num_windows - 1:
-            tail = decoded_window_tchw[-overlap_frames:].contiguous()
-            carry_keyframes_tchw = tail
-            carry_keyframe_ids = sequence.frame_ids[max(0, end_pos_valid - overlap_frames):end_pos_valid]
+            tail = decoded_window_tchw[valid_window - 1:valid_window].contiguous()
+            carry_keyframe_tchw = tail
+            carry_keyframe_id = int(sequence.frame_ids[end_pos_valid - 1])
 
-            next_start = int(start_pos + window_frames)
+            next_start = int(end_pos_valid)
             next_valid_new = min(stride, total_required - next_start)
             target_ids_next = sequence.frame_ids[next_start:next_start + next_valid_new]
 
-            keyframe_rgbs_u8 = []
-            for k in range(overlap_frames):
-                frame = tail[k].permute(1, 2, 0).clamp(0, 1).numpy()
-                keyframe_rgbs_u8.append((frame * 255.0).round().astype(base.np.uint8))
+            frame = carry_keyframe_tchw[0].permute(1, 2, 0).clamp(0, 1).numpy()
+            keyframe_rgbs_u8 = [(frame * 255.0).round().astype(base.np.uint8)]
 
             warped_masked_rgb_next_valid, warped_mask_next_valid = base._warp_maskrgb_from_keyframes(
                 keyframe_rgbs_u8=keyframe_rgbs_u8,
-                keyframe_frame_ids=carry_keyframe_ids,
+                keyframe_frame_ids=[carry_keyframe_id],
                 target_frame_ids=target_ids_next,
                 depth_path_by_frame_id=depth_path_by_id,
                 camera_k_aligned=sequence.camera_k_aligned,
@@ -549,7 +561,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--scheduler", choices=["flowmatch_euler", "unipc"], default="flowmatch_euler")
     p.add_argument("--schedule_num_inference_steps", type=int, default=50)
-    p.add_argument("--timestep_indices", type=str, default="0,12,24,36")
+    p.add_argument("--timestep_indices", type=str, default="")
     p.add_argument("--dmd_steps", type=str, default="1000,750,500,250")
     p.add_argument("--update_rule", choices=["renoise_x0", "euler_dt"], default="renoise_x0")
     p.add_argument("--full_schedule", action="store_true")
@@ -562,7 +574,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--num_frames", type=int, required=True)
     p.add_argument("--causal_window_frames", type=int, default=45)
-    p.add_argument("--causal_overlap_frames", type=int, default=4)
+    p.add_argument("--causal_overlap_frames", type=int, default=1)
     p.add_argument("--local_attn_size", type=int, default=21)
     p.add_argument("--sink_size", type=int, default=1)
     p.add_argument("--context_noise", type=int, default=0)
@@ -582,8 +594,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if int(args.causal_overlap_frames) <= 0 or int(args.causal_overlap_frames) >= int(args.causal_window_frames):
-        raise ValueError("causal_overlap_frames must be >0 and smaller than causal_window_frames")
+    if int(args.causal_overlap_frames) < 0 or int(args.causal_overlap_frames) >= int(args.causal_window_frames):
+        raise ValueError("causal_overlap_frames must be >=0 and smaller than causal_window_frames")
 
     base._ensure_single_process_dist_env()
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", "TORCH_SDPA")
