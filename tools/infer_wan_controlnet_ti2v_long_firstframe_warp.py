@@ -369,6 +369,24 @@ def _load_raw_long_sequence_nomask(
         )
 
     rgb_paths = rgb_all[:total_required]
+    rgb_zero = rgb_dir / "rgb_0000.png"
+    if rgb_zero.is_file():
+        zero_idx = next((i for i, p in enumerate(rgb_paths) if p == rgb_zero), None)
+        if zero_idx is not None and zero_idx != 0:
+            rgb_paths = [rgb_zero] + [p for p in rgb_paths if p != rgb_zero]
+        elif zero_idx is None:
+            logger.warning(
+                "rgb_0000.png exists under %s but fell outside the first %s sorted frames; forcing it as first-frame anchor.",
+                rgb_dir,
+                total_required,
+            )
+            rgb_paths = [rgb_zero] + rgb_paths[:-1]
+    elif rgb_paths:
+        logger.warning(
+            "rgb_0000.png not found under %s; fallback to first sorted rgb frame %s.",
+            rgb_dir,
+            rgb_paths[0].name,
+        )
     depth_paths = depth_all[:total_required]
     frame_ids = base._extract_frame_ids(depth_paths, name="depth")
     normal_paths = normal_all[:total_required] if normal_all is not None else None
