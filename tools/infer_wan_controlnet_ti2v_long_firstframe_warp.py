@@ -100,11 +100,17 @@ def _load_raw_long_sequence_nomask(
     if not depth_dir.is_dir():
         raise FileNotFoundError(f"raw depth dir not found: {depth_dir}")
 
-    rgb_all = base._sorted_files(rgb_dir, (".png",))
-    depth_all = base._sorted_files(depth_dir, (".png",))
+    rgb_all = base._sorted_files(
+        rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    )
+    depth_all = base._sorted_files(
+        depth_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
+    )
     normal_all: list[Path] | None = None
     if normal_dir.is_dir():
-        nfiles = base._sorted_files(normal_dir, (".png", ".exr"))
+        nfiles = base._sorted_files(
+            normal_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr")
+        )
         if nfiles:
             normal_all = nfiles
     if bool(args.raw_require_normal) and normal_all is None:
