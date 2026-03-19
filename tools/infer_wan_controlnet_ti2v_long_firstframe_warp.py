@@ -7,8 +7,9 @@ Behavior:
 - First window: use only frame0 RGB as the source keyframe and warp to the first
   `causal_window_frames` targets. Frame0 itself is forced visible.
 - Later windows: keep a 1-frame visual overlap. The overlap frame is inherited
-  directly from the previous chunk output, while the following 80 frames are
-  warped from the previous chunk's last 4 generated frames and merged.
+  directly from the previous chunk output, while the remaining
+  `causal_window_frames - 1` frames are warped from the previous chunk's last
+  4 generated frames and merged.
 - Temporal continuity is carried by the overlap frame, multi-keyframe warp, and
   the causal KV-cache.
 
