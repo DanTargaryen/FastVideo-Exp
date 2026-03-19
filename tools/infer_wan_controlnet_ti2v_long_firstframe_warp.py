@@ -6,11 +6,11 @@ Long causal TI2V + ControlNet inference with online warp-generated mask/masked_r
 Behavior:
 - First window: use only frame0 RGB as the source keyframe and warp to the first
   `causal_window_frames` targets. Frame0 itself is forced visible.
-- Later windows: use only the decoded last frame from the previous window as the
-  source keyframe. The next window has a 1-frame visual overlap:
-  `[source_frame] + [warped next 80 frames]` for an 81-frame window.
-- Temporal continuity is carried by both the 1-frame visual overlap and the
-  causal KV-cache.
+- Later windows: keep a 1-frame visual overlap. The overlap frame is inherited
+  directly from the previous chunk output, while the following 80 frames are
+  warped from the previous chunk's last 4 generated frames and merged.
+- Temporal continuity is carried by the overlap frame, multi-keyframe warp, and
+  the causal KV-cache.
 
 This keeps the rollout semantics aligned with long causal inference while
 removing the dependency on precomputed mask/masked_rgb clips.
@@ -244,8 +244,8 @@ def _run_long_rollout_firstframe_warp(
     final_tchw = torch.empty((total_required, 3, H, W), dtype=torch.float32)
     write_ptr = 0
 
-    carry_keyframe_tchw: torch.Tensor | None = None
-    carry_keyframe_id: int | None = None
+    carry_keyframes_tchw: torch.Tensor | None = None
+    carry_keyframe_ids: list[int] | None = None
     warped_masked_rgb_next: torch.Tensor | None = None
     warped_mask_next: torch.Tensor | None = None
 
@@ -273,7 +273,7 @@ def _run_long_rollout_firstframe_warp(
         if valid_window <= 0:
             break
         end_pos_valid = int(start_pos + valid_window)
-        window_first_rgb = global_first_rgb if win_idx == 0 else carry_keyframe_tchw[0]
+        window_first_rgb = global_first_rgb if win_idx == 0 else carry_keyframes_tchw[-1]
         window_first_frame_latent = (
             global_first_frame_latent
             if win_idx == 0
@@ -296,28 +296,43 @@ def _run_long_rollout_firstframe_warp(
             first_rgb_u8 = (
                 global_first_rgb.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0
             ).round().astype(base.np.uint8)
-            target_ids = sequence.frame_ids[start_pos:end_pos_valid]
-            warped_masked_rgb, warped_mask = base._warp_maskrgb_from_keyframes(
-                keyframe_rgbs_u8=[first_rgb_u8],
-                keyframe_frame_ids=[int(sequence.frame_ids[0])],
-                target_frame_ids=target_ids,
-                depth_path_by_frame_id=depth_path_by_id,
-                camera_k_aligned=sequence.camera_k_aligned,
-                camera_rt_dir=sequence.camera_rt_dir,
-                crop_params=sequence.crop_params,
-                target_height=H,
-                target_width=W,
+            target_ids = sequence.frame_ids[start_pos + 1:end_pos_valid]
+            if len(target_ids) > 0:
+                warped_masked_rgb_valid, warped_mask_valid = base._warp_maskrgb_from_keyframes(
+                    keyframe_rgbs_u8=[first_rgb_u8],
+                    keyframe_frame_ids=[int(sequence.frame_ids[0])],
+                    target_frame_ids=target_ids,
+                    depth_path_by_frame_id=depth_path_by_id,
+                    camera_k_aligned=sequence.camera_k_aligned,
+                    camera_rt_dir=sequence.camera_rt_dir,
+                    crop_params=sequence.crop_params,
+                    target_height=H,
+                    target_width=W,
+                )
+            else:
+                warped_masked_rgb_valid = torch.empty((0, 3, H, W), dtype=torch.float32)
+                warped_mask_valid = torch.empty((0, 1, H, W), dtype=torch.float32)
+
+            warped_masked_rgb = _pad_tchw(warped_masked_rgb_valid, max(window_frames - 1, 1))
+            warped_mask = _pad_tchw(warped_mask_valid, max(window_frames - 1, 1))
+            mask_tchw = torch.cat(
+                [
+                    torch.ones((1, 1, H, W), dtype=torch.float32),
+                    warped_mask[:max(window_frames - 1, 0)],
+                ],
+                dim=0,
             )
-            warped_masked_rgb = _pad_tchw(warped_masked_rgb, window_frames)
-            warped_mask = _pad_tchw(warped_mask, window_frames)
-            mask_tchw = warped_mask.clone()
-            masked_rgb_tchw = warped_masked_rgb.clone()
-            mask_tchw[0] = 1.0
-            masked_rgb_tchw[0] = global_first_rgb
+            masked_rgb_tchw = torch.cat(
+                [
+                    global_first_rgb.unsqueeze(0),
+                    warped_masked_rgb[:max(window_frames - 1, 0)],
+                ],
+                dim=0,
+            )
         else:
             if (
-                carry_keyframe_tchw is None
-                or carry_keyframe_id is None
+                carry_keyframes_tchw is None
+                or carry_keyframe_ids is None
                 or warped_masked_rgb_next is None
                 or warped_mask_next is None
             ):
@@ -331,7 +346,7 @@ def _run_long_rollout_firstframe_warp(
             )
             masked_rgb_tchw = torch.cat(
                 [
-                    carry_keyframe_tchw,
+                    carry_keyframes_tchw[-1:],
                     warped_masked_rgb_next,
                 ],
                 dim=0,
@@ -515,20 +530,25 @@ def _run_long_rollout_firstframe_warp(
         write_ptr += write_count
 
         if win_idx < num_windows - 1:
-            tail = decoded_window_tchw[valid_window - 1:valid_window].contiguous()
-            carry_keyframe_tchw = tail
-            carry_keyframe_id = int(sequence.frame_ids[end_pos_valid - 1])
+            keyframe_count = min(4, int(valid_window))
+            tail = decoded_window_tchw[valid_window - keyframe_count:valid_window].contiguous()
+            carry_keyframes_tchw = tail
+            carry_keyframe_ids = [
+                int(fid) for fid in sequence.frame_ids[end_pos_valid - keyframe_count:end_pos_valid]
+            ]
 
             next_start = int(end_pos_valid)
             next_valid_new = min(stride, total_required - next_start)
             target_ids_next = sequence.frame_ids[next_start:next_start + next_valid_new]
 
-            frame = carry_keyframe_tchw[0].permute(1, 2, 0).clamp(0, 1).numpy()
-            keyframe_rgbs_u8 = [(frame * 255.0).round().astype(base.np.uint8)]
+            keyframe_rgbs_u8 = []
+            for k in range(int(carry_keyframes_tchw.shape[0])):
+                frame = carry_keyframes_tchw[k].permute(1, 2, 0).clamp(0, 1).numpy()
+                keyframe_rgbs_u8.append((frame * 255.0).round().astype(base.np.uint8))
 
             warped_masked_rgb_next_valid, warped_mask_next_valid = base._warp_maskrgb_from_keyframes(
                 keyframe_rgbs_u8=keyframe_rgbs_u8,
-                keyframe_frame_ids=[carry_keyframe_id],
+                keyframe_frame_ids=carry_keyframe_ids,
                 target_frame_ids=target_ids_next,
                 depth_path_by_frame_id=depth_path_by_id,
                 camera_k_aligned=sequence.camera_k_aligned,
