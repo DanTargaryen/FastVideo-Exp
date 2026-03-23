@@ -138,6 +138,56 @@ def _chw_float_to_u8(x_chw: torch.Tensor) -> base.np.ndarray:
     ).round().astype(base.np.uint8)
 
 
+def _vis_bcthw_from_tchw(
+    x_tchw: torch.Tensor,
+    *,
+    value_range: str,
+) -> torch.Tensor:
+    x = x_tchw.detach().cpu().float()
+    if value_range == "minus1_1":
+        x = (x.clamp(-1, 1) + 1.0) * 0.5
+    elif value_range == "0_1":
+        x = x.clamp(0, 1)
+    else:
+        raise ValueError(f"Unsupported value_range: {value_range}")
+    if int(x.shape[1]) == 1:
+        x = x.repeat(1, 3, 1, 1)
+    return x.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+
+
+def _save_control_outputs(
+    *,
+    out_dir: Path,
+    sample_id: str,
+    fps: int,
+    depth_tchw: torch.Tensor,
+    normal_tchw: torch.Tensor | None,
+    mask_tchw: torch.Tensor,
+    masked_rgb_tchw: torch.Tensor,
+    save_frames: bool,
+) -> None:
+    control_dir = out_dir / "control_outputs"
+    control_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[tuple[str, torch.Tensor, str]] = [
+        ("depth", depth_tchw, "minus1_1"),
+        ("mask", mask_tchw, "0_1"),
+        ("masked_rgb", masked_rgb_tchw, "0_1"),
+    ]
+    if normal_tchw is not None:
+        outputs.append(("normal", normal_tchw, "minus1_1"))
+
+    for name, x_tchw, value_range in outputs:
+        vis_bcthw = _vis_bcthw_from_tchw(x_tchw, value_range=value_range)
+        base._save_mp4(vis_bcthw, str(control_dir / f"{sample_id}_{name}.mp4"), fps=fps)
+        if save_frames:
+            base._save_frames_png(
+                vis_bcthw,
+                str(control_dir / f"frames_{name}"),
+                prefix=f"{sample_id}_{name}",
+            )
+
+
 def _select_keyframes_for_next_window(
     *,
     sequence: RawLongSequenceNoMask,
@@ -450,7 +500,7 @@ def _run_long_rollout_firstframe_warp(
     inference_device: torch.device,
     dmd_steps_list: list[int] | None,
     timestep_indices_list: list[int] | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
     condition_mode = str(args.first_frame_condition_mode).lower()
     if condition_mode == "md_align":
         logger.warning(
@@ -494,6 +544,15 @@ def _run_long_rollout_firstframe_warp(
 
     depth_path_by_id = {int(fid): p for fid, p in zip(sequence.frame_ids, sequence.depth_paths)}
     final_tchw = torch.empty((total_required, 3, H, W), dtype=torch.float32)
+    saved_controls: dict[str, torch.Tensor] | None = None
+    if bool(args.save_control_outputs):
+        saved_controls = {
+            "depth": torch.empty((total_required, 1, H, W), dtype=torch.float32),
+            "mask": torch.empty((total_required, 1, H, W), dtype=torch.float32),
+            "masked_rgb": torch.empty((total_required, 3, H, W), dtype=torch.float32),
+        }
+        if sequence.normal_paths is not None:
+            saved_controls["normal"] = torch.empty((total_required, 3, H, W), dtype=torch.float32)
     write_ptr = 0
     history_rgbs_u8: dict[int, base.np.ndarray] = {}
     processed_frame_ids: set[int] = set()
@@ -776,12 +835,30 @@ def _run_long_rollout_firstframe_warp(
                     ) * decoded_window_tchw[k]
         if win_idx == 0:
             write_frames = decoded_window_tchw[:valid_window]
+            depth_write = depth_tchw[:valid_window]
+            mask_write = mask_tchw[:valid_window]
+            masked_rgb_write = masked_rgb_tchw[:valid_window]
+            normal_write = normal_tchw[:valid_window] if normal_tchw is not None else None
         else:
             valid_new = max(0, valid_window - overlap_frames)
             write_frames = decoded_window_tchw[overlap_frames:overlap_frames + valid_new]
+            depth_write = depth_tchw[overlap_frames:overlap_frames + valid_new]
+            mask_write = mask_tchw[overlap_frames:overlap_frames + valid_new]
+            masked_rgb_write = masked_rgb_tchw[overlap_frames:overlap_frames + valid_new]
+            normal_write = (
+                normal_tchw[overlap_frames:overlap_frames + valid_new]
+                if normal_tchw is not None
+                else None
+            )
 
         write_count = int(write_frames.shape[0])
         final_tchw[write_ptr:write_ptr + write_count] = write_frames
+        if saved_controls is not None:
+            saved_controls["depth"][write_ptr:write_ptr + write_count] = depth_write.cpu().float()
+            saved_controls["mask"][write_ptr:write_ptr + write_count] = mask_write.cpu().float()
+            saved_controls["masked_rgb"][write_ptr:write_ptr + write_count] = masked_rgb_write.cpu().float()
+            if "normal" in saved_controls and normal_write is not None:
+                saved_controls["normal"][write_ptr:write_ptr + write_count] = normal_write.cpu().float()
         write_ptr += write_count
 
         current_frame_ids = [int(fid) for fid in sequence.frame_ids[start_pos:end_pos_valid]]
@@ -851,7 +928,7 @@ def _run_long_rollout_firstframe_warp(
 
     if write_ptr != total_required:
         raise RuntimeError(f"Final frame count mismatch: wrote {write_ptr}, expected {total_required}")
-    return final_tchw.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+    return final_tchw.permute(1, 0, 2, 3).unsqueeze(0).contiguous(), saved_controls
 
 
 def parse_args() -> argparse.Namespace:
@@ -912,6 +989,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--save_frames", action="store_true")
+    p.add_argument("--save_control_outputs", action="store_true")
     p.set_defaults(raw_depth_invert=False)
     return p.parse_args()
 
@@ -1039,7 +1117,7 @@ def main() -> None:
         int(args.causal_overlap_frames),
     )
 
-    decoded = _run_long_rollout_firstframe_warp(
+    decoded, saved_controls = _run_long_rollout_firstframe_warp(
         sequence=sequence,
         args=args,
         transformer=transformer,
@@ -1060,6 +1138,17 @@ def main() -> None:
     base._save_mp4(decoded, out_path, fps=int(sequence.fps))
     if bool(args.save_frames):
         base._save_frames_png(decoded, str(out_dir / "frames" / sequence.sample_id), prefix=sequence.sample_id)
+    if saved_controls is not None:
+        _save_control_outputs(
+            out_dir=out_dir,
+            sample_id=sequence.sample_id,
+            fps=int(sequence.fps),
+            depth_tchw=saved_controls["depth"],
+            normal_tchw=saved_controls.get("normal"),
+            mask_tchw=saved_controls["mask"],
+            masked_rgb_tchw=saved_controls["masked_rgb"],
+            save_frames=bool(args.save_frames),
+        )
     logger.info("saved: %s", out_path)
 
 
