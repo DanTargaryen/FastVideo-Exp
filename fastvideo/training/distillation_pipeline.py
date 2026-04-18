@@ -57,6 +57,17 @@ def _to_log_scalar(value: Any) -> float:
     return float(value)
 
 
+def _safe_nonnegative_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0
+        value = value.reshape(-1)[0].item()
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class DistillationPipeline(TrainingPipeline):
     """
     A distillation pipeline for training a 3 step model.
@@ -1603,6 +1614,12 @@ class DistillationPipeline(TrainingPipeline):
         self.train_loader_iter = iter(self.train_dataloader)
 
         step_times: deque[float] = deque(maxlen=100)
+        training_state_ckpt_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "training_state_checkpointing_steps", 0))
+        weight_only_ckpt_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "weight_only_checkpointing_steps", 0))
+        validation_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "validation_steps", 0))
 
         self._log_training_info()
         self._log_validation(self.transformer, self.training_args,
@@ -1743,9 +1760,8 @@ class DistillationPipeline(TrainingPipeline):
                 self.tracker.log(log_data, step)
 
             # Save training state checkpoint (for resuming training)
-            if (self.training_args.training_state_checkpointing_steps > 0
-                    and step %
-                    self.training_args.training_state_checkpointing_steps == 0):
+            if (training_state_ckpt_steps > 0
+                    and step % training_state_ckpt_steps == 0):
                 print("rank", self.global_rank,
                       "save training state checkpoint at step", step)
                 save_distillation_checkpoint(
@@ -1787,9 +1803,7 @@ class DistillationPipeline(TrainingPipeline):
                 self.sp_group.barrier()
 
             # Save weight-only checkpoint
-            if (self.training_args.weight_only_checkpointing_steps > 0
-                    and step %
-                    self.training_args.weight_only_checkpointing_steps == 0):
+            if weight_only_ckpt_steps > 0 and step % weight_only_ckpt_steps == 0:
                 print("rank", self.global_rank,
                       "save weight-only checkpoint at step", step)
                 save_distillation_checkpoint(
@@ -1823,7 +1837,8 @@ class DistillationPipeline(TrainingPipeline):
                 if self.training_args.use_ema and self.is_ema_ready():
                     self.save_ema_weights(self.training_args.output_dir, step)
 
-            if self.training_args.log_validation and step % self.training_args.validation_steps == 0:
+            if (self.training_args.log_validation and validation_steps > 0
+                    and step % validation_steps == 0):
                 if self.training_args.log_visualization:
                     self.visualize_intermediate_latents(training_batch,
                                                         self.training_args,
@@ -1832,38 +1847,45 @@ class DistillationPipeline(TrainingPipeline):
 
         self.tracker.finish()
 
-        # Save final training state checkpoint
-        print("rank", self.global_rank,
-              "save final training state checkpoint at step",
-              self.training_args.max_train_steps)
-        save_distillation_checkpoint(
-            self.transformer,
-            self.fake_score_transformer,
-            self.global_rank,
-            self.training_args.output_dir,
-            self.training_args.max_train_steps,
-            self.optimizer,
-            self.fake_score_optimizer,
-            self.train_dataloader,
-            self.lr_scheduler,
-            self.fake_score_lr_scheduler,
-            self.noise_random_generator,
-            self.generator_ema,
-            generator_controlnet=getattr(self, "controlnet", None),
-            fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
-            # MoE support
-            generator_transformer_2=getattr(self, 'transformer_2', None),
-            real_score_transformer_2=getattr(self, 'real_score_transformer_2',
-                                             None),
-            fake_score_transformer_2=getattr(self, 'fake_score_transformer_2',
-                                             None),
-            generator_optimizer_2=getattr(self, 'optimizer_2', None),
-            fake_score_optimizer_2=getattr(self, 'fake_score_optimizer_2',
-                                           None),
-            generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
-            fake_score_scheduler_2=getattr(self, 'fake_score_lr_scheduler_2',
-                                           None),
-            generator_ema_2=getattr(self, 'generator_ema_2', None))
+        if training_state_ckpt_steps > 0:
+            # Save final training state checkpoint only when full-state
+            # checkpointing is explicitly enabled.
+            print("rank", self.global_rank,
+                  "save final training state checkpoint at step",
+                  self.training_args.max_train_steps)
+            save_distillation_checkpoint(
+                self.transformer,
+                self.fake_score_transformer,
+                self.global_rank,
+                self.training_args.output_dir,
+                self.training_args.max_train_steps,
+                self.optimizer,
+                self.fake_score_optimizer,
+                self.train_dataloader,
+                self.lr_scheduler,
+                self.fake_score_lr_scheduler,
+                self.noise_random_generator,
+                self.generator_ema,
+                generator_controlnet=getattr(self, "controlnet", None),
+                fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
+                # MoE support
+                generator_transformer_2=getattr(self, 'transformer_2', None),
+                real_score_transformer_2=getattr(self, 'real_score_transformer_2',
+                                                 None),
+                fake_score_transformer_2=getattr(self, 'fake_score_transformer_2',
+                                                 None),
+                generator_optimizer_2=getattr(self, 'optimizer_2', None),
+                fake_score_optimizer_2=getattr(self, 'fake_score_optimizer_2',
+                                               None),
+                generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
+                fake_score_scheduler_2=getattr(self, 'fake_score_lr_scheduler_2',
+                                               None),
+                generator_ema_2=getattr(self, 'generator_ema_2', None))
+        else:
+            logger.info(
+                "Skipping final training-state checkpoint because training_state_checkpointing_steps=%s",
+                training_state_ckpt_steps,
+            )
 
         if self.training_args.use_ema and self.is_ema_ready():
             self.save_ema_weights(self.training_args.output_dir,

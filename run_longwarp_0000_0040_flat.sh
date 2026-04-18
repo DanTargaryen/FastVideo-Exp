@@ -8,7 +8,7 @@ MODEL=/vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 AR_CKPT=/vePFS-buaa/linming/workspace/worldrender/phase3_dmd_out/checkpoint-3200_weight_only
 
 BASE=/vePFS-buaa/wangyuzhen/Dataset/test
-GPU_ID=7
+GPU_ID=0
 MASTER_PORT=29635
 
 VIDEO_ROOT=/vePFS-buaa/linming/workspace/worldrender/results/video

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import asdict
+import json
 import math
 import os
+import shlex
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -52,6 +55,17 @@ vsa_available = is_vsa_available()
 vmoba_available = is_vmoba_available()
 
 logger = init_logger(__name__)
+
+
+def _safe_nonnegative_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0
+        value = value.reshape(-1)[0].item()
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class TrainingPipeline(LoRAPipeline, ABC):
@@ -232,6 +246,60 @@ class TrainingPipeline(LoRAPipeline, ABC):
             log_dir=tracker_log_dir,
             run_name=tracker_run_name,
         )
+        self._save_launch_metadata()
+
+    def _save_launch_metadata(self) -> None:
+        """Persist launch metadata alongside checkpoints for reproducibility."""
+        if getattr(self, "global_rank", 0) != 0:
+            return
+
+        output_dir = self.training_args.output_dir or os.getcwd()
+        os.makedirs(output_dir, exist_ok=True)
+
+        selected_env = {}
+        for key in (
+                "WANDB_MODE",
+                "WANDB_BASE_URL",
+                "CUDA_VISIBLE_DEVICES",
+                "MASTER_ADDR",
+                "MASTER_PORT",
+                "WORLD_SIZE",
+                "RANK",
+                "LOCAL_RANK",
+                "FASTVIDEO_ATTENTION_BACKEND",
+                "TOKENIZERS_PARALLELISM",
+                "PYTHONUNBUFFERED",
+                "PYTHONPATH",
+        ):
+            value = os.environ.get(key)
+            if value is not None:
+                selected_env[key] = value
+
+        launch_metadata = {
+            "argv": sys.argv,
+            "command": shlex.join([sys.executable, *sys.argv]),
+            "cwd": os.getcwd(),
+            "python_executable": sys.executable,
+            "output_dir": output_dir,
+            "tracker_project_name": self.training_args.tracker_project_name,
+            "wandb_run_name": self.training_args.wandb_run_name,
+            "wandb_mode": os.environ.get("WANDB_MODE",
+                                         getattr(self.training_args,
+                                                 "wandb_mode", None)),
+            "environment": selected_env,
+        }
+
+        metadata_path = os.path.join(output_dir, "launch_metadata.json")
+        command_path = os.path.join(output_dir, "launch_command.sh")
+        try:
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(launch_metadata, f, indent=2, ensure_ascii=True)
+            with open(command_path, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\n")
+                f.write(launch_metadata["command"] + "\n")
+            logger.info("Saved launch metadata to %s", metadata_path)
+        except Exception as exc:
+            logger.warning("Failed to save launch metadata: %s", exc)
 
     @abstractmethod
     def initialize_validation_pipeline(self, training_args: TrainingArgs):
@@ -587,6 +655,10 @@ class TrainingPipeline(LoRAPipeline, ABC):
         self.train_loader_iter = iter(self.train_dataloader)
 
         step_times: deque[float] = deque(maxlen=100)
+        training_state_ckpt_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "training_state_checkpointing_steps", 0))
+        validation_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "validation_steps", 0))
 
         self._log_training_info()
 
@@ -604,6 +676,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         for step in range(self.init_steps + 1,
                           self.training_args.max_train_steps + 1):
             start_time = time.perf_counter()
+            self.current_trainstep = step
             if vsa_available:
                 vsa_sparsity = self.training_args.VSA_sparsity
                 vsa_decay_rate = self.training_args.VSA_decay_rate
@@ -662,7 +735,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 metrics["ffn_dim"] = arch_config.ffn_dim
 
                 self.tracker.log(metrics, step)
-            if step % self.training_args.training_state_checkpointing_steps == 0:
+            if (training_state_ckpt_steps > 0
+                    and step % training_state_ckpt_steps == 0):
                 with self.profiler_controller.region(
                         "profiler_region_training_save_checkpoint"):
                     # Free gradient buffers before checkpoint to reduce peak CUDA memory.
@@ -680,7 +754,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
                                     controlnet=controlnet)
                 self.transformer.train()
                 self.sp_group.barrier()
-            if self.training_args.log_validation and step % self.training_args.validation_steps == 0:
+            if (self.training_args.log_validation and validation_steps > 0
+                    and step % validation_steps == 0):
                 with self.profiler_controller.region(
                         "profiler_region_training_validation"):
                     if self.training_args.log_visualization:

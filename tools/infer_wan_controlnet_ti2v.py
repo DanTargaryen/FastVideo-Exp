@@ -80,6 +80,12 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 logger = init_logger(__name__)
 
 
+def _enable_opencv_openexr_if_needed() -> None:
+    # OpenCV disables EXR support by default in some builds unless this env var
+    # is set before importing cv2.
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+
 def _is_union_controlnet(model) -> bool:
     return "union" in model.__class__.__name__.lower()
 
@@ -250,6 +256,10 @@ def _ensure_single_process_dist_env() -> None:
 
 def _list_parquet_files(root: str | os.PathLike[str]) -> list[str]:
     root = str(root)
+    if os.path.isfile(root):
+        if not root.endswith(".parquet"):
+            raise FileNotFoundError(f"Not a parquet file: {root}")
+        return [root]
     paths: list[str] = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for fn in filenames:
@@ -309,6 +319,26 @@ def _ensure_text_embedding_bld(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:
         return x
     raise ValueError(f"Unsupported text_embedding shape: {tuple(x.shape)}")
+
+
+def _load_fixed_text_embedding_from_parquet(
+    data_path: str,
+    row_idx: int,
+) -> tuple[torch.Tensor, str]:
+    row = _read_row_by_global_index(
+        data_path,
+        row_idx,
+        [
+            "caption",
+            "text_embedding_bytes",
+            "text_embedding_shape",
+            "text_embedding_dtype",
+        ],
+    )
+    text_embedding = _ensure_text_embedding_bld(
+        _decode_tensor(row, "text_embedding"))
+    caption = str(row.get("caption", ""))
+    return text_embedding, caption
 
 
 def _ensure_bcfhw(x: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -464,6 +494,7 @@ def _load_mask_frame(path: Path,
 def _read_depth_any(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".exr":
         try:
+            _enable_opencv_openexr_if_needed()
             import cv2
 
             arr = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
@@ -477,6 +508,7 @@ def _read_depth_any(path: Path) -> np.ndarray:
     # Avoid imageio/pyav plugin instability on some environments by preferring
     # raster readers (OpenCV/PIL) for non-EXR depth files.
     try:
+        _enable_opencv_openexr_if_needed()
         import cv2
 
         arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -502,6 +534,7 @@ def _read_depth_any(path: Path) -> np.ndarray:
 def _read_normal_any(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".exr":
         try:
+            _enable_opencv_openexr_if_needed()
             import cv2
 
             arr = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
@@ -515,6 +548,7 @@ def _read_normal_any(path: Path) -> np.ndarray:
         except Exception:
             pass
     try:
+        _enable_opencv_openexr_if_needed()
         import cv2
 
         arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -584,12 +618,24 @@ def _load_depth_sequence(
     pmin: float,
     pmax: float,
     invert_depth: bool,
+    normalization_mode: str = "md_align",
 ) -> torch.Tensor:
+    mode = str(normalization_mode).strip().lower() or "md_align"
+    if mode not in {"md_align", "percentile"}:
+        raise ValueError(
+            "normalization_mode must be one of {'md_align', 'percentile'}, "
+            f"got {normalization_mode!r}"
+        )
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
     for p in depth_paths:
         d = _read_depth_any(p)
-        if np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
+        if mode == "percentile":
+            mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+            if mx > 1.5:
+                d = d / (65535.0 if mx > 255.0 else 255.0)
+            d = np.clip(d, 0.0, 1.0)
+        elif np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
             d = d / 65535.0
         h0, w0 = d.shape
         current_ratio = float(w0) / float(h0)
@@ -610,12 +656,20 @@ def _load_depth_sequence(
         d[~valid] = np.nan
         depths.append(d)
 
-    # Match md process_depth: global min/max (not percentile) over valid pixels.
     stacked = np.stack(depths, axis=0)
     valid_vals = stacked[np.isfinite(stacked)]
     if valid_vals.size == 0:
         lo, hi = 0.0, 1.0
+    elif mode == "percentile":
+        lo = float(np.percentile(valid_vals, pmin))
+        hi = float(np.percentile(valid_vals, pmax))
+        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+            lo = float(np.nanmin(valid_vals))
+            hi = float(np.nanmax(valid_vals))
+            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                lo, hi = 0.0, 1.0
     else:
+        # Match md process_depth: global min/max (not percentile) over valid pixels.
         lo, hi = float(np.nanmin(valid_vals)), float(np.nanmax(valid_vals))
         if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
             lo, hi = 0.0, 1.0
@@ -717,15 +771,15 @@ def _build_image_latent_from_first_frame_latent(
 ) -> torch.Tensor:
     """
     Build a full-length TI2V image_latent in latent space only:
-    keep frame-0 latent from first_frame_latent, zero-fill the tail.
+    keep the provided latent prefix, zero-fill the tail.
     """
     if first_frame_latent_bcfhw.ndim != 5:
         raise ValueError(
             "first_frame_latent_bcfhw must be [B,C,F,H,W], "
             f"got shape={tuple(first_frame_latent_bcfhw.shape)}")
-    if int(first_frame_latent_bcfhw.shape[2]) != 1:
+    if int(first_frame_latent_bcfhw.shape[2]) <= 0:
         raise ValueError(
-            "first_frame_latent_bcfhw must have F==1, "
+            "first_frame_latent_bcfhw must have F>0, "
             f"got shape={tuple(first_frame_latent_bcfhw.shape)}")
     t = int(target_frames)
     if t <= 0:
@@ -733,8 +787,23 @@ def _build_image_latent_from_first_frame_latent(
     out = first_frame_latent_bcfhw.new_zeros(
         (first_frame_latent_bcfhw.shape[0], first_frame_latent_bcfhw.shape[1], t,
          first_frame_latent_bcfhw.shape[3], first_frame_latent_bcfhw.shape[4]))
-    out[:, :, :1] = first_frame_latent_bcfhw[:, :, :1]
+    keep_t = min(int(first_frame_latent_bcfhw.shape[2]), t)
+    out[:, :, :keep_t] = first_frame_latent_bcfhw[:, :, :keep_t]
     return out
+
+
+def _effective_prefix_anchor_t(
+    *,
+    first_frame_latent_bcfhw: torch.Tensor | None,
+    requested_anchor_t: int,
+    target_frames: int,
+) -> int:
+    if first_frame_latent_bcfhw is None:
+        return 0
+    available_t = int(first_frame_latent_bcfhw.shape[2])
+    if available_t <= 0:
+        return 0
+    return max(1, min(int(requested_anchor_t), available_t, int(target_frames)))
 
 
 @torch.no_grad()
@@ -983,6 +1052,19 @@ class Sample:
     image_latent_bcfhw: torch.Tensor | None = None  # [B, C_img, F, H, W]
 
 
+def _override_sample_text_embedding(sample: Sample, text_embedding_bld: torch.Tensor,
+                                    caption: str) -> Sample:
+    return Sample(
+        sample_id=sample.sample_id,
+        caption=caption,
+        fps=sample.fps,
+        text_embedding_bld=text_embedding_bld,
+        first_frame_latent_bcfhw=sample.first_frame_latent_bcfhw,
+        control_latent_bcfhw=sample.control_latent_bcfhw,
+        image_latent_bcfhw=sample.image_latent_bcfhw,
+    )
+
+
 def _load_sample(data_path: str, index: int) -> Sample:
     cols = [
         "id",
@@ -1209,6 +1291,8 @@ def _load_sample_raw(
         pmin=float(args.raw_depth_percentile_min),
         pmax=float(args.raw_depth_percentile_max),
         invert_depth=bool(args.raw_depth_invert),
+        normalization_mode=str(getattr(args, "raw_depth_normalization_mode",
+                                       "md_align")),
     )
     mask_tchw = torch.stack(
         [
@@ -1566,18 +1650,21 @@ class _PointCloudWarper:
             return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
                     np.zeros((out_h, out_w), dtype=np.uint8))
 
+        cam_points = cam_points[valid]
+        colors = colors[valid]
+        zs = zs[valid]
+
         x_norm = cam_points[:, 0] / zs
         y_norm = -cam_points[:, 1] / zs
         proj_finite = np.isfinite(x_norm) & np.isfinite(y_norm)
-        valid = valid & proj_finite
-        if not np.any(valid):
+        if not np.any(proj_finite):
             return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
                     np.zeros((out_h, out_w), dtype=np.uint8))
 
-        x_v = x_norm[valid]
-        y_v = y_norm[valid]
-        zs_v = zs[valid]
-        colors_v = colors[valid]
+        x_v = x_norm[proj_finite]
+        y_v = y_norm[proj_finite]
+        zs_v = zs[proj_finite]
+        colors_v = colors[proj_finite]
 
         u_proj = np.rint(fx * x_v + cx).astype(np.int32)
         v_proj = np.rint(fy * y_v + cy).astype(np.int32)
@@ -2020,12 +2107,16 @@ def _causal_dmd_rollout_one_window_with_cache(
                 "Unsupported causal md_align hidden-state channels: "
                 f"latent_channels={latent_channels}, image_channels={image_channels}, "
                 f"expected_hidden_channels={expected_hidden_channels}.")
-    anchor_t_global = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
-    if use_noise_init and first_frame_latent_bcfhw is not None:
+    anchor_t_global = _effective_prefix_anchor_t(
+        first_frame_latent_bcfhw=first_frame_latent_bcfhw,
+        requested_anchor_t=int(first_frame_anchor_latent_frames),
+        target_frames=int(latent_t),
+    )
+    if use_noise_init and first_frame_latent_bcfhw is not None and anchor_t_global > 0:
         # Replace the initial noisy state of the first anchor latents with q(x_t | x0, eps)
         # so the first-frame condition participates in the initial sampling state.
-        first_anchor = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
-            -1, -1, anchor_t_global, -1, -1)
+        first_anchor = first_frame_latent_bcfhw.to(
+            device=device, dtype=dtype)[:, :, :anchor_t_global]
         first_anchor_btchw = first_anchor.permute(0, 2, 1, 3, 4).contiguous()
         anchor_noise_btchw = torch.randn_like(first_anchor_btchw)
         t_init = t_list_full[0].to(device=device, dtype=torch.float32)
@@ -2055,7 +2146,13 @@ def _causal_dmd_rollout_one_window_with_cache(
         if use_md_align:
             anchor_t = 1
         else:
-            anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(current_num_frames)))
+            anchor_t = _effective_prefix_anchor_t(
+                first_frame_latent_bcfhw=(
+                    first_frame_latent_bcfhw if start_index == 0 else None
+                ),
+                requested_anchor_t=int(first_frame_anchor_latent_frames),
+                target_frames=int(current_num_frames),
+            )
         current_latents = latents[:, :, start_index:start_index + current_num_frames].clone()
         control_chunk = control_latent_bcfhw[:, :, start_index:start_index +
                                              current_num_frames].to(device=device,
@@ -2097,7 +2194,8 @@ def _causal_dmd_rollout_one_window_with_cache(
             elif (start_index == 0 and first_block_image_latents is not None
                   and first_block_latent_input_mode == "overwrite_first_frame"):
                 latent_model_input = latent_model_input.clone()
-                latent_model_input[:, :, :1] = first_block_image_latents[:, :, :1]
+                if anchor_t > 0:
+                    latent_model_input[:, :, :anchor_t] = first_block_image_latents[:, :, :anchor_t]
             elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
@@ -2105,14 +2203,18 @@ def _causal_dmd_rollout_one_window_with_cache(
                     dtype=dtype,
                 )
                 first_frame_mask[:, :, :anchor_t] = 0
-                first_latents_local = first_frame_latent_bcfhw.to(device=device,
-                                                                  dtype=dtype)
+                first_latents_local = _build_image_latent_from_first_frame_latent(
+                    first_frame_latent_bcfhw=first_frame_latent_bcfhw.to(
+                        device=device, dtype=dtype)[:, :, :anchor_t],
+                    target_frames=int(current_num_frames),
+                )
                 latent_model_input = (1 - first_frame_mask) * first_latents_local + first_frame_mask * current_latents
             elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 latent_model_input = latent_model_input.clone()
-                anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
-                    -1, -1, anchor_t, -1, -1)
-                latent_model_input[:, :, :anchor_t] = anchor_lat
+                if anchor_t > 0:
+                    anchor_lat = first_frame_latent_bcfhw.to(
+                        device=device, dtype=dtype)[:, :, :anchor_t]
+                    latent_model_input[:, :, :anchor_t] = anchor_lat
             latent_model_input = latent_model_input.to(dtype=dtype)
 
             zero_anchor = ((first_frame_timestep_zero and start_index == 0) or
@@ -2166,11 +2268,22 @@ def _causal_dmd_rollout_one_window_with_cache(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
+                        control_res_uncond = controlnet(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=negative_prompt_embeds_list,
+                            timestep=timestep,
+                            **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                       num_channels_latents),
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=current_start_abs,
+                            start_frame=start_frame_abs,
+                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_cond,
+                            block_controlnet_hidden_states=control_res_uncond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=current_start_abs,
@@ -2303,7 +2416,8 @@ def _causal_dmd_rollout_one_window_with_cache(
             elif (start_index == 0 and first_block_image_latents is not None
                   and first_block_latent_input_mode == "overwrite_first_frame"):
                 context_bcfhw = context_bcfhw.clone()
-                context_bcfhw[:, :, :1] = first_block_image_latents[:, :, :1]
+                if anchor_t > 0:
+                    context_bcfhw[:, :, :anchor_t] = first_block_image_latents[:, :, :anchor_t]
             elif use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None and start_index == 0:
                 first_frame_mask = torch.ones(
                     (1, 1, current_num_frames, latent_h, latent_w),
@@ -2311,14 +2425,18 @@ def _causal_dmd_rollout_one_window_with_cache(
                     dtype=dtype,
                 )
                 first_frame_mask[:, :, :anchor_t] = 0
-                first_latents_local = first_frame_latent_bcfhw.to(device=device,
-                                                                  dtype=dtype)
+                first_latents_local = _build_image_latent_from_first_frame_latent(
+                    first_frame_latent_bcfhw=first_frame_latent_bcfhw.to(
+                        device=device, dtype=dtype)[:, :, :anchor_t],
+                    target_frames=int(current_num_frames),
+                )
                 context_bcfhw = (1 - first_frame_mask) * first_latents_local + first_frame_mask * context_bcfhw
             elif use_hard_replace and first_frame_latent_bcfhw is not None and start_index == 0:
                 context_bcfhw = context_bcfhw.clone()
-                anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
-                    -1, -1, anchor_t, -1, -1)
-                context_bcfhw[:, :, :anchor_t] = anchor_lat
+                if anchor_t > 0:
+                    anchor_lat = first_frame_latent_bcfhw.to(
+                        device=device, dtype=dtype)[:, :, :anchor_t]
+                    context_bcfhw[:, :, :anchor_t] = anchor_lat
             context_bcfhw = context_bcfhw.to(dtype=dtype)
 
             with torch.autocast(device_type="cuda", dtype=dtype,
@@ -2369,21 +2487,34 @@ def _causal_dmd_rollout_one_window_with_cache(
         start_index += current_num_frames
 
     if use_hard_replace and expand_timesteps and first_frame_latent_bcfhw is not None:
-        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
+        anchor_t = _effective_prefix_anchor_t(
+            first_frame_latent_bcfhw=first_frame_latent_bcfhw,
+            requested_anchor_t=int(first_frame_anchor_latent_frames),
+            target_frames=int(latent_t),
+        )
         first_frame_mask = torch.ones(
             (1, 1, latent_t, latent_h, latent_w),
             device=device,
             dtype=dtype,
         )
         first_frame_mask[:, :, :anchor_t] = 0
-        image_latents = first_frame_latent_bcfhw.to(device=device, dtype=dtype)
+        image_latents = _build_image_latent_from_first_frame_latent(
+            first_frame_latent_bcfhw=first_frame_latent_bcfhw.to(
+                device=device, dtype=dtype)[:, :, :anchor_t],
+            target_frames=int(latent_t),
+        )
         latents = (1 - first_frame_mask) * image_latents + first_frame_mask * latents
     elif use_hard_replace and first_frame_latent_bcfhw is not None:
-        anchor_t = max(1, min(int(first_frame_anchor_latent_frames), int(latent_t)))
+        anchor_t = _effective_prefix_anchor_t(
+            first_frame_latent_bcfhw=first_frame_latent_bcfhw,
+            requested_anchor_t=int(first_frame_anchor_latent_frames),
+            target_frames=int(latent_t),
+        )
         latents = latents.clone()
-        anchor_lat = first_frame_latent_bcfhw.to(device=device, dtype=dtype).expand(
-            -1, -1, anchor_t, -1, -1)
-        latents[:, :, :anchor_t] = anchor_lat
+        if anchor_t > 0:
+            anchor_lat = first_frame_latent_bcfhw.to(
+                device=device, dtype=dtype)[:, :, :anchor_t]
+            latents[:, :, :anchor_t] = anchor_lat
     return latents
 
 
@@ -2546,6 +2677,8 @@ def _run_causal_long_warp_rollout(
             pmin=float(args.raw_depth_percentile_min),
             pmax=float(args.raw_depth_percentile_max),
             invert_depth=bool(args.raw_depth_invert),
+            normalization_mode=str(getattr(args, "raw_depth_normalization_mode",
+                                           "md_align")),
         )
         normal_tchw = None
         if sequence.normal_paths is not None:
@@ -3206,11 +3339,22 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
+                        control_res_uncond = controlnet(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=negative_prompt_embeds_list,
+                            timestep=timestep,
+                            **_build_controlnet_kwargs(controlnet, control_chunk,
+                                                       num_channels_latents),
+                            kv_cache=control_kv_cache_uncond,
+                            crossattn_cache=control_crossattn_cache_uncond,
+                            current_start=start_index * frame_seq_length,
+                            start_frame=start_index,
+                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_cond,
+                            block_controlnet_hidden_states=control_res_uncond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=start_index * frame_seq_length,
@@ -3632,8 +3776,13 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             noise_uncond = None
             control_res_uncond = None
             if float(guidance_scale) != 1.0:
-                # Reuse conditional control residual for uncond branch.
-                control_res_uncond = control_res
+                control_res_uncond = controlnet(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=negative_prompt_embeds_list,
+                    timestep=timestep,
+                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
+                                               num_channels_latents),
+                )
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -3821,6 +3970,33 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--fixed_text_embedding_data_path",
+        type=str,
+        default="",
+        help=(
+            "Optional parquet root/file used to override inference text embedding "
+            "with a fixed cached text embedding from another dataset."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_text_embedding_row_idx",
+        type=int,
+        default=0,
+        help=(
+            "Global row index inside --fixed_text_embedding_data_path used as "
+            "the fixed reference text embedding."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_text_embedding_caption",
+        type=str,
+        default="",
+        help=(
+            "Optional caption label used only for logging when "
+            "--fixed_text_embedding_data_path is enabled."
+        ),
+    )
+    parser.add_argument(
         "--raw_sample_root",
         type=str,
         default="",
@@ -3968,6 +4144,12 @@ def main() -> None:
     parser.add_argument("--raw_require_normal", action="store_true")
     parser.add_argument("--raw_depth_percentile_min", type=float, default=5.0)
     parser.add_argument("--raw_depth_percentile_max", type=float, default=95.0)
+    parser.add_argument(
+        "--raw_depth_normalization_mode",
+        type=str,
+        default="md_align",
+        choices=["md_align", "percentile"],
+    )
     raw_depth_group = parser.add_mutually_exclusive_group()
     raw_depth_group.add_argument("--raw_depth_invert",
                                  dest="raw_depth_invert",
@@ -4288,9 +4470,10 @@ def main() -> None:
             args.input_mode) == "raw":
         logger.info(
             "bidirectional + raw mode enabled (for mask/depth ablation). "
-            "raw_mask_threshold=%s raw_depth_invert=%s",
+            "raw_mask_threshold=%s raw_depth_invert=%s raw_depth_normalization_mode=%s",
             str(args.raw_mask_threshold),
             bool(args.raw_depth_invert),
+            str(args.raw_depth_normalization_mode),
         )
     if int(args.T) < 0:
         raise ValueError("--T must be >= 0")
@@ -4473,6 +4656,8 @@ def main() -> None:
         "from the same phase-1 export; otherwise you're mixing student transformer with teacher controlnet."
         )
     negative_prompt_embeds_global: torch.Tensor | None = None
+    fixed_text_embedding_global: torch.Tensor | None = None
+    fixed_text_caption_global = ""
     tokenizer = None
     text_encoder = None
     negative_prompt_text = str(args.negative_prompt or "").strip()
@@ -4503,6 +4688,23 @@ def main() -> None:
     elif guidance_scale_value != 1.0 and not negative_prompt_text:
         logger.warning(
             "--guidance_scale != 1.0 but --negative_prompt is empty; falling back to zeros."
+        )
+    fixed_text_data_path = str(args.fixed_text_embedding_data_path or "").strip()
+    if fixed_text_data_path:
+        fixed_text_embedding_global, fixed_caption_source = _load_fixed_text_embedding_from_parquet(
+            fixed_text_data_path,
+            int(args.fixed_text_embedding_row_idx),
+        )
+        fixed_text_caption_global = str(
+            args.fixed_text_embedding_caption or "").strip() or fixed_caption_source
+        logger.info(
+            "Inference text override enabled: source=%s row=%s caption=%r shape=%s mean=%.6f std=%.6f",
+            fixed_text_data_path,
+            int(args.fixed_text_embedding_row_idx),
+            fixed_text_caption_global,
+            tuple(fixed_text_embedding_global.shape),
+            float(fixed_text_embedding_global.float().mean().item()),
+            float(fixed_text_embedding_global.float().std(unbiased=False).item()),
         )
     if str(args.input_mode) != "raw":
         # Raw mode needs tokenizer/text_encoder to build prompt embeddings on the fly.
@@ -4631,6 +4833,17 @@ def main() -> None:
             )
         else:
             sample = _load_sample(args.data_path, sample_idx)
+        if fixed_text_embedding_global is not None:
+            sample = _override_sample_text_embedding(
+                sample,
+                fixed_text_embedding_global,
+                fixed_text_caption_global,
+            )
+            if i == 0:
+                logger.info(
+                    "sample text_embedding overridden by fixed reference caption=%r",
+                    fixed_text_caption_global,
+                )
         logger.info("sample=%s idx=%s caption=%s", sample.sample_id, sample_idx,
                     sample.caption)
 
@@ -4770,6 +4983,8 @@ def main() -> None:
                     total_c,
                     target_c,
                 )
+        expand_timesteps_enabled = bool(
+            getattr(fastvideo_args.pipeline_config, "expand_timesteps", False))
         effective_first_frame_timestep_zero = bool(args.first_frame_timestep_zero)
         if args.attention_mode == "bidirectional":
             # Bidirectional default: first-frame timestep is zero.
@@ -4785,10 +5000,20 @@ def main() -> None:
                 bool(args.bidir_first_frame_timestep_zero),
                 bool(args.first_frame_timestep_zero),
             )
-        elif first_frame_latent is not None and not effective_first_frame_timestep_zero:
-            logger.warning(
-                "TI2V alignment: first_frame_timestep_zero is OFF. "
-                "This matches the current FastVideo causal default."
+        elif first_frame_latent is not None:
+            # Short causal TI2V still zeros the anchor timestep whenever
+            # expand_timesteps injects the first-frame latent directly into the
+            # model input, even if the explicit CLI flag is off.
+            effective_first_frame_timestep_zero = (
+                bool(args.first_frame_timestep_zero)
+                or expand_timesteps_enabled
+            )
+            logger.info(
+                "causal alignment: effective first_frame_timestep_zero=%s "
+                "(explicit_global=%s expand_timesteps=%s)",
+                bool(effective_first_frame_timestep_zero),
+                bool(args.first_frame_timestep_zero),
+                bool(expand_timesteps_enabled),
             )
 
         if args.debug_dump:
@@ -4847,8 +5072,7 @@ def main() -> None:
                 first_frame_timestep_zero=effective_first_frame_timestep_zero,
                 bidir_sync_first_frame_state=bool(
                     args.bidir_sync_first_frame_state),
-                expand_timesteps=bool(
-                    getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
+                expand_timesteps=expand_timesteps_enabled,
                 trace_jsonl_path=(trace_jsonl_path if trace_jsonl_path else None),
                 trace_sample_id=sample.sample_id,
                 seed=args.seed + i,
@@ -4875,8 +5099,7 @@ def main() -> None:
                 update_rule=args.update_rule,
                 full_schedule=bool(args.full_schedule),
                 first_frame_timestep_zero=effective_first_frame_timestep_zero,
-                expand_timesteps=bool(
-                    getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
+                expand_timesteps=expand_timesteps_enabled,
                 first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
                 first_frame_condition_mode=str(args.first_frame_condition_mode),
                 reset_cache_each_block=bool(args.reset_cache_each_block),

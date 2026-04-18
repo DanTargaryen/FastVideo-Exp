@@ -197,17 +197,14 @@ class ODEInitTrainingPipeline(TrainingPipeline):
                                      dtype=torch.long).repeat(1, num_frame)
             return timestep
         else:
+            nfb = max(1, int(num_frame_per_block))
+            num_chunks = (int(num_frame) + nfb - 1) // nfb
             timestep = torch.randint(min_timestep,
-                                     max_timestep, [batch_size, num_frame],
+                                     max_timestep, [batch_size, num_chunks],
                                      device=self.device,
                                      dtype=torch.long)
-            # logger.info(f"individual timestep: {timestep}")
-            # make the noise level the same within every block
-            timestep = timestep.reshape(timestep.shape[0], -1,
-                                        num_frame_per_block)
-            timestep[:, :, 1:] = timestep[:, :, 0:1]
-            timestep = timestep.reshape(timestep.shape[0], -1)
-            return timestep
+            timestep = timestep.repeat_interleave(nfb, dim=1)
+            return timestep[:, :num_frame]
 
     def _step_predict_next_latent(
         self, traj_latents: torch.Tensor, traj_timesteps: torch.Tensor,

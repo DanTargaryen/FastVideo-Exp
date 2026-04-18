@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fastvideo.configs.models.dits import WanVideoConfig
-from fastvideo.distributed.parallel_state import get_sp_world_size
+from fastvideo.distributed.utils import get_sequence_parallel_block_partition
 from fastvideo.layers.visual_embedding import PatchEmbed
 from fastvideo.models.dits.base import BaseDiT
 from fastvideo.models.dits.causal_wanvideo import CausalWanTransformerBlock
@@ -196,15 +196,27 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         device: torch.device | str,
         *,
         num_frames: int,
+        clean_num_frames: int | None,
+        noisy_num_frames: int | None,
+        noisy_valid_num_frames: int | None,
         frame_seqlen: int,
         num_frame_per_block: int,
+        local_attn_size: int,
+        noisy_block_offset: int,
     ):
         from torch.nn.attention.flex_attention import create_block_mask
 
-        total_length = num_frames * frame_seqlen * 2
+        clean_num_frames = int(num_frames if clean_num_frames is None else clean_num_frames)
+        noisy_num_frames = int(num_frames if noisy_num_frames is None else noisy_num_frames)
+        noisy_valid_num_frames = int(
+            noisy_num_frames if noisy_valid_num_frames is None else
+            noisy_valid_num_frames)
+
+        total_length = (clean_num_frames + noisy_num_frames) * frame_seqlen
         padded_length = math.ceil(total_length / 128) * 128 - total_length
 
-        clean_ends = num_frames * frame_seqlen
+        clean_ends = clean_num_frames * frame_seqlen
+        noisy_valid_end = clean_ends + noisy_valid_num_frames * frame_seqlen
         context_ends = torch.zeros(total_length + padded_length,
                                    device=device,
                                    dtype=torch.long)
@@ -222,37 +234,56 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                                        dtype=torch.long)
 
         attention_block_size = frame_seqlen * num_frame_per_block
+        noisy_clean_context_tokens = (
+            None if int(local_attn_size) == -1 else
+            max(int(local_attn_size) - int(num_frame_per_block),
+                0) * int(frame_seqlen))
         frame_indices = torch.arange(
             start=0,
-            end=num_frames * frame_seqlen,
+            end=clean_ends,
             step=attention_block_size,
             device=device,
             dtype=torch.long,
         )
         for start in frame_indices:
-            context_ends[start:start + attention_block_size] = start + attention_block_size
+            end = int(start.item()) + int(attention_block_size)
+            context_ends[start:start + attention_block_size] = end
 
         noisy_image_start_list = torch.arange(
-            num_frames * frame_seqlen,
+            clean_ends,
             total_length,
             step=attention_block_size,
             device=device,
             dtype=torch.long,
         )
         noisy_image_end_list = noisy_image_start_list + attention_block_size
-        for block_index, (start, end) in enumerate(
+        for local_block_index, (start, end) in enumerate(
                 zip(noisy_image_start_list, noisy_image_end_list)):
+            global_block_index = int(noisy_block_offset) + int(local_block_index)
+            clean_block_end = min(
+                global_block_index * int(attention_block_size),
+                int(clean_ends),
+            )
+            if noisy_clean_context_tokens is None:
+                clean_ctx_start = 0
+            else:
+                clean_ctx_start = max(0,
+                                      clean_block_end -
+                                      int(noisy_clean_context_tokens))
             noise_noise_starts[start:end] = start
             noise_noise_ends[start:end] = end
-            noise_context_ends[start:end] = block_index * attention_block_size
+            noise_context_starts[start:end] = clean_ctx_start
+            noise_context_ends[start:end] = clean_block_end
 
         def attention_mask(_b, _h, q_idx, kv_idx):
-            clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
+            clean_mask = (q_idx < clean_ends) & (kv_idx < clean_ends)
             c1 = ((kv_idx < noise_noise_ends[q_idx]) &
-                  (kv_idx >= noise_noise_starts[q_idx]))
+                  (kv_idx >= noise_noise_starts[q_idx]) &
+                  (kv_idx < noisy_valid_end))
             c2 = ((kv_idx < noise_context_ends[q_idx]) &
                   (kv_idx >= noise_context_starts[q_idx]))
-            noise_mask = (q_idx >= clean_ends) & (c1 | c2)
+            noise_mask = ((q_idx >= clean_ends) & (q_idx < noisy_valid_end) &
+                          (c1 | c2))
             eye_mask = q_idx == kv_idx
             return eye_mask | clean_mask | noise_mask
 
@@ -267,12 +298,22 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         )
 
     def _get_block_mask(self, *, num_frames: int, frame_seqlen: int,
-                        device: torch.device, teacher_forcing: bool) -> Any:
+                        device: torch.device,
+                        teacher_forcing: bool,
+                        clean_num_frames: int | None = None,
+                        noisy_num_frames: int | None = None,
+                        noisy_valid_num_frames: int | None = None,
+                        noisy_block_offset: int = 0) -> Any:
         key = (
             "tf",
-            int(num_frames),
+            int(num_frames if clean_num_frames is None else clean_num_frames),
+            int(num_frames if noisy_num_frames is None else noisy_num_frames),
+            int((num_frames if noisy_num_frames is None else noisy_num_frames)
+                if noisy_valid_num_frames is None else noisy_valid_num_frames),
             int(frame_seqlen),
             int(self.num_frame_per_block),
+            int(self.local_attn_size),
+            int(noisy_block_offset),
         ) if teacher_forcing else (
             "causal",
             int(num_frames),
@@ -286,8 +327,13 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 mask = self._prepare_teacher_forcing_mask(
                     device=device,
                     num_frames=num_frames,
+                    clean_num_frames=clean_num_frames,
+                    noisy_num_frames=noisy_num_frames,
+                    noisy_valid_num_frames=noisy_valid_num_frames,
                     frame_seqlen=frame_seqlen,
                     num_frame_per_block=self.num_frame_per_block,
+                    local_attn_size=self.local_attn_size,
+                    noisy_block_offset=noisy_block_offset,
                 )
             else:
                 mask = self._prepare_blockwise_causal_attn_mask(
@@ -334,8 +380,13 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
 
         orig_dtype = hidden_states.dtype
 
-        noisy_num_frames = int(hidden_states.shape[2])
+        full_noisy_num_frames = int(hidden_states.shape[2])
+        noisy_num_frames = full_noisy_num_frames
         dual_stream = clean_hidden_states is not None
+        noisy_partition = None
+        noisy_frame_start = 0
+        noisy_frame_end = full_noisy_num_frames
+        noisy_valid_num_frames = full_noisy_num_frames
 
         # Align device/dtype & spatial shape
         mask = mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
@@ -349,21 +400,44 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
 
         if dual_stream:
             assert clean_hidden_states is not None
+            if get_sequence_parallel_block_partition(
+                    full_noisy_num_frames,
+                    self.num_frame_per_block).num_frames != full_noisy_num_frames:
+                noisy_partition = get_sequence_parallel_block_partition(
+                    full_noisy_num_frames, self.num_frame_per_block)
+                noisy_frame_start = noisy_partition.frame_start
+                noisy_frame_end = noisy_partition.frame_end
+                noisy_valid_num_frames = noisy_partition.num_frames
             clean_hidden_states = clean_hidden_states.to(
                 device=hidden_states.device, dtype=hidden_states.dtype)
             if clean_hidden_states.shape[-2:] != hidden_states.shape[-2:]:
                 clean_hidden_states = _resize_bcfhw_nearest(
                     clean_hidden_states, hidden_states.shape[-2:])
-            if clean_hidden_states.shape[2] != noisy_num_frames:
+            if clean_hidden_states.shape[2] != full_noisy_num_frames:
                 raise ValueError(
                     "clean_hidden_states must have same frame count as noisy hidden_states: "
                     f"clean={tuple(clean_hidden_states.shape)} noisy={tuple(hidden_states.shape)}"
                 )
+            local_noisy_hidden_states = hidden_states[:, :, noisy_frame_start:
+                                                     noisy_frame_end]
+            local_mask = mask[:, :, noisy_frame_start:noisy_frame_end]
+            local_masked_latent = masked_latent[:, :, noisy_frame_start:
+                                                noisy_frame_end]
+            if noisy_partition is not None and noisy_partition.padded_num_frames > noisy_partition.num_frames:
+                pad_frames = noisy_partition.padded_num_frames - noisy_partition.num_frames
+                local_noisy_hidden_states = F.pad(local_noisy_hidden_states,
+                                                  (0, 0, 0, 0, 0, pad_frames))
+                local_mask = F.pad(local_mask, (0, 0, 0, 0, 0, pad_frames))
+                local_masked_latent = F.pad(local_masked_latent,
+                                            (0, 0, 0, 0, 0, pad_frames))
+            noisy_num_frames = int(local_noisy_hidden_states.shape[2])
             # Teacher-forcing dual stream at ControlNet input:
             # [clean, noisy] plus duplicated conditioning maps.
-            hidden_states = torch.cat([clean_hidden_states, hidden_states], dim=2)
-            mask = torch.cat([mask, mask], dim=2)
-            masked_latent = torch.cat([masked_latent, masked_latent], dim=2)
+            hidden_states = torch.cat(
+                [clean_hidden_states, local_noisy_hidden_states], dim=2)
+            mask = torch.cat([mask, local_mask], dim=2)
+            masked_latent = torch.cat([masked_latent, local_masked_latent],
+                                      dim=2)
 
         # Union control inputs
         control_id_vec = torch.zeros(hidden_states.shape[0],
@@ -392,7 +466,12 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 cond_input = _resize_bcfhw_nearest(
                     cond_input, hidden_states.shape[-2:])
             if dual_stream:
-                cond_input = torch.cat([cond_input, cond_input], dim=2)
+                local_cond_input = cond_input[:, :, noisy_frame_start:noisy_frame_end]
+                if noisy_partition is not None and noisy_partition.padded_num_frames > noisy_partition.num_frames:
+                    pad_frames = noisy_partition.padded_num_frames - noisy_partition.num_frames
+                    local_cond_input = F.pad(local_cond_input,
+                                             (0, 0, 0, 0, 0, pad_frames))
+                cond_input = torch.cat([cond_input, local_cond_input], dim=2)
             cond_feat = self.union_cond_embedding(cond_input)
             feat_vec = torch.mean(cond_feat, dim=(2, 3, 4))
             if self.union_dim != latents_emb.shape[1]:
@@ -471,12 +550,17 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
                 )
             return t_2d
 
-        noisy_timestep_2d = _normalize_frame_timestep(
-            timestep, noisy_num_frames, name="timestep")
+        full_noisy_timestep_2d = _normalize_frame_timestep(
+            timestep, full_noisy_num_frames, name="timestep")
+        noisy_timestep_2d = full_noisy_timestep_2d[:, noisy_frame_start:
+                                                   noisy_frame_end]
+        if noisy_partition is not None and noisy_partition.padded_num_frames > noisy_partition.num_frames:
+            pad_frames = noisy_partition.padded_num_frames - noisy_partition.num_frames
+            noisy_timestep_2d = F.pad(noisy_timestep_2d, (0, pad_frames), value=0)
         if dual_stream:
             clean_timestep_2d = _normalize_frame_timestep(
                 0 if aug_t is None else aug_t,
-                noisy_num_frames,
+                full_noisy_num_frames,
                 name="aug_t",
             )
             timestep_2d = torch.cat([clean_timestep_2d, noisy_timestep_2d], dim=1)
@@ -495,26 +579,51 @@ class CausalWanControlnetUnion3DModel(BaseDiT):
         # Rotary embeddings (frame offset = start_frame)
         d = self.hidden_size // self.num_attention_heads
         rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        rope_num_frames = noisy_num_frames if dual_stream else num_frames
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (rope_num_frames * get_sp_world_size(), post_patch_height,
-             post_patch_width),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
-            rope_theta=10000,
-            start_frame=start_frame,
-        )
+        # This causal teacher-forcing path does not sequence-shard token
+        # states across the SP group yet; only weights are sharded. Keep RoPE
+        # aligned to the local sequence length seen by each rank.
         if dual_stream:
-            freqs_cos = torch.cat([freqs_cos, freqs_cos], dim=0)
-            freqs_sin = torch.cat([freqs_sin, freqs_sin], dim=0)
+            clean_freqs_cos, clean_freqs_sin = get_rotary_pos_embed(
+                (full_noisy_num_frames, post_patch_height, post_patch_width),
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+                rope_theta=10000,
+                start_frame=0,
+            )
+            noisy_freqs_cos, noisy_freqs_sin = get_rotary_pos_embed(
+                (noisy_num_frames, post_patch_height, post_patch_width),
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+                rope_theta=10000,
+                start_frame=noisy_frame_start,
+            )
+            freqs_cos = torch.cat([clean_freqs_cos, noisy_freqs_cos], dim=0)
+            freqs_sin = torch.cat([clean_freqs_sin, noisy_freqs_sin], dim=0)
+        else:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (num_frames, post_patch_height, post_patch_width),
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+                rope_theta=10000,
+                start_frame=start_frame,
+            )
         freqs_cis = (freqs_cos.to(hidden_states.device),
                      freqs_sin.to(hidden_states.device))
 
         # In TF mode, use teacher-forcing mask; otherwise use block-wise causal mask.
         block_mask = self._get_block_mask(
             num_frames=noisy_num_frames if dual_stream else num_frames,
+            clean_num_frames=full_noisy_num_frames if dual_stream else None,
+            noisy_num_frames=noisy_num_frames if dual_stream else None,
+            noisy_valid_num_frames=noisy_valid_num_frames if dual_stream else None,
+            noisy_block_offset=(0 if noisy_partition is None else
+                                noisy_partition.block_start),
             frame_seqlen=post_patch_height * post_patch_width,
             device=hidden_states.device,
             teacher_forcing=dual_stream,

@@ -37,6 +37,8 @@ logger = init_logger(__name__)
 
 vsa_available = is_vsa_available()
 sync_list_verbose_log = bool(int(os.getenv("FASTVIDEO_SYNC_LIST_LOG", "0")))
+empty_cache_before_gen_step = bool(
+    int(os.getenv("FASTVIDEO_EMPTY_CACHE_BEFORE_GEN_STEP", "0")))
 
 
 def _to_log_scalar(value: Any) -> float:
@@ -45,6 +47,39 @@ def _to_log_scalar(value: Any) -> float:
             return float(value.item())
         return float(value.float().mean().item())
     return float(value)
+
+
+def _safe_nonnegative_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0
+        value = value.reshape(-1)[0].item()
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_optional_log_scalar(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        if value.numel() == 1:
+            return float(value.item())
+        return float(value.float().mean().item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_optional_log_scalar(value: Any, precision: int = 4) -> str:
+    scalar = _to_optional_log_scalar(value)
+    if scalar is None:
+        return "-"
+    return f"{scalar:.{precision}f}"
 
 
 def _wan_denormalize_dit_latents(latents: torch.Tensor, vae) -> torch.Tensor:
@@ -198,6 +233,8 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
         logger.info("Self-forcing rollout_add_context_noise=%s",
                     self.rollout_add_context_noise)
+        logger.info("Self-forcing empty_cache_before_gen_step=%s",
+                    empty_cache_before_gen_step)
 
         neg_prompt = str(getattr(training_args, "negative_prompt", "") or "").strip()
         if neg_prompt:
@@ -429,37 +466,31 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         # Dynamic frame generation logic (adapted from _run_generator)
         num_training_frames = getattr(self.training_args, 'num_latent_t', 21)
 
-        # During training, the number of generated frames should be uniformly sampled from
-        # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
+        # During training, sample the total effective latent length uniformly from
+        # [21, self.num_training_frames]. When we warm-start with a first-frame
+        # latent, the rollout only needs to generate the remaining latent frames,
+        # which can leave a tail remainder (e.g. 21 total -> 20 rollout frames).
         min_num_frames = 20 if self.independent_first_frame else 21
-        max_num_frames = num_training_frames - 1 if self.independent_first_frame else num_training_frames
-        assert max_num_frames % self.num_frame_per_block == 0
-        assert min_num_frames % self.num_frame_per_block == 0
-        max_num_blocks = max_num_frames // self.num_frame_per_block
-        min_num_blocks = min_num_frames // self.num_frame_per_block
+        max_num_frames = (num_training_frames - 1
+                          if self.independent_first_frame else
+                          num_training_frames)
 
-        # Sample number of blocks and sync across processes
-        num_generated_blocks = torch.randint(min_num_blocks,
-                                             max_num_blocks + 1, (1, ),
+        sampled_total_frames = torch.randint(min_num_frames,
+                                             max_num_frames + 1, (1, ),
                                              device=self.device)
         if dist.is_initialized():
-            dist.broadcast(num_generated_blocks, src=0)
-        num_generated_blocks = num_generated_blocks.item()
-        num_generated_frames = num_generated_blocks * self.num_frame_per_block
+            dist.broadcast(sampled_total_frames, src=0)
+        num_generated_frames = int(sampled_total_frames.item())
         if self.independent_first_frame and initial_latent is None:
             num_generated_frames += 1
             min_num_frames += 1
 
+        num_input_frames = initial_latent.shape[
+            1] if initial_latent is not None else 0
+        rollout_num_frames = max(0, num_generated_frames - num_input_frames)
+
         # Create noise with dynamic shape
-        if initial_latent is not None:
-            noise_shape = [
-                batch_size, num_generated_frames - 1,
-                *self.video_latent_shape[2:]
-            ]
-        else:
-            noise_shape = [
-                batch_size, num_generated_frames, *self.video_latent_shape[2:]
-            ]
+        noise_shape = [batch_size, rollout_num_frames, *self.video_latent_shape[2:]]
 
         noise = torch.randn(noise_shape, device=self.device, dtype=dtype)
         if self.sp_world_size > 1:
@@ -470,17 +501,19 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
         batch_size, num_frames, num_channels, height, width = noise.shape
 
-        # Block size calculation
-        if not self.independent_first_frame or (self.independent_first_frame
-                                                and initial_latent is not None):
-            assert num_frames % self.num_frame_per_block == 0
-            num_blocks = num_frames // self.num_frame_per_block
-        else:
-            assert (num_frames - 1) % self.num_frame_per_block == 0
-            num_blocks = (num_frames - 1) // self.num_frame_per_block
+        # Build rollout chunks. The tail chunk may contain a remainder smaller
+        # than num_frame_per_block when a first-frame latent is used.
+        remainder_frames = num_frames
+        all_num_frames: list[int] = []
+        if self.independent_first_frame and initial_latent is None:
+            all_num_frames.append(1)
+            remainder_frames = max(0, remainder_frames - 1)
+        full_blocks, tail_frames = divmod(remainder_frames,
+                                          self.num_frame_per_block)
+        all_num_frames.extend([self.num_frame_per_block] * full_blocks)
+        if tail_frames > 0:
+            all_num_frames.append(tail_frames)
 
-        num_input_frames = initial_latent.shape[
-            1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -526,9 +559,6 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             current_start_frame += 1
 
         # Step 3: Temporal denoising loop
-        all_num_frames = [self.num_frame_per_block] * num_blocks
-        if self.independent_first_frame and initial_latent is None:
-            all_num_frames = [1] + all_num_frames
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(len(all_num_frames),
                                                  num_denoising_steps,
@@ -672,7 +702,11 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
         # Handle "last N frames" logic (N = gradient_mask_last_n_frames).
         pred_image_or_video = output
-        if num_input_frames > 0:
+        keep_initial_latent_in_output = (
+            num_input_frames > 0
+            and getattr(training_batch, "first_frame_latent", None) is not None
+        )
+        if num_input_frames > 0 and not keep_initial_latent_in_output:
             pred_image_or_video = output[:, num_input_frames:]
 
         # Slice last N frames if we generated more
@@ -1000,10 +1034,27 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
         training_batch.dmd_latent_vis_dict = {}
         training_batch.fake_score_latent_vis_dict = {}
+        training_batch.grad_norm = None
+        training_batch.generator_update_step = float(train_generator)
+        for attr in (
+                "generator_grad_norm_preclip",
+                "generator_grad_norm_postclip",
+                "generator_grad_clip_coef",
+                "generator_grad_was_clipped",
+                "critic_grad_norm_preclip",
+                "critic_grad_norm_postclip",
+                "critic_grad_clip_coef",
+                "critic_grad_was_clipped",
+        ):
+            setattr(training_batch, attr, None)
 
         if train_generator:
             logger.debug("Training generator at step %s",
                          self.current_trainstep)
+            if empty_cache_before_gen_step and torch.cuda.is_available():
+                # Release allocator-held cached blocks before the heavier
+                # generator backward to reduce fragmentation-related OOMs.
+                torch.cuda.empty_cache()
             self.optimizer.zero_grad()
             if self.transformer_2 is not None:
                 self.optimizer_2.zero_grad()
@@ -1055,13 +1106,25 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
             # Only clip gradients and step optimizer for the model that is currently training
             if train_generator_expert_2 and self.transformer_2 is not None:
-                self._clip_model_grad_norm_(batch_gen, self.transformer_2)
+                self._clip_model_grad_norm_(batch_gen,
+                                            self.transformer_2,
+                                            log_prefix="generator")
                 self.optimizer_2.step()
                 self.lr_scheduler_2.step()
             else:
-                self._clip_model_grad_norm_(batch_gen, self.transformer)
+                self._clip_model_grad_norm_(batch_gen,
+                                            self.transformer,
+                                            log_prefix="generator")
                 self.optimizer.step()
                 self.lr_scheduler.step()
+            for attr in (
+                    "grad_norm",
+                    "generator_grad_norm_preclip",
+                    "generator_grad_norm_postclip",
+                    "generator_grad_clip_coef",
+                    "generator_grad_was_clipped",
+            ):
+                setattr(training_batch, attr, getattr(batch_gen, attr, None))
 
             if self.generator_ema is not None:
                 if train_generator_expert_2 and self.transformer_2 is not None:
@@ -1120,14 +1183,24 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
         if self.train_fake_score_transformer_2 and self.fake_score_transformer_2 is not None:
             self._clip_model_grad_norm_(batch_critic,
-                                        self.fake_score_transformer_2)
+                                        self.fake_score_transformer_2,
+                                        log_prefix="critic")
             self.fake_score_optimizer_2.step()
             self.fake_score_lr_scheduler_2.step()
         else:
             self._clip_model_grad_norm_(batch_critic,
-                                        self.fake_score_transformer)
+                                        self.fake_score_transformer,
+                                        log_prefix="critic")
             self.fake_score_optimizer.step()
             self.fake_score_lr_scheduler.step()
+        for attr in (
+                "grad_norm",
+                "critic_grad_norm_preclip",
+                "critic_grad_norm_postclip",
+                "critic_grad_clip_coef",
+                "critic_grad_was_clipped",
+        ):
+            setattr(training_batch, attr, getattr(batch_critic, attr, None))
 
         avg_critic_loss = torch.tensor(total_critic_loss /
                                        gradient_accumulation_steps,
@@ -1604,6 +1677,12 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
         self.train_loader_iter = iter(self.train_dataloader)
 
         step_times: deque[float] = deque(maxlen=100)
+        training_state_ckpt_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "training_state_checkpointing_steps", 0))
+        weight_only_ckpt_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "weight_only_checkpointing_steps", 0))
+        validation_steps = _safe_nonnegative_int(
+            getattr(self.training_args, "validation_steps", 0))
 
         self._log_training_info()
         self._log_validation(self.transformer, self.training_args,
@@ -1668,6 +1747,10 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
             generator_loss = training_batch.generator_loss
             fake_score_loss = training_batch.fake_score_loss
             grad_norm = training_batch.grad_norm
+            generator_grad_norm = getattr(training_batch,
+                                          "generator_grad_norm_preclip", None)
+            critic_grad_norm = getattr(training_batch,
+                                       "critic_grad_norm_preclip", None)
 
             step_time = time.perf_counter() - start_time
             step_times.append(step_time)
@@ -1683,7 +1766,11 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 "step_time":
                 f"{step_time:.2f}s",
                 "grad_norm":
-                grad_norm,
+                _format_optional_log_scalar(grad_norm, precision=3),
+                "g_grad":
+                _format_optional_log_scalar(generator_grad_norm, precision=3),
+                "d_grad":
+                _format_optional_log_scalar(critic_grad_norm, precision=3),
                 "ema":
                 "✓" if (self.generator_ema is not None and self.is_ema_ready())
                 else "✗",
@@ -1707,11 +1794,30 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                     step_time,
                     "avg_step_time":
                     avg_step_time,
-                    "grad_norm":
-                    grad_norm,
+                    "generator_update_step":
+                    getattr(training_batch, "generator_update_step", 0.0),
                 }
+                if grad_norm is not None:
+                    log_data["grad_norm"] = grad_norm
                 if (step % self.dfake_gen_update_ratio == 0):
                     log_data["train_generator_loss"] = generator_loss
+                for source_attr, log_key in (
+                    ("generator_grad_norm_preclip",
+                     "generator_grad_norm_preclip"),
+                    ("generator_grad_norm_postclip",
+                     "generator_grad_norm_postclip"),
+                    ("generator_grad_clip_coef", "generator_grad_clip_coef"),
+                    ("generator_grad_was_clipped",
+                     "generator_grad_was_clipped"),
+                    ("critic_grad_norm_preclip", "critic_grad_norm_preclip"),
+                    ("critic_grad_norm_postclip", "critic_grad_norm_postclip"),
+                    ("critic_grad_clip_coef", "critic_grad_clip_coef"),
+                    ("critic_grad_was_clipped", "critic_grad_was_clipped"),
+                ):
+                    value = _to_optional_log_scalar(
+                        getattr(training_batch, source_attr, None))
+                    if value is not None:
+                        log_data[log_key] = value
                 if use_vsa:
                     log_data["VSA_train_sparsity"] = current_vsa_sparsity
 
@@ -1758,61 +1864,14 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
 
                 self.tracker.log(log_data, step)
 
-                if self.training_args.log_validation and step % self.training_args.validation_steps == 0 and self.training_args.log_visualization:
+                if (self.training_args.log_validation and validation_steps > 0
+                        and step % validation_steps == 0
+                        and self.training_args.log_visualization):
                     self.visualize_intermediate_latents(training_batch,
                                                         self.training_args,
                                                         step)
 
-            if (self.training_args.training_state_checkpointing_steps > 0
-                    and step %
-                    self.training_args.training_state_checkpointing_steps == 0):
-                print("rank", self.global_rank,
-                      "save training state checkpoint at step", step)
-                save_distillation_checkpoint(
-                    self.transformer,
-                    self.fake_score_transformer,
-                    self.global_rank,
-                    self.training_args.output_dir,
-                    step,
-                    self.optimizer,
-                    self.fake_score_optimizer,
-                    self.train_dataloader,
-                    self.lr_scheduler,
-                    self.fake_score_lr_scheduler,
-                    self.noise_random_generator,
-                    self.generator_ema,
-                    save_consolidated_inference_checkpoint=False,
-                    generator_controlnet=getattr(self, "controlnet", None),
-                    fake_score_controlnet=getattr(self, "fake_score_controlnet",
-                                                  None),
-                    # MoE support
-                    generator_transformer_2=getattr(self, 'transformer_2',
-                                                    None),
-                    real_score_transformer_2=getattr(
-                        self, 'real_score_transformer_2', None),
-                    fake_score_transformer_2=getattr(
-                        self, 'fake_score_transformer_2', None),
-                    generator_optimizer_2=getattr(self, 'optimizer_2', None),
-                    fake_score_optimizer_2=getattr(self,
-                                                   'fake_score_optimizer_2',
-                                                   None),
-                    generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
-                    fake_score_scheduler_2=getattr(self,
-                                                   'fake_score_lr_scheduler_2',
-                                                   None),
-                    generator_ema_2=getattr(self, 'generator_ema_2', None))
-
-                self._maybe_log_checkpoint_preview(training_batch,
-                                                   step,
-                                                   tag="train_state")
-
-                if self.transformer:
-                    self.transformer.train()
-                self.sp_group.barrier()
-
-            if (self.training_args.weight_only_checkpointing_steps > 0
-                    and step %
-                    self.training_args.weight_only_checkpointing_steps == 0):
+            if weight_only_ckpt_steps > 0 and step % weight_only_ckpt_steps == 0:
                 print("rank", self.global_rank,
                       "save weight-only checkpoint at step", step)
                 with ExitStack() as ema_stack:
@@ -1878,42 +1937,95 @@ class SelfForcingDistillationPipeline(DistillationPipeline):
                 if self.is_ema_ready():
                     self.save_ema_weights(self.training_args.output_dir, step)
 
-            if self.training_args.log_validation and step % self.training_args.validation_steps == 0:
+            if (training_state_ckpt_steps > 0
+                    and step % training_state_ckpt_steps == 0):
+                print("rank", self.global_rank,
+                      "save training state checkpoint at step", step)
+                save_distillation_checkpoint(
+                    self.transformer,
+                    self.fake_score_transformer,
+                    self.global_rank,
+                    self.training_args.output_dir,
+                    step,
+                    self.optimizer,
+                    self.fake_score_optimizer,
+                    self.train_dataloader,
+                    self.lr_scheduler,
+                    self.fake_score_lr_scheduler,
+                    self.noise_random_generator,
+                    self.generator_ema,
+                    save_consolidated_inference_checkpoint=False,
+                    generator_controlnet=getattr(self, "controlnet", None),
+                    fake_score_controlnet=getattr(self, "fake_score_controlnet",
+                                                  None),
+                    # MoE support
+                    generator_transformer_2=getattr(self, 'transformer_2',
+                                                    None),
+                    real_score_transformer_2=getattr(
+                        self, 'real_score_transformer_2', None),
+                    fake_score_transformer_2=getattr(
+                        self, 'fake_score_transformer_2', None),
+                    generator_optimizer_2=getattr(self, 'optimizer_2', None),
+                    fake_score_optimizer_2=getattr(self,
+                                                   'fake_score_optimizer_2',
+                                                   None),
+                    generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
+                    fake_score_scheduler_2=getattr(self,
+                                                   'fake_score_lr_scheduler_2',
+                                                   None),
+                    generator_ema_2=getattr(self, 'generator_ema_2', None))
+
+                self._maybe_log_checkpoint_preview(training_batch,
+                                                   step,
+                                                   tag="train_state")
+
+                if self.transformer:
+                    self.transformer.train()
+                self.sp_group.barrier()
+
+            if (self.training_args.log_validation and validation_steps > 0
+                    and step % validation_steps == 0):
                 self._log_validation(self.transformer, self.training_args, step)
 
         self.tracker.finish()
 
-        print("rank", self.global_rank,
-              "save final training state checkpoint at step",
-              self.training_args.max_train_steps)
-        save_distillation_checkpoint(
-            self.transformer,
-            self.fake_score_transformer,
-            self.global_rank,
-            self.training_args.output_dir,
-            self.training_args.max_train_steps,
-            self.optimizer,
-            self.fake_score_optimizer,
-            self.train_dataloader,
-            self.lr_scheduler,
-            self.fake_score_lr_scheduler,
-            self.noise_random_generator,
-            self.generator_ema,
-            generator_controlnet=getattr(self, "controlnet", None),
-            fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
-            # MoE support
-            generator_transformer_2=getattr(self, 'transformer_2', None),
-            real_score_transformer_2=getattr(self, 'real_score_transformer_2',
-                                             None),
-            fake_score_transformer_2=getattr(self, 'fake_score_transformer_2',
-                                             None),
-            generator_optimizer_2=getattr(self, 'optimizer_2', None),
-            fake_score_optimizer_2=getattr(self, 'fake_score_optimizer_2',
-                                           None),
-            generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
-            fake_score_scheduler_2=getattr(self, 'fake_score_lr_scheduler_2',
-                                           None),
-            generator_ema_2=getattr(self, 'generator_ema_2', None))
+        if training_state_ckpt_steps > 0:
+            print("rank", self.global_rank,
+                  "save final training state checkpoint at step",
+                  self.training_args.max_train_steps)
+            save_distillation_checkpoint(
+                self.transformer,
+                self.fake_score_transformer,
+                self.global_rank,
+                self.training_args.output_dir,
+                self.training_args.max_train_steps,
+                self.optimizer,
+                self.fake_score_optimizer,
+                self.train_dataloader,
+                self.lr_scheduler,
+                self.fake_score_lr_scheduler,
+                self.noise_random_generator,
+                self.generator_ema,
+                generator_controlnet=getattr(self, "controlnet", None),
+                fake_score_controlnet=getattr(self, "fake_score_controlnet", None),
+                # MoE support
+                generator_transformer_2=getattr(self, 'transformer_2', None),
+                real_score_transformer_2=getattr(self, 'real_score_transformer_2',
+                                                 None),
+                fake_score_transformer_2=getattr(self, 'fake_score_transformer_2',
+                                                 None),
+                generator_optimizer_2=getattr(self, 'optimizer_2', None),
+                fake_score_optimizer_2=getattr(self, 'fake_score_optimizer_2',
+                                               None),
+                generator_scheduler_2=getattr(self, 'lr_scheduler_2', None),
+                fake_score_scheduler_2=getattr(self, 'fake_score_lr_scheduler_2',
+                                               None),
+                generator_ema_2=getattr(self, 'generator_ema_2', None))
+        else:
+            logger.info(
+                "Skipping final training-state checkpoint because training_state_checkpointing_steps=%s",
+                training_state_ckpt_steps,
+            )
 
         if self.is_ema_ready():
             self.save_ema_weights(self.training_args.output_dir,

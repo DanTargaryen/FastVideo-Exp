@@ -1,0 +1,133 @@
+# FastVideo training config for:
+#   Wan TI2V + ControlNet + Self-Forcing (Phase-3 MC401 w2-only bootstrap 1000-step run)
+#
+# Goal:
+# - Use the 401-frame MatrixCity parquet provided by the user
+# - Roll out exactly 2 windows
+# - Randomly supervise window 1 or window 2 with 1:1 probability
+# - Enable cached bootstrap control for the first window
+# - Save weight-only checkpoints every 25 steps while continuing to 1000 steps
+
+mode: distillation
+workload_type: i2v
+dit_precision: fp32
+inference_mode: false
+
+# ---- Paths ----
+pretrained_model_name_or_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+real_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+fake_score_model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+
+controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+real_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+fake_score_controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+
+init_weights_from_safetensors: /vePFS-buaa/linming/workspace/worldrender/phase2_ode_out/checkpoint-3000/generator_inference_transformer/diffusion_pytorch_model.safetensors
+init_controlnet_weights_from_safetensors: /vePFS-buaa/linming/workspace/worldrender/phase2_ode_out/checkpoint-3000/generator_inference_controlnet/diffusion_pytorch_model.safetensors
+
+# ---- Dataset ----
+data_path: /vePFS-buaa/linming/workspace/worldrender/MATRIXCITY_PARQUET_PHASE3_401_BOOTSTRAP_W0CTRL_DN401_POSEFILTERED_SEGMENTED_R5_ROT10
+online_warp_training: true
+online_warp_raw_root: /vePFS-buaa/yinli/datasets/matrixcity
+online_warp_street_split: train_dense
+online_warp_camera_mode: B_inv
+online_warp_window_frames: 81
+online_warp_overlap_frames: 1
+online_warp_num_keyframes: 4
+online_warp_selection_num_target_samples: 3
+online_warp_selection_voxel_size: 0.1
+online_warp_depth_normalization_mode: percentile
+online_warp_require_normal: true
+online_warp_use_bootstrap_control_for_first_window: true
+online_warp_rollout_min_windows: 2
+online_warp_rollout_max_windows: 2
+online_warp_rollout_window_weights: "1.0"
+online_warp_supervised_window_policy: random
+online_warp_supervised_window_weights: "1.0,1.0"
+dataloader_num_workers: 2
+train_batch_size: 1
+train_sp_batch_size: 1
+
+# ---- Shapes ----
+num_height: 384
+num_width: 512
+num_frames: 81
+num_latent_t: 21
+
+# ---- Self-forcing ----
+simulate_generator_forward: true
+num_frame_per_block: 3
+local_attn_size: 21
+sink_size: 1
+context_noise: 0
+dfake_gen_update_ratio: 5
+
+# ---- DMD / CFG ----
+real_score_guidance_scale: 3.0
+training_cfg_rate: 0.0
+dmd_grad_normalizer_min: 1.0e-3
+dmd_grad_normalizer_ema_decay: 0.99
+dmd_grad_normalizer_ema_floor_ratio: 0.1
+dmd_grad_value_clip: 10.0
+dmd_teacher_adaptive_clamp: true
+dmd_teacher_adaptive_start_ratio: 0.7
+dmd_teacher_high_noise_cfg_delta_max_ratio: 1.0
+dmd_teacher_high_noise_residual_max_ratio: 1.0
+dmd_teacher_high_noise_output_max_ratio: 1.0
+dmd_teacher_cfg_use_uncond_base: true
+dmd_teacher_adaptive_guidance: true
+dmd_teacher_guidance_high_noise_threshold_ratio: 0.7
+dmd_teacher_high_noise_guidance_scale: 2.0
+dmd_denoising_steps: "1000,750,500,250"
+warp_denoising_step: true
+ts_schedule: false
+ts_schedule_max: false
+normalize_condition_latents: false
+negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+
+# ---- Training ----
+max_train_steps: 1000
+gradient_accumulation_steps: 6
+learning_rate: 2.0e-6
+weight_decay: 0.01
+betas: "0.0,0.999"
+mixed_precision: bf16
+max_grad_norm: 1.0
+enable_gradient_checkpointing_type: full
+fake_score_learning_rate: 4.0e-7
+fake_score_betas: "0.0,0.999"
+
+min_timestep_ratio: 0.02
+max_timestep_ratio: 0.98
+
+ema_decay: 0.999
+ema_start_step: 200
+use_ema: true
+seed: 1024
+
+# ---- Parallelism ----
+tp_size: 1
+sp_size: 1
+hsdp_replicate_dim: 1
+hsdp_shard_dim: 7
+num_gpus: 7
+
+# ---- Scheduler ----
+flow_shift: 5
+
+# ---- Checkpointing / logs ----
+output_dir: /vePFS-buaa/linming/workspace/worldrender/phase3_dmd_out_causal_lr_ga6_mc401_posefiltered_r5rot10_w2only_bootstrap_1000step
+checkpoints_total_limit: 4
+training_state_checkpointing_steps: 0
+weight_only_checkpointing_steps: 25
+log_validation: false
+
+# ---- Tracking / Preview ----
+tracker_project_name: worldrender_phase3
+wandb_run_name: phase3_dmd_from_phase2ode_ckpt3000_lr2e6_f4e7_ga6_mc401_posefiltered_r5rot10_w2only_bootstrap_1000step
+wandb_mode: online
+
+checkpoint_preview: false
+checkpoint_preview_fps: 16
+checkpoint_preview_max_frames: 0

@@ -1,0 +1,53 @@
+mode: distillation
+workload_type: i2v
+inference_mode: false
+
+pretrained_model_name_or_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+model_path: /vePFS-buaa/linming/workspace/worldrender/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+controlnet_model_path: /vePFS-buaa/linming/workspace/worldrender/world-renderer-controlnet-union
+
+data_path: /vePFS-buaa/linming/workspace/worldrender/MATRIXCITY_PARQUET_PHASE1_401_SEGMENTED_RAWRGBWARP_VAE
+output_dir: /vePFS-buaa/linming/workspace/worldrender/phase1_artf_mc401_localattn9_8gpu
+
+train_batch_size: 1
+train_sp_batch_size: 1
+dataloader_num_workers: 2
+
+num_height: 384
+num_width: 512
+num_frames: 401
+num_latent_t: 101
+
+num_frame_per_block: 3
+local_attn_size: 9
+sink_size: 1
+context_noise: 0
+
+learning_rate: 5.0e-5
+weight_decay: 0.01
+betas: "0.9,0.999"
+max_train_steps: 10000
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+dit_precision: fp32
+enable_gradient_checkpointing_type: full
+max_grad_norm: 1.0
+
+min_timestep_ratio: 0.02
+max_timestep_ratio: 0.98
+
+tp_size: 1
+sp_size: 8
+num_gpus: 8
+hsdp_replicate_dim: 1
+hsdp_shard_dim: 8
+
+flow_shift: 5
+
+training_state_checkpointing_steps: 250
+weight_only_checkpointing_steps: 500
+checkpoints_total_limit: 2
+
+tracker_project_name: worldrender_phase1_artf
+wandb_run_name: phase1_artf_mc401_localattn9_8gpu
+wandb_mode: online

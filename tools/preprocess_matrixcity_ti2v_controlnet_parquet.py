@@ -32,9 +32,11 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,8 @@ from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.pipelines.stages.text_encoding import TextEncodingStage
+
+import tools.infer_wan_controlnet_ti2v as infer_base
 
 logger = init_logger(__name__)
 
@@ -260,23 +264,24 @@ def _load_depth_sequence(
     pmin: float,
     pmax: float,
     invert_depth: bool,
+    normalization_mode: str = "md_align",
 ) -> torch.Tensor:
-    # NOTE:
-    # This function intentionally matches FastVideo/run_wan_contorlnet_union.md
-    # process_depth logic for strict alignment:
-    # 1) per-frame near/far invalid filtering
-    # 2) global min/max normalization across the whole clip
-    # 3) invalid -> far(1.0)
-    # 4) map [0,1] -> [-1,1]
-    #
-    # `pmin/pmax` are kept in the signature for CLI compatibility but are not
-    # used in this strict md-aligned path.
-    _ = (pmin, pmax)
+    mode = str(normalization_mode).strip().lower() or "md_align"
+    if mode not in {"md_align", "percentile"}:
+        raise ValueError(
+            "normalization_mode must be one of {'md_align', 'percentile'}, "
+            f"got {normalization_mode!r}"
+        )
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
     for p in depth_paths:
         d = _read_depth_any(p)
-        if np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
+        if mode == "percentile":
+            mx = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+            if mx > 1.5:
+                d = d / (65535.0 if mx > 255.0 else 255.0)
+            d = np.clip(d, 0.0, 1.0)
+        elif np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
             d = d / 65535.0
 
         h0, w0 = d.shape
@@ -301,6 +306,14 @@ def _load_depth_sequence(
     valid_vals = stacked[np.isfinite(stacked)]
     if valid_vals.size == 0:
         lo, hi = 0.0, 1.0
+    elif mode == "percentile":
+        lo = float(np.percentile(valid_vals, pmin))
+        hi = float(np.percentile(valid_vals, pmax))
+        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+            lo = float(np.nanmin(valid_vals))
+            hi = float(np.nanmax(valid_vals))
+            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                lo, hi = 0.0, 1.0
     else:
         lo = float(np.nanmin(valid_vals))
         hi = float(np.nanmax(valid_vals))
@@ -484,6 +497,1261 @@ def _align_latent_channels(lat: torch.Tensor, target_c: int, name: str) -> torch
     )
 
 
+@torch.no_grad()
+def _encode_control_branch_latent(
+    vae,
+    branch_tchw: torch.Tensor,
+    *,
+    normalize: bool,
+    target_num_channels_latents: int,
+    latent_repeat: int,
+    name: str,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    if branch_tchw.ndim != 4:
+        raise ValueError(
+            f"{name} must be [T,C,H,W], got shape={tuple(branch_tchw.shape)}"
+        )
+    if int(branch_tchw.shape[1]) == 1:
+        branch_tchw = branch_tchw.repeat(1, 3, 1, 1)
+    elif int(branch_tchw.shape[1]) != 3:
+        raise ValueError(
+            f"{name} channel count must be 1 or 3 before VAE encode, got {int(branch_tchw.shape[1])}"
+        )
+
+    video_bcthw = _to_vae_input(branch_tchw, normalize=normalize).to(
+        device=device, dtype=compute_dtype
+    )
+    lat = _encode_video_latents(
+        vae,
+        video_bcthw,
+        sample_mode="mode",
+        compute_dtype=compute_dtype,
+    )[0].to("cpu", dtype=torch.float32)
+    if int(latent_repeat) != 1:
+        lat = lat.repeat(int(latent_repeat), 1, 1, 1)
+    return _align_latent_channels(lat, int(target_num_channels_latents), name)
+
+
+@dataclass(frozen=True)
+class _MatrixCityPoseSceneIndex:
+    scene_name: str
+    intrinsics_meta: dict[str, float | None]
+    rt_by_frame_id: dict[int, np.ndarray]
+    raw_pose_by_frame_id: dict[int, np.ndarray]
+
+
+def _list_matrixcity_scene_dirs(
+    *,
+    rgb_root: Path,
+    street_split: str,
+    street_dir: str,
+) -> list[Path]:
+    scene_root_candidates = [
+        rgb_root / "small_city" / "street" / str(street_split),
+        rgb_root / "street" / str(street_split),
+    ]
+    if str(street_dir).strip():
+        requested = str(street_dir).strip()
+        for scene_root in scene_root_candidates:
+            scene_dir = scene_root / requested
+            if scene_dir.is_dir():
+                return [scene_dir]
+        return []
+
+    scene_dirs: list[Path] = []
+    seen: set[str] = set()
+    for scene_root in scene_root_candidates:
+        if not scene_root.is_dir():
+            continue
+        for scene_dir in sorted(p for p in scene_root.iterdir() if p.is_dir()):
+            key = str(scene_dir.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            scene_dirs.append(scene_dir)
+    return scene_dirs
+
+
+def _sequence_window_starts(
+    *,
+    available_ids: list[int],
+    clip_length: int,
+    stride: int,
+) -> list[int]:
+    if int(clip_length) <= 0:
+        raise ValueError(f"clip_length must be > 0, got {clip_length}")
+    if int(stride) <= 0:
+        raise ValueError(f"stride must be > 0, got {stride}")
+    if not available_ids:
+        return []
+
+    unique_ids = sorted({int(x) for x in available_ids})
+    min_id = unique_ids[0]
+    max_id = unique_ids[-1]
+    last_valid_start = int(max_id) - int(clip_length) + 1
+    if last_valid_start < int(min_id):
+        return []
+
+    available_set = set(unique_ids)
+    starts: list[int] = []
+    for start in range(int(min_id), int(last_valid_start) + 1, int(stride)):
+        if all((int(start) + i) in available_set for i in range(int(clip_length))):
+            starts.append(int(start))
+
+    tail_start = int(last_valid_start)
+    if (not starts) or starts[-1] != tail_start:
+        if all((tail_start + i) in available_set for i in range(int(clip_length))):
+            starts.append(tail_start)
+    return starts
+
+
+def _build_online_warp_prompt(prompt_template: str, scene_name: str) -> str:
+    scene_text = str(scene_name).replace("_", " ").strip()
+    prompt = str(prompt_template).replace("{scene}", scene_text)
+    prompt = _prompt_clean(prompt)
+    if prompt:
+        return prompt
+    return "A continuous driving view through a city street."
+
+
+def _build_raw_online_warp_clip_paths(
+    *,
+    rgb_root: Path,
+    street_split: str,
+    street_dir: str,
+    clip_length: int,
+    stride: int,
+    pose_frame_ids_by_scene: dict[str, set[int]] | None = None,
+    scene_pose_index_by_scene: dict[str, _MatrixCityPoseSceneIndex] | None = None,
+    pose_filter_translation_ratio: float = 0.0,
+    pose_filter_max_rotation_deg: float = 0.0,
+) -> list[Path]:
+    clip_paths: list[Path] = []
+    for scene_dir in _list_matrixcity_scene_dirs(
+        rgb_root=rgb_root,
+        street_split=street_split,
+        street_dir=street_dir,
+    ):
+        scene_name = scene_dir.name
+        if pose_frame_ids_by_scene is not None and scene_name not in pose_frame_ids_by_scene:
+            logger.warning(
+                "Skip raw online-warp scene without pose index: %s",
+                scene_name,
+            )
+            continue
+        rgb_dir = scene_dir / scene_name
+        if not rgb_dir.is_dir():
+            logger.warning("Skip scene without rgb dir: %s", scene_dir)
+            continue
+        rgb_files = _sorted_pngs(rgb_dir)
+        rgb_id_map = _build_numeric_file_map(rgb_files)
+        available_ids = sorted(rgb_id_map.keys())
+        if pose_frame_ids_by_scene is not None:
+            available_ids = sorted(
+                set(rgb_id_map.keys()) & set(pose_frame_ids_by_scene.get(scene_name, set()))
+            )
+            if len(available_ids) >= int(clip_length):
+                clip_starts = _sequence_window_starts(
+                    available_ids=available_ids,
+                    clip_length=int(clip_length),
+                    stride=int(stride),
+                )
+            else:
+                clip_starts = []
+        else:
+            if len(rgb_id_map) >= int(clip_length):
+                clip_starts = _sequence_window_starts(
+                    available_ids=sorted(rgb_id_map.keys()),
+                    clip_length=int(clip_length),
+                    stride=int(stride),
+                )
+            else:
+                max_start = len(rgb_files) - int(clip_length)
+                if max_start < 0:
+                    clip_starts = []
+                else:
+                    clip_starts = list(range(0, int(max_start) + 1, int(stride)))
+                    if clip_starts and clip_starts[-1] != int(max_start):
+                        clip_starts.append(int(max_start))
+                    elif not clip_starts:
+                        clip_starts = [0]
+        clip_starts_before_filter = len(clip_starts)
+        if clip_starts and (
+            float(pose_filter_translation_ratio) > 0.0
+            or float(pose_filter_max_rotation_deg) > 0.0
+        ):
+            scene_pose_index = None
+            if scene_pose_index_by_scene is not None:
+                scene_pose_index = scene_pose_index_by_scene.get(scene_name)
+            if scene_pose_index is None:
+                logger.warning(
+                    "Pose continuity filter requested but scene pose index missing for scene=%s; keep unfiltered clip starts.",
+                    scene_name,
+                )
+            else:
+                clip_starts = _segment_clip_starts_by_pose_continuity(
+                    scene_name=scene_name,
+                    available_ids=available_ids,
+                    clip_length=int(clip_length),
+                    stride=int(stride),
+                    scene_pose_index=scene_pose_index,
+                    translation_ratio=float(pose_filter_translation_ratio),
+                    max_rotation_deg=float(pose_filter_max_rotation_deg),
+                )
+        if not clip_starts:
+            if clip_starts_before_filter > 0:
+                logger.warning(
+                    "Skip scene after pose continuity filtering removed all candidate clips: scene=%s clip_length=%d",
+                    scene_name,
+                    int(clip_length),
+                )
+            else:
+                logger.warning(
+                    "Skip scene with insufficient raw clip coverage: scene=%s clip_length=%d",
+                    scene_name,
+                    int(clip_length),
+                )
+            continue
+        for clip_start in clip_starts:
+            window_start = int(clip_start)
+            window_end = int(clip_start) + int(clip_length) - 1
+            clip_paths.append(
+                Path(scene_name)
+                / f"{window_start}_{window_end}"
+                / f"clip_start_{clip_start}"
+            )
+    return clip_paths
+
+
+class _OnlineWarpVisibilityMap:
+
+    def __init__(self, voxel_size: float = 0.1) -> None:
+        self.voxel_size = float(voxel_size)
+        self.voxel_vis: dict[tuple[int, int, int], set[int]] = {}
+
+    def points_to_voxels(self, points_world: np.ndarray) -> set[tuple[int, int, int]]:
+        if int(points_world.shape[0]) == 0:
+            return set()
+        voxels = np.floor(points_world / float(self.voxel_size)).astype(np.int32)
+        return set(map(tuple, voxels.tolist()))
+
+    def add_view(self, frame_idx: int, points_world: np.ndarray) -> None:
+        voxels = self.points_to_voxels(points_world)
+        for voxel in voxels:
+            self.voxel_vis.setdefault(voxel, set()).add(int(frame_idx))
+
+    def query_top_k_complementary_views(
+        self,
+        *,
+        target_voxels: set[tuple[int, int, int]],
+        k: int,
+        valid_history_ids: set[int] | None = None,
+    ) -> list[int]:
+        remaining_voxels = set(target_voxels)
+        selected_views: list[int] = []
+        for _ in range(int(k)):
+            view_counts: dict[int, int] = {}
+            for voxel in remaining_voxels:
+                for frame_idx in self.voxel_vis.get(voxel, ()):
+                    if valid_history_ids is not None and int(frame_idx) not in valid_history_ids:
+                        continue
+                    if int(frame_idx) in selected_views:
+                        continue
+                    view_counts[int(frame_idx)] = view_counts.get(int(frame_idx), 0) + 1
+            if not view_counts:
+                break
+            best_view = max(view_counts, key=view_counts.get)
+            selected_views.append(int(best_view))
+            covered = {
+                voxel for voxel in remaining_voxels
+                if int(best_view) in self.voxel_vis.get(voxel, ())
+            }
+            remaining_voxels -= covered
+        return selected_views
+
+
+def _pad_tchw(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    if int(x.shape[0]) >= int(target_len):
+        return x[:target_len]
+    if int(x.shape[0]) <= 0:
+        raise ValueError("cannot pad empty frame tensor")
+    pad = x[-1:].repeat(int(target_len) - int(x.shape[0]), 1, 1, 1)
+    return torch.cat([x, pad], dim=0)
+
+
+def _matrixcity_variant_rt(rot_mat: np.ndarray, mode: str) -> np.ndarray:
+    x = np.array(rot_mat, dtype=np.float32).copy()
+    if x.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 rot_mat, got {x.shape}")
+    if mode == "A_raw":
+        return x
+    if mode == "B_inv":
+        return np.linalg.inv(x)
+    if mode == "C_scale_inv":
+        x[:3, :3] *= 100.0
+        x[:3, 3] /= 100.0
+        return np.linalg.inv(x)
+    if mode == "D_scale_raw":
+        x[:3, :3] *= 100.0
+        x[:3, 3] /= 100.0
+        return x
+    raise KeyError(f"Unknown MatrixCity camera mode: {mode}")
+
+
+def _orthonormalize_rotation(rot: np.ndarray) -> np.ndarray:
+    r = np.array(rot, dtype=np.float64, copy=True)
+    if r.shape != (3, 3):
+        raise ValueError(f"Expected 3x3 rotation, got {r.shape}")
+    u, _, vh = np.linalg.svd(r)
+    r_ortho = u @ vh
+    if np.linalg.det(r_ortho) < 0:
+        u[:, -1] *= -1.0
+        r_ortho = u @ vh
+    return r_ortho
+
+
+def _pose_translation_step(raw_pose_prev: np.ndarray, raw_pose_next: np.ndarray) -> float:
+    prev_t = np.asarray(raw_pose_prev[:3, 3], dtype=np.float64)
+    next_t = np.asarray(raw_pose_next[:3, 3], dtype=np.float64)
+    return float(np.linalg.norm(next_t - prev_t))
+
+
+def _pose_relative_rotation_deg(raw_pose_prev: np.ndarray, raw_pose_next: np.ndarray) -> float:
+    r_prev = _orthonormalize_rotation(raw_pose_prev[:3, :3])
+    r_next = _orthonormalize_rotation(raw_pose_next[:3, :3])
+    rel = r_next @ r_prev.T
+    trace_val = float(np.trace(rel))
+    cos_theta = max(-1.0, min(1.0, (trace_val - 1.0) * 0.5))
+    return float(math.degrees(math.acos(cos_theta)))
+
+
+def _segment_clip_starts_by_pose_continuity(
+    *,
+    scene_name: str,
+    available_ids: list[int],
+    clip_length: int,
+    stride: int,
+    scene_pose_index: _MatrixCityPoseSceneIndex,
+    translation_ratio: float,
+    max_rotation_deg: float,
+) -> list[int]:
+    if not available_ids:
+        return []
+
+    use_translation_filter = float(translation_ratio) > 0.0
+    use_rotation_filter = float(max_rotation_deg) > 0.0
+    if not use_translation_filter and not use_rotation_filter:
+        return _sequence_window_starts(
+            available_ids=list(available_ids),
+            clip_length=int(clip_length),
+            stride=int(stride),
+        )
+
+    raw_pose_by_frame_id = scene_pose_index.raw_pose_by_frame_id
+    if not raw_pose_by_frame_id:
+        logger.warning(
+            "Pose continuity filter requested but raw pose index is empty for scene=%s; keep all %d clips.",
+            scene_name,
+            len(available_ids),
+        )
+        return _sequence_window_starts(
+            available_ids=list(available_ids),
+            clip_length=int(clip_length),
+            stride=int(stride),
+        )
+
+    translation_steps: list[float] = []
+    sorted_available_ids = sorted({int(x) for x in available_ids})
+    for prev_id, next_id in zip(sorted_available_ids[:-1], sorted_available_ids[1:]):
+        if int(next_id) != int(prev_id) + 1:
+            continue
+        raw_pose_prev = raw_pose_by_frame_id.get(int(prev_id))
+        raw_pose_next = raw_pose_by_frame_id.get(int(next_id))
+        if raw_pose_prev is None or raw_pose_next is None:
+            continue
+        step = _pose_translation_step(raw_pose_prev, raw_pose_next)
+        if math.isfinite(step):
+            translation_steps.append(step)
+
+    translation_threshold: float | None = None
+    translation_median: float | None = None
+    if use_translation_filter:
+        if not translation_steps:
+            logger.warning(
+                "Pose continuity translation filter requested but no consecutive pose pairs found for scene=%s; disabling translation filter for this scene.",
+                scene_name,
+            )
+        else:
+            translation_median = float(np.median(np.asarray(translation_steps, dtype=np.float64)))
+            translation_threshold = max(float(translation_median), 1e-6) * float(translation_ratio)
+
+    break_gap = 0
+    break_translation = 0
+    break_rotation = 0
+    break_missing_pose = 0
+    segments: list[list[int]] = []
+    current_segment: list[int] = [int(sorted_available_ids[0])]
+    for prev_id, next_id in zip(sorted_available_ids[:-1], sorted_available_ids[1:]):
+        prev_id = int(prev_id)
+        next_id = int(next_id)
+        if next_id != prev_id + 1:
+            break_gap += 1
+            segments.append(current_segment)
+            current_segment = [next_id]
+            continue
+
+        raw_pose_prev = raw_pose_by_frame_id.get(prev_id)
+        raw_pose_next = raw_pose_by_frame_id.get(next_id)
+        if raw_pose_prev is None or raw_pose_next is None:
+            break_missing_pose += 1
+            segments.append(current_segment)
+            current_segment = [next_id]
+            continue
+
+        pair_break_reason: str | None = None
+        if translation_threshold is not None:
+            translation_step = _pose_translation_step(raw_pose_prev, raw_pose_next)
+            if (not math.isfinite(translation_step)
+                    or translation_step > float(translation_threshold)):
+                pair_break_reason = "translation"
+        if pair_break_reason is None and use_rotation_filter:
+            rotation_deg = _pose_relative_rotation_deg(raw_pose_prev, raw_pose_next)
+            if (not math.isfinite(rotation_deg)
+                    or rotation_deg > float(max_rotation_deg)):
+                pair_break_reason = "rotation"
+
+        if pair_break_reason == "translation":
+            break_translation += 1
+            segments.append(current_segment)
+            current_segment = [next_id]
+            continue
+        if pair_break_reason == "rotation":
+            break_rotation += 1
+            segments.append(current_segment)
+            current_segment = [next_id]
+            continue
+        current_segment.append(next_id)
+
+    if current_segment:
+        segments.append(current_segment)
+
+    clip_starts: list[int] = []
+    usable_segments = 0
+    for segment_ids in segments:
+        if len(segment_ids) < int(clip_length):
+            continue
+        usable_segments += 1
+        clip_starts.extend(
+            _sequence_window_starts(
+                available_ids=segment_ids,
+                clip_length=int(clip_length),
+                stride=int(stride),
+            )
+        )
+
+    logger.info(
+        "Pose continuity segmentation scene=%s candidate_id_count=%d segments=%d usable_segments=%d clips_after=%d break_gap=%d break_translation=%d break_rotation=%d break_missing_pose=%d translation_median=%s translation_ratio=%.3f translation_threshold=%s rotation_threshold_deg=%s",
+        scene_name,
+        len(sorted_available_ids),
+        len(segments),
+        usable_segments,
+        len(clip_starts),
+        break_gap,
+        break_translation,
+        break_rotation,
+        break_missing_pose,
+        "n/a" if translation_median is None else f"{translation_median:.6f}",
+        float(translation_ratio),
+        "n/a" if translation_threshold is None else f"{translation_threshold:.6f}",
+        "n/a" if not use_rotation_filter else f"{float(max_rotation_deg):.6f}",
+    )
+    return sorted({int(x) for x in clip_starts})
+
+
+def _build_intrinsics_from_pose_meta(
+    intrinsics_meta: dict[str, float | None],
+    *,
+    src_w: int,
+    src_h: int,
+) -> np.ndarray:
+    fl_x = intrinsics_meta.get("fl_x")
+    fl_y = intrinsics_meta.get("fl_y")
+    cx = intrinsics_meta.get("cx")
+    cy = intrinsics_meta.get("cy")
+    if fl_x is None:
+        camera_angle_x = intrinsics_meta.get("camera_angle_x")
+        if camera_angle_x is None:
+            raise ValueError("pose metadata must contain fl_x or camera_angle_x")
+        fl_x = 0.5 * float(src_w) / math.tan(0.5 * float(camera_angle_x))
+    if fl_y is None:
+        camera_angle_y = intrinsics_meta.get("camera_angle_y")
+        if camera_angle_y is not None:
+            fl_y = 0.5 * float(src_h) / math.tan(0.5 * float(camera_angle_y))
+        else:
+            fl_y = float(fl_x)
+    if cx is None:
+        cx = float(src_w) / 2.0
+    if cy is None:
+        cy = float(src_h) / 2.0
+    return np.array(
+        [
+            [float(fl_x), 0.0, float(cx)],
+            [0.0, float(fl_y), float(cy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _load_matrixcity_pose_index(
+    *,
+    rgb_root: Path,
+    street_split: str,
+    camera_mode: str,
+) -> dict[str, _MatrixCityPoseSceneIndex]:
+    def _intrinsics_meta_from_json(data: dict[str, Any]) -> dict[str, float | None]:
+        return {
+            "fl_x": data.get("fl_x"),
+            "fl_y": data.get("fl_y"),
+            "cx": data.get("cx"),
+            "cy": data.get("cy"),
+            "camera_angle_x": data.get("camera_angle_x"),
+            "camera_angle_y": data.get("camera_angle_y"),
+        }
+
+    def _ensure_scene_payload(
+        scene_pose_map: dict[str, dict[str, Any]],
+        scene_name: str,
+        intrinsics_meta: dict[str, float | None],
+    ) -> dict[str, Any]:
+        if scene_name not in scene_pose_map:
+            scene_pose_map[scene_name] = {
+                "intrinsics_meta": dict(intrinsics_meta),
+                "rt_by_frame_id": {},
+                "raw_pose_by_frame_id": {},
+            }
+            return scene_pose_map[scene_name]
+        payload = scene_pose_map[scene_name]
+        for key, value in intrinsics_meta.items():
+            if payload["intrinsics_meta"].get(key) is None and value is not None:
+                payload["intrinsics_meta"][key] = value
+        return payload
+
+    scene_pose_map: dict[str, dict[str, Any]] = {}
+    scene_transforms_count = 0
+
+    # Preferred source: per-scene transforms.json under the raw split directory.
+    for scene_dir in _list_matrixcity_scene_dirs(
+        rgb_root=rgb_root,
+        street_split=street_split,
+        street_dir="",
+    ):
+        transforms_json = scene_dir / "transforms.json"
+        if not transforms_json.is_file():
+            continue
+        data = json.loads(transforms_json.read_text(encoding="utf-8"))
+        scene_name = scene_dir.name
+        payload = _ensure_scene_payload(
+            scene_pose_map,
+            scene_name,
+            _intrinsics_meta_from_json(data),
+        )
+        rt_by_frame_id = payload["rt_by_frame_id"]
+        raw_pose_by_frame_id = payload["raw_pose_by_frame_id"]
+        for fr in data.get("frames", []):
+            frame_idx = fr.get("frame_index")
+            rot_mat = fr.get("rot_mat") or fr.get("transform_matrix")
+            if frame_idx is None or rot_mat is None:
+                continue
+            raw_pose = np.array(rot_mat, dtype=np.float32)
+            rt_by_frame_id[int(frame_idx)] = _matrixcity_variant_rt(raw_pose, camera_mode)
+            raw_pose_by_frame_id[int(frame_idx)] = raw_pose
+        if rt_by_frame_id:
+            scene_transforms_count += 1
+
+    pose_root_candidates = [
+        rgb_root / "small_city" / "street" / "pose",
+        rgb_root / "street" / "pose",
+    ]
+    pose_jsons: list[Path] = []
+    for pose_root in pose_root_candidates:
+        if pose_root.is_dir():
+            pose_jsons.extend(sorted(pose_root.glob(f"*/transforms_{street_split}.json")))
+    if scene_transforms_count <= 0 and not pose_jsons:
+        raise FileNotFoundError(
+            f"No MatrixCity transforms/pose json found for split={street_split} under {rgb_root}"
+        )
+    pose_json_count = 0
+    for pose_json in pose_jsons:
+        data = json.loads(pose_json.read_text(encoding="utf-8"))
+        intrinsics_meta = _intrinsics_meta_from_json(data)
+        for fr in data.get("frames", []):
+            file_path = str(fr.get("file_path", "")).strip()
+            rot_mat = fr.get("rot_mat") or fr.get("transform_matrix")
+            if (not file_path) or rot_mat is None:
+                continue
+            path_obj = Path(file_path)
+            scene_name = path_obj.parent.name
+            frame_idx = _frame_index_from_stem(path_obj.stem)
+            if frame_idx is None:
+                continue
+            rt = _matrixcity_variant_rt(np.array(rot_mat, dtype=np.float32), camera_mode)
+            payload = _ensure_scene_payload(scene_pose_map, scene_name, intrinsics_meta)
+            rt_by_frame_id = payload["rt_by_frame_id"]
+            raw_pose_by_frame_id = payload["raw_pose_by_frame_id"]
+            prev_rt = rt_by_frame_id.get(int(frame_idx))
+            if prev_rt is not None:
+                continue
+            rt_by_frame_id[int(frame_idx)] = rt
+            raw_pose_by_frame_id[int(frame_idx)] = np.array(rot_mat, dtype=np.float32)
+        pose_json_count += 1
+
+    logger.info(
+        "MatrixCity pose index sources: scene_transforms=%d fallback_pose_jsons=%d",
+        int(scene_transforms_count),
+        int(pose_json_count),
+    )
+
+    out: dict[str, _MatrixCityPoseSceneIndex] = {}
+    for scene_name, payload in scene_pose_map.items():
+        out[scene_name] = _MatrixCityPoseSceneIndex(
+            scene_name=scene_name,
+            intrinsics_meta=dict(payload["intrinsics_meta"]),
+            rt_by_frame_id=dict(payload["rt_by_frame_id"]),
+            raw_pose_by_frame_id=dict(payload["raw_pose_by_frame_id"]),
+        )
+    return out
+
+
+def _chw_float_to_u8(x_chw: torch.Tensor) -> np.ndarray:
+    return (
+        x_chw.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0
+    ).round().astype(np.uint8)
+
+
+def _load_rgb_window_tchw(
+    rgb_paths: list[Path],
+    *,
+    start_pos: int,
+    end_pos: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    return torch.stack(
+        [_load_rgb_frame(p, int(height), int(width)) for p in rgb_paths[int(start_pos):int(end_pos)]],
+        dim=0,
+    )
+
+
+def _warp_maskrgb_from_keyframes_md_aligned_memory(
+    *,
+    keyframe_rgbs_u8: list[np.ndarray],
+    keyframe_frame_ids: list[int],
+    target_frame_ids: list[int],
+    depth_path_by_frame_id: dict[int, Path],
+    camera_k_aligned: np.ndarray,
+    rt_by_frame_id: dict[int, np.ndarray],
+    crop_params: tuple[int, int, int, int],
+    target_height: int,
+    target_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    warper = infer_base._PointCloudWarper()
+    source_clouds: list[tuple[np.ndarray, np.ndarray]] = []
+    for src_rgb, src_id in zip(keyframe_rgbs_u8, keyframe_frame_ids):
+        if int(src_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for source frame id {int(src_id)}")
+        if int(src_id) not in rt_by_frame_id:
+            raise KeyError(f"Missing RT for source frame id {int(src_id)}")
+        src_depth = infer_base._aligned_physical_depth(
+            depth_path_by_frame_id[int(src_id)],
+            crop_params,
+            int(target_width),
+            int(target_height),
+        )
+        points_world, colors = warper.back_project(
+            src_rgb,
+            src_depth,
+            camera_k_aligned,
+            rt_by_frame_id[int(src_id)],
+        )
+        source_clouds.append((points_world, colors))
+
+    merged_rgb_tensors: list[torch.Tensor] = []
+    merged_mask_tensors: list[torch.Tensor] = []
+    for tgt_id in target_frame_ids:
+        if int(tgt_id) not in depth_path_by_frame_id:
+            raise KeyError(f"Missing depth path for target frame id {int(tgt_id)}")
+        if int(tgt_id) not in rt_by_frame_id:
+            raise KeyError(f"Missing RT for target frame id {int(tgt_id)}")
+        tgt_depth = infer_base._aligned_physical_depth(
+            depth_path_by_frame_id[int(tgt_id)],
+            crop_params,
+            int(target_width),
+            int(target_height),
+        )
+
+        merged_rgb = np.zeros((int(target_height), int(target_width), 3), dtype=np.uint8)
+        merged_mask = np.zeros((int(target_height), int(target_width)), dtype=np.uint8)
+        for points_world, colors in source_clouds:
+            w_rgb, w_mask = warper.project_to_view(
+                points_world,
+                colors,
+                camera_k_aligned,
+                rt_by_frame_id[int(tgt_id)],
+                int(target_height),
+                int(target_width),
+                target_depth=tgt_depth,
+            )
+            valid_area = w_mask > 127.5
+            merged_rgb[valid_area] = w_rgb[valid_area]
+            merged_mask[valid_area] = 255
+
+        merged_rgb_tensors.append(
+            torch.from_numpy(merged_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+        )
+        merged_mask_tensors.append(
+            torch.from_numpy((merged_mask > 127.5).astype(np.float32))[None, ...].contiguous()
+        )
+
+    return torch.stack(merged_rgb_tensors, dim=0), torch.stack(merged_mask_tensors, dim=0)
+
+
+def _update_history_and_visibility_memory(
+    *,
+    frame_ids: list[int],
+    frames_tchw: torch.Tensor,
+    depth_path_by_id: dict[int, Path],
+    camera_k_aligned: np.ndarray,
+    rt_by_frame_id: dict[int, np.ndarray],
+    crop_params: tuple[int, int, int, int],
+    history_rgbs_u8: dict[int, np.ndarray],
+    processed_frame_ids: set[int],
+    visibility_map: _OnlineWarpVisibilityMap,
+) -> None:
+    warper = infer_base._PointCloudWarper()
+    H = int(frames_tchw.shape[-2])
+    W = int(frames_tchw.shape[-1])
+    for local_idx, frame_id in enumerate(frame_ids):
+        frame_id = int(frame_id)
+        if frame_id not in depth_path_by_id or frame_id not in rt_by_frame_id:
+            raise KeyError(f"Missing depth/RT for processed frame id {frame_id}")
+        rgb_u8 = _chw_float_to_u8(frames_tchw[local_idx])
+        history_rgbs_u8[frame_id] = rgb_u8
+        processed_frame_ids.add(frame_id)
+        depth_aligned = infer_base._aligned_physical_depth(
+            depth_path_by_id[frame_id],
+            crop_params,
+            W,
+            H,
+        )
+        points_world, _ = warper.back_project(
+            rgb_u8,
+            depth_aligned,
+            camera_k_aligned,
+            rt_by_frame_id[frame_id],
+        )
+        visibility_map.add_view(frame_id, points_world)
+
+
+def _select_keyframes_for_next_window_memory(
+    *,
+    visibility_map: _OnlineWarpVisibilityMap,
+    processed_frame_ids: set[int],
+    history_rgbs_u8: dict[int, np.ndarray],
+    target_frame_ids_for_chunk: list[int],
+    depth_path_by_id: dict[int, Path],
+    camera_k_aligned: np.ndarray,
+    rt_by_frame_id: dict[int, np.ndarray],
+    crop_params: tuple[int, int, int, int],
+    target_height: int,
+    target_width: int,
+    last_frame_id: int,
+    num_keyframes: int,
+    num_target_samples: int,
+) -> list[int]:
+    if int(last_frame_id) not in history_rgbs_u8:
+        raise KeyError(f"Missing RGB history for overlap frame {int(last_frame_id)}")
+
+    warper = infer_base._PointCloudWarper()
+    target_voxels: set[tuple[int, int, int]] = set()
+    if target_frame_ids_for_chunk:
+        sample_n = max(1, min(int(num_target_samples), len(target_frame_ids_for_chunk)))
+        sample_positions = np.linspace(
+            0, len(target_frame_ids_for_chunk) - 1, num=sample_n, dtype=int
+        ).tolist()
+        sampled_ids = [int(target_frame_ids_for_chunk[i]) for i in sample_positions]
+        dummy_rgb = np.zeros((int(target_height), int(target_width), 3), dtype=np.uint8)
+        for tgt_id in sampled_ids:
+            if int(tgt_id) not in depth_path_by_id or int(tgt_id) not in rt_by_frame_id:
+                continue
+            tgt_depth = infer_base._aligned_physical_depth(
+                depth_path_by_id[int(tgt_id)],
+                crop_params,
+                int(target_width),
+                int(target_height),
+            )
+            points_world, _ = warper.back_project(
+                dummy_rgb,
+                tgt_depth,
+                camera_k_aligned,
+                rt_by_frame_id[int(tgt_id)],
+            )
+            target_voxels.update(visibility_map.points_to_voxels(points_world))
+
+    k_query = max(0, int(num_keyframes) - 1)
+    best_keys = visibility_map.query_top_k_complementary_views(
+        target_voxels=target_voxels,
+        k=k_query,
+        valid_history_ids=processed_frame_ids,
+    )
+    selected = [int(fid) for fid in best_keys if int(fid) != int(last_frame_id)]
+
+    if len(selected) < k_query:
+        recent_candidates = sorted(
+            [int(fid) for fid in processed_frame_ids if int(fid) != int(last_frame_id)],
+            reverse=True,
+        )
+        for fid in recent_candidates:
+            if fid in selected or fid not in history_rgbs_u8:
+                continue
+            selected.append(fid)
+            if len(selected) >= k_query:
+                break
+
+    selected = selected[:k_query]
+    selected.append(int(last_frame_id))
+    return selected
+
+
+def _build_online_warp_controls_for_clip(
+    *,
+    rgb_paths: list[Path],
+    depth_paths: list[Path],
+    frame_ids: list[int],
+    scene_pose_index: _MatrixCityPoseSceneIndex,
+    target_height: int,
+    target_width: int,
+    window_frames: int,
+    overlap_frames: int,
+    num_keyframes: int,
+    num_target_samples: int,
+    selection_voxel_size: float,
+    control_policy: str = "history_keyframes",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    total_required = len(rgb_paths)
+    if total_required <= 0:
+        raise ValueError("online warp requires non-empty rgb_paths")
+    if len(depth_paths) != total_required or len(frame_ids) != total_required:
+        raise ValueError(
+            "online warp requires rgb/depth/frame_ids to have the same temporal length"
+        )
+    if int(window_frames) <= 0:
+        raise ValueError(f"online_warp_window_frames must be > 0, got {window_frames}")
+    if int(overlap_frames) < 0 or int(overlap_frames) >= int(window_frames):
+        raise ValueError(
+            f"online_warp_overlap_frames must satisfy 0 <= overlap < window, got overlap={overlap_frames}, window={window_frames}"
+        )
+    policy = str(control_policy).strip().lower() or "history_keyframes"
+    if policy not in {"history_keyframes", "segmented_single_anchor"}:
+        raise ValueError(
+            "online_warp control_policy must be one of "
+            "{'history_keyframes','segmented_single_anchor'}, "
+            f"got {control_policy!r}"
+        )
+
+    with Image.open(rgb_paths[0]) as ref_img:
+        src_w, src_h = ref_img.size
+    crop_params = infer_base._get_crop_params(
+        int(src_w), int(src_h), int(target_width), int(target_height)
+    )
+    camera_k = _build_intrinsics_from_pose_meta(
+        scene_pose_index.intrinsics_meta,
+        src_w=int(src_w),
+        src_h=int(src_h),
+    )
+    camera_k_aligned = infer_base._adjust_intrinsics(
+        camera_k,
+        crop_params,
+        int(target_width),
+        int(target_height),
+    )
+
+    rt_by_frame_id = scene_pose_index.rt_by_frame_id
+    depth_path_by_id = {int(fid): p for fid, p in zip(frame_ids, depth_paths)}
+    missing_rt_ids = [int(fid) for fid in frame_ids if int(fid) not in rt_by_frame_id]
+    if missing_rt_ids:
+        preview = ",".join(str(x) for x in missing_rt_ids[:5])
+        raise KeyError(
+            f"Missing MatrixCity pose entries for scene={scene_pose_index.scene_name} frame ids={preview}"
+        )
+
+    stride = int(window_frames) - int(overlap_frames)
+    num_windows = 1
+    if int(total_required) > int(window_frames):
+        num_windows = 1 + int(
+            math.ceil(float(total_required - int(window_frames)) / float(stride))
+        )
+
+    global_first_rgb = _load_rgb_frame(
+        rgb_paths[0], int(target_height), int(target_width)
+    )
+    final_mask = torch.zeros(
+        (int(total_required), 1, int(target_height), int(target_width)),
+        dtype=torch.float32,
+    )
+    final_masked_rgb = torch.zeros(
+        (int(total_required), 3, int(target_height), int(target_width)),
+        dtype=torch.float32,
+    )
+
+    history_rgbs_u8: dict[int, np.ndarray] = {}
+    processed_frame_ids: set[int] = set()
+    visibility_map = _OnlineWarpVisibilityMap(
+        voxel_size=float(selection_voxel_size)
+    )
+    carry_prefix_tchw: torch.Tensor | None = None
+    warped_masked_rgb_next: torch.Tensor | None = None
+    warped_mask_next: torch.Tensor | None = None
+
+    if policy == "segmented_single_anchor":
+        stride = int(window_frames) - int(overlap_frames)
+        segment_span = max(1, int(stride))
+        for anchor_local_idx in range(0, max(int(total_required) - 1, 1), segment_span):
+            anchor_rgb = _load_rgb_frame(
+                rgb_paths[int(anchor_local_idx)],
+                int(target_height),
+                int(target_width),
+            )
+            final_mask[int(anchor_local_idx)] = 1.0
+            final_masked_rgb[int(anchor_local_idx)] = anchor_rgb
+
+            target_start = int(anchor_local_idx + 1)
+            target_end = min(int(anchor_local_idx + segment_span),
+                             int(total_required) - 1)
+            target_ids = [int(fid) for fid in frame_ids[target_start:target_end + 1]]
+            if not target_ids:
+                continue
+            warped_masked_rgb_valid, warped_mask_valid = _warp_maskrgb_from_keyframes_md_aligned_memory(
+                keyframe_rgbs_u8=[_chw_float_to_u8(anchor_rgb)],
+                keyframe_frame_ids=[int(frame_ids[int(anchor_local_idx)])],
+                target_frame_ids=target_ids,
+                depth_path_by_frame_id=depth_path_by_id,
+                camera_k_aligned=camera_k_aligned,
+                rt_by_frame_id=rt_by_frame_id,
+                crop_params=crop_params,
+                target_height=int(target_height),
+                target_width=int(target_width),
+            )
+            for off, local_idx in enumerate(range(target_start, target_end + 1)):
+                final_mask[int(local_idx)] = warped_mask_valid[int(off)]
+                final_masked_rgb[int(local_idx)] = warped_masked_rgb_valid[int(off)]
+        return final_mask, final_masked_rgb
+
+    for win_idx in range(int(num_windows)):
+        start_pos = int(win_idx * stride)
+        valid_window = min(int(window_frames), int(total_required - start_pos))
+        if valid_window <= 0:
+            break
+        end_pos_valid = int(start_pos + valid_window)
+
+        current_rgb_window_tchw = _load_rgb_window_tchw(
+            rgb_paths,
+            start_pos=start_pos,
+            end_pos=end_pos_valid,
+            height=int(target_height),
+            width=int(target_width),
+        )
+
+        if win_idx == 0:
+            target_ids = [int(fid) for fid in frame_ids[start_pos + 1:end_pos_valid]]
+            if target_ids:
+                first_rgb_u8 = _chw_float_to_u8(global_first_rgb)
+                warped_masked_rgb_valid, warped_mask_valid = _warp_maskrgb_from_keyframes_md_aligned_memory(
+                    keyframe_rgbs_u8=[first_rgb_u8],
+                    keyframe_frame_ids=[int(frame_ids[0])],
+                    target_frame_ids=target_ids,
+                    depth_path_by_frame_id=depth_path_by_id,
+                    camera_k_aligned=camera_k_aligned,
+                    rt_by_frame_id=rt_by_frame_id,
+                    crop_params=crop_params,
+                    target_height=int(target_height),
+                    target_width=int(target_width),
+                )
+            else:
+                warped_masked_rgb_valid = torch.empty(
+                    (0, 3, int(target_height), int(target_width)), dtype=torch.float32
+                )
+                warped_mask_valid = torch.empty(
+                    (0, 1, int(target_height), int(target_width)), dtype=torch.float32
+                )
+            warped_masked_rgb = _pad_tchw(
+                warped_masked_rgb_valid, max(int(window_frames) - 1, 1)
+            )
+            warped_mask = _pad_tchw(
+                warped_mask_valid, max(int(window_frames) - 1, 1)
+            )
+            mask_tchw = torch.cat(
+                [
+                    torch.ones((1, 1, int(target_height), int(target_width)), dtype=torch.float32),
+                    warped_mask[:max(int(window_frames) - 1, 0)],
+                ],
+                dim=0,
+            )
+            masked_rgb_tchw = torch.cat(
+                [
+                    global_first_rgb.unsqueeze(0),
+                    warped_masked_rgb[:max(int(window_frames) - 1, 0)],
+                ],
+                dim=0,
+            )
+            final_mask[:valid_window] = mask_tchw[:valid_window]
+            final_masked_rgb[:valid_window] = masked_rgb_tchw[:valid_window]
+        else:
+            if (
+                carry_prefix_tchw is None
+                or warped_masked_rgb_next is None
+                or warped_mask_next is None
+            ):
+                raise RuntimeError("Missing carry-over online warp state for window > 0")
+            mask_tchw = torch.cat(
+                [
+                    torch.ones((int(overlap_frames), 1, int(target_height), int(target_width)), dtype=torch.float32),
+                    warped_mask_next,
+                ],
+                dim=0,
+            )
+            masked_rgb_tchw = torch.cat(
+                [
+                    carry_prefix_tchw,
+                    warped_masked_rgb_next,
+                ],
+                dim=0,
+            )
+            valid_new = max(0, int(valid_window - overlap_frames))
+            write_start = int(start_pos + overlap_frames)
+            write_end = int(write_start + valid_new)
+            final_mask[write_start:write_end] = mask_tchw[
+                int(overlap_frames):int(overlap_frames) + valid_new
+            ]
+            final_masked_rgb[write_start:write_end] = masked_rgb_tchw[
+                int(overlap_frames):int(overlap_frames) + valid_new
+            ]
+
+        current_frame_ids = [int(fid) for fid in frame_ids[start_pos:end_pos_valid]]
+        _update_history_and_visibility_memory(
+            frame_ids=current_frame_ids,
+            frames_tchw=current_rgb_window_tchw,
+            depth_path_by_id=depth_path_by_id,
+            camera_k_aligned=camera_k_aligned,
+            rt_by_frame_id=rt_by_frame_id,
+            crop_params=crop_params,
+            history_rgbs_u8=history_rgbs_u8,
+            processed_frame_ids=processed_frame_ids,
+            visibility_map=visibility_map,
+        )
+
+        if win_idx < int(num_windows) - 1:
+            last_frame_id = int(frame_ids[end_pos_valid - 1])
+            prefix_keep = min(int(overlap_frames), int(valid_window))
+            carry_prefix_tchw = current_rgb_window_tchw[
+                int(valid_window - prefix_keep):int(valid_window)
+            ].clone()
+
+            next_chunk_start = max(0, int(end_pos_valid - overlap_frames))
+            next_chunk_end = min(int(next_chunk_start + window_frames), int(total_required))
+            target_frame_ids_for_chunk = [
+                int(fid) for fid in frame_ids[next_chunk_start:next_chunk_end]
+            ]
+            selected_keyframe_ids = _select_keyframes_for_next_window_memory(
+                visibility_map=visibility_map,
+                processed_frame_ids=processed_frame_ids,
+                history_rgbs_u8=history_rgbs_u8,
+                target_frame_ids_for_chunk=target_frame_ids_for_chunk,
+                depth_path_by_id=depth_path_by_id,
+                camera_k_aligned=camera_k_aligned,
+                rt_by_frame_id=rt_by_frame_id,
+                crop_params=crop_params,
+                target_height=int(target_height),
+                target_width=int(target_width),
+                last_frame_id=int(last_frame_id),
+                num_keyframes=int(num_keyframes),
+                num_target_samples=int(num_target_samples),
+            )
+            keyframe_rgbs_u8 = [history_rgbs_u8[int(fid)] for fid in selected_keyframe_ids]
+
+            next_start = int(end_pos_valid)
+            next_valid_new = min(int(stride), int(total_required - next_start))
+            target_ids_next = [int(fid) for fid in frame_ids[next_start:next_start + next_valid_new]]
+            if target_ids_next:
+                warped_masked_rgb_next_valid, warped_mask_next_valid = _warp_maskrgb_from_keyframes_md_aligned_memory(
+                    keyframe_rgbs_u8=keyframe_rgbs_u8,
+                    keyframe_frame_ids=selected_keyframe_ids,
+                    target_frame_ids=target_ids_next,
+                    depth_path_by_frame_id=depth_path_by_id,
+                    camera_k_aligned=camera_k_aligned,
+                    rt_by_frame_id=rt_by_frame_id,
+                    crop_params=crop_params,
+                    target_height=int(target_height),
+                    target_width=int(target_width),
+                )
+                warped_masked_rgb_next = _pad_tchw(warped_masked_rgb_next_valid, int(stride))
+                warped_mask_next = _pad_tchw(warped_mask_next_valid, int(stride))
+            else:
+                warped_masked_rgb_next = None
+                warped_mask_next = None
+
+    return final_mask, final_masked_rgb
+
+
+def _build_online_warp_first_window_control_latent(
+    *,
+    vae,
+    rgb_paths: list[Path],
+    depth_paths: list[Path],
+    normal_paths: list[Path] | None,
+    frame_ids: list[int],
+    scene_pose_index: _MatrixCityPoseSceneIndex,
+    target_height: int,
+    target_width: int,
+    window_frames: int,
+    overlap_frames: int,
+    num_keyframes: int,
+    num_target_samples: int,
+    selection_voxel_size: float,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+    depth_normalization_mode: str,
+) -> np.ndarray:
+    if len(rgb_paths) < int(window_frames) or len(depth_paths) < int(window_frames):
+        raise ValueError(
+            "First-window control cache requires at least one full online-warp window: "
+            f"got rgb={len(rgb_paths)} depth={len(depth_paths)} window_frames={int(window_frames)}"
+        )
+    if len(frame_ids) < int(window_frames):
+        raise ValueError(
+            "First-window control cache requires frame_ids to cover one full window: "
+            f"got frame_ids={len(frame_ids)} window_frames={int(window_frames)}"
+        )
+    if normal_paths is not None and len(normal_paths) < int(window_frames):
+        raise ValueError(
+            "First-window control cache requires normal_paths to cover one full window: "
+            f"got normals={len(normal_paths)} window_frames={int(window_frames)}"
+        )
+
+    first_window_rgb_paths = list(rgb_paths[:int(window_frames)])
+    first_window_depth_paths = list(depth_paths[:int(window_frames)])
+    first_window_frame_ids = [int(fid) for fid in frame_ids[:int(window_frames)]]
+    first_window_normal_paths = None
+    if normal_paths is not None:
+        first_window_normal_paths = list(normal_paths[:int(window_frames)])
+
+    mask_tchw, masked_rgb_tchw = _build_online_warp_controls_for_clip(
+        rgb_paths=first_window_rgb_paths,
+        depth_paths=first_window_depth_paths,
+        frame_ids=first_window_frame_ids,
+        scene_pose_index=scene_pose_index,
+        target_height=int(target_height),
+        target_width=int(target_width),
+        window_frames=int(window_frames),
+        overlap_frames=int(overlap_frames),
+        num_keyframes=int(num_keyframes),
+        num_target_samples=int(num_target_samples),
+        selection_voxel_size=float(selection_voxel_size),
+    )
+    depth_tchw = _load_depth_sequence(
+        first_window_depth_paths,
+        int(target_height),
+        int(target_width),
+        pmin=5.0,
+        pmax=95.0,
+        invert_depth=False,
+        normalization_mode=str(depth_normalization_mode),
+    )
+    normal_tchw = None
+    if first_window_normal_paths is not None:
+        normal_tchw = torch.stack(
+            [
+                _load_normal_frame(p, int(target_height), int(target_width))
+                for p in first_window_normal_paths
+            ],
+            dim=0,
+        )
+
+    with torch.no_grad():
+        control_latent = infer_base._encode_control_latent_from_tchw(
+            vae=vae,
+            depth_tchw=depth_tchw,
+            normal_tchw=normal_tchw,
+            masked_rgb_tchw=masked_rgb_tchw,
+            mask_tchw=mask_tchw,
+            target_c=int(target_c),
+            inference_device=inference_device,
+            compute_dtype=compute_dtype,
+        )
+    return control_latent[0].to("cpu", dtype=torch.float32).numpy()
+
+
+def _build_online_warp_full_cached_branch_latents(
+    *,
+    vae,
+    depth_paths: list[Path],
+    normal_paths: list[Path] | None,
+    target_height: int,
+    target_width: int,
+    target_c: int,
+    latent_repeat: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+    depth_normalization_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth_tchw = _load_depth_sequence(
+        depth_paths,
+        int(target_height),
+        int(target_width),
+        pmin=5.0,
+        pmax=95.0,
+        invert_depth=False,
+        normalization_mode=str(depth_normalization_mode),
+    )
+    depth_lat = _encode_control_branch_latent(
+        vae,
+        depth_tchw,
+        normalize=False,
+        target_num_channels_latents=int(target_c),
+        latent_repeat=int(latent_repeat),
+        name="depth_lat",
+        device=inference_device,
+        compute_dtype=compute_dtype,
+    )
+
+    empty_lat = np.zeros((0,), dtype=np.float32)
+    normal_lat_np = empty_lat
+    if normal_paths is not None:
+        normal_tchw = torch.stack(
+            [
+                _load_normal_frame(p, int(target_height), int(target_width))
+                for p in normal_paths
+            ],
+            dim=0,
+        )
+        normal_lat = _encode_control_branch_latent(
+            vae,
+            normal_tchw,
+            normalize=False,
+            target_num_channels_latents=int(target_c),
+            latent_repeat=int(latent_repeat),
+            name="normal_lat",
+            device=inference_device,
+            compute_dtype=compute_dtype,
+        )
+        normal_lat_np = normal_lat.numpy()
+
+    return depth_lat.numpy(), normal_lat_np
+
+
 def _list_caption_files(clip_dir: Path, pattern: str) -> list[Path]:
     return sorted([p for p in clip_dir.glob(pattern) if p.is_file()], key=lambda p: p.name)
 
@@ -613,6 +1881,12 @@ def _count_pair_id_mismatch(a: list[Path], b: list[Path]) -> int:
                 rel_bad += 1
         bad = min(bad, rel_bad)
     return bad
+
+
+def _count_unique_selected_paths(paths: list[Path]) -> int:
+    if not paths:
+        return 0
+    return len({str(p) for p in paths})
 
 
 def _frame_index_from_stem(stem: str) -> int | None:
@@ -758,7 +2032,15 @@ def _resolve_clip_start_global_id_for_sampling(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Preprocess MatrixCity clips to TI2V+ControlNet parquet")
     p.add_argument("--model_path", type=str, required=True)
-    p.add_argument("--mask_root", type=str, required=True)
+    p.add_argument(
+        "--mask_root",
+        type=str,
+        default="",
+        help=(
+            "Root of precomputed mask clips. Required when control_source=precomputed. "
+            "Ignored when control_source=online_warp."
+        ),
+    )
     p.add_argument("--rgb_root", type=str, required=True, help="MatrixCity RGB root (contains small_city/...).")
     p.add_argument(
         "--depth_root",
@@ -824,6 +2106,114 @@ def parse_args() -> argparse.Namespace:
         help="If set, require clip_dir/masked_rgb to exist. "
         "When missing, skip the clip (no rgb*mask fallback).",
     )
+    p.add_argument(
+        "--control_source",
+        type=str,
+        default="precomputed",
+        choices=["precomputed", "online_warp"],
+        help=(
+            "How to build mask/masked_rgb controls. "
+            "'precomputed' reads clip_dir/mask and clip_dir/masked_rgb. "
+            "'online_warp' derives them from raw rgb/depth + MatrixCity poses."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_camera_mode",
+        type=str,
+        default="B_inv",
+        choices=["A_raw", "B_inv", "C_scale_inv", "D_scale_raw"],
+        help="MatrixCity pose transform variant used when control_source=online_warp.",
+    )
+    p.add_argument(
+        "--online_warp_window_frames",
+        type=int,
+        default=81,
+        help="Window size used to build long-video online warp controls inside one clip.",
+    )
+    p.add_argument(
+        "--online_warp_overlap_frames",
+        type=int,
+        default=1,
+        help="Overlap size used by online warp control generation.",
+    )
+    p.add_argument(
+        "--online_warp_num_keyframes",
+        type=int,
+        default=4,
+        help="Number of history keyframes used to warp the next online-warp chunk.",
+    )
+    p.add_argument(
+        "--online_warp_selection_num_target_samples",
+        type=int,
+        default=3,
+        help="How many target frames to sample when selecting complementary keyframes.",
+    )
+    p.add_argument(
+        "--online_warp_selection_voxel_size",
+        type=float,
+        default=0.1,
+        help="Voxel size used by online warp keyframe selection.",
+    )
+    p.add_argument(
+        "--online_warp_control_policy",
+        type=str,
+        default="history_keyframes",
+        choices=["history_keyframes", "segmented_single_anchor"],
+        help=(
+            "How to generate online-warp mask/masked_rgb. "
+            "'history_keyframes' uses the current complementary-keyframe rollout logic. "
+            "'segmented_single_anchor' uses one raw RGB anchor every stride window, "
+            "e.g. 0->1..80, 80->81..160 for window=81 overlap=1."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_depth_normalization_mode",
+        type=str,
+        default="md_align",
+        choices=["md_align", "percentile"],
+        help=(
+            "Depth normalization used by online-warp controls. "
+            "'md_align' matches the current md-aligned long-warp path; "
+            "'percentile' matches the older RGBN/control preprocessing distribution."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_raw_clip_stride",
+        type=int,
+        default=0,
+        help=(
+            "Stride used to enumerate raw 401-frame training clips when control_source=online_warp. "
+            "0 means auto use (online_warp_window_frames - online_warp_overlap_frames)."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_pose_filter_translation_ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional pose continuity filter. "
+            "If > 0, reject any raw clip whose consecutive pose translation step exceeds "
+            "scene_median_step * this ratio."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_pose_filter_max_rotation_deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional pose continuity filter. "
+            "If > 0, reject any raw clip whose consecutive pose rotation jump exceeds this many degrees."
+        ),
+    )
+    p.add_argument(
+        "--online_warp_default_prompt",
+        type=str,
+        default="A continuous driving view through a city street.",
+        help=(
+            "Fallback prompt template for raw online-warp clips. "
+            "Supports {scene} placeholder."
+        ),
+    )
     p.add_argument("--fps", type=int, default=16)
     p.add_argument("--max_width", type=int, default=512)
     p.add_argument("--max_height", type=int, default=384)
@@ -836,13 +2226,13 @@ def parse_args() -> argparse.Namespace:
         "--depth_percentile_min",
         type=float,
         default=5.0,
-        help="Compatibility arg (unused in strict md depth logic).",
+        help="Used when depth normalization mode is 'percentile'.",
     )
     p.add_argument(
         "--depth_percentile_max",
         type=float,
         default=95.0,
-        help="Compatibility arg (unused in strict md depth logic).",
+        help="Used when depth normalization mode is 'percentile'.",
     )
     depth_inv_group = p.add_mutually_exclusive_group()
     depth_inv_group.add_argument(
@@ -899,9 +2289,39 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--bootstrap_only",
+        action="store_true",
+        help=(
+            "Write only bootstrap fields needed by training-time online warp "
+            "(text / first_frame_latent / metadata, plus optional vae_latent). "
+            "By default control_latent is written as empty placeholders; "
+            "--bootstrap_cache_first_window_control_latent can optionally cache "
+            "the first online-warp window only."
+        ),
+    )
+    p.add_argument(
+        "--bootstrap_cache_first_window_control_latent",
+        action="store_true",
+        help=(
+            "When used with --bootstrap_only and control_source=online_warp, "
+            "cache the first online-warp window (frames 0-80 by default) as "
+            "control_latent so training can reuse the 21-latent prefix without "
+            "recomputing it every step."
+        ),
+    )
+    p.add_argument(
         "--skip_existing_ids",
         action="store_true",
         help="Resume-friendly mode: skip records whose id already exists in output parquet rank shard.",
+    )
+    p.add_argument(
+        "--require_full_control_sequence",
+        action="store_true",
+        help=(
+            "If set, skip clips whose mask/masked_rgb do not provide clip_length distinct source "
+            "frames before nearest-fill padding. This is useful to prevent silently stretching "
+            "81-frame controls into 401-frame samples."
+        ),
     )
     return p.parse_args()
 
@@ -926,14 +2346,49 @@ def main() -> None:
         raise ValueError("--world_size must be >= 1")
     if int(args.rank) < 0 or int(args.rank) >= int(args.world_size):
         raise ValueError(f"--rank must be in [0,{int(args.world_size)-1}]")
+    if float(args.online_warp_pose_filter_translation_ratio) < 0.0:
+        raise ValueError("--online_warp_pose_filter_translation_ratio must be >= 0")
+    if float(args.online_warp_pose_filter_max_rotation_deg) < 0.0:
+        raise ValueError("--online_warp_pose_filter_max_rotation_deg must be >= 0")
 
     model_path = os.path.expanduser(os.path.expandvars(args.model_path))
-    mask_root = Path(os.path.expanduser(os.path.expandvars(args.mask_root)))
+    mask_root = (
+        Path(os.path.expanduser(os.path.expandvars(args.mask_root)))
+        if str(args.mask_root).strip()
+        else None
+    )
     rgb_root = Path(os.path.expanduser(os.path.expandvars(args.rgb_root)))
     depth_root = Path(os.path.expanduser(os.path.expandvars(args.depth_root))) if str(args.depth_root).strip() else rgb_root
     output_dir = Path(os.path.expanduser(os.path.expandvars(args.output_dir)))
     normal_root = Path(os.path.expanduser(os.path.expandvars(args.normal_root))) if str(args.normal_root).strip() else None
+    control_source = str(args.control_source).strip().lower()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if control_source == "online_warp" and bool(args.require_masked_rgb):
+        logger.warning(
+            "--require_masked_rgb is ignored when control_source=online_warp because masked_rgb is generated on the fly."
+        )
+    if bool(args.bootstrap_only) and bool(args.require_masked_rgb):
+        logger.warning(
+            "--require_masked_rgb is ignored when --bootstrap_only is enabled because control latents are not precomputed."
+        )
+    if (bool(args.bootstrap_only)
+            and bool(args.bootstrap_cache_first_window_control_latent)
+            and control_source != "online_warp"):
+        logger.warning(
+            "--bootstrap_cache_first_window_control_latent is ignored unless "
+            "--bootstrap_only and --control_source=online_warp are both enabled."
+        )
+    if control_source == "online_warp" and str(args.first_frame_source) == "masked_rgb":
+        logger.info(
+            "control_source=online_warp with first_frame_source=masked_rgb: first frame remains equivalent to rgb because frame0 mask is forced visible."
+        )
+    if control_source == "precomputed" and mask_root is None:
+        raise ValueError("--mask_root is required when control_source=precomputed")
+    if bool(args.bootstrap_only) and str(args.first_frame_source) == "masked_rgb":
+        logger.warning(
+            "--bootstrap_only with first_frame_source=masked_rgb falls back to rgb first frame because masked_rgb is not loaded."
+        )
 
     if args.device == "cuda" and torch.cuda.is_available():
         # torchrun: use LOCAL_RANK; manual CUDA_VISIBLE_DEVICES per process: local rank defaults to 0.
@@ -1029,6 +2484,7 @@ def main() -> None:
     rgb_files_cache: dict[tuple[str, str], list[Path]] = {}
     depth_files_cache: dict[tuple[str, str, str], list[Path] | None] = {}
     normal_seq_files_cache: dict[str, list[Path]] = {}
+    pose_index_by_scene: dict[str, _MatrixCityPoseSceneIndex] = {}
     if bool(args.skip_existing_ids):
         existing_ids = _load_existing_ids(out_dir_rank)
         logger.info(
@@ -1036,16 +2492,59 @@ def main() -> None:
             len(existing_ids),
             out_dir_rank,
         )
-
-    street_dirs = [mask_root / args.street_dir] if args.street_dir else [p for p in sorted(mask_root.iterdir()) if p.is_dir()]
+    if control_source == "online_warp":
+        pose_index_by_scene = _load_matrixcity_pose_index(
+            rgb_root=rgb_root,
+            street_split=str(args.street_split),
+            camera_mode=str(args.online_warp_camera_mode),
+        )
+        logger.info(
+            "Loaded MatrixCity pose index for %d scenes (split=%s camera_mode=%s)",
+            len(pose_index_by_scene),
+            str(args.street_split),
+            str(args.online_warp_camera_mode),
+        )
     all_clips: list[Path] = []
-    for street_dir in street_dirs:
-        for window_dir in sorted(street_dir.iterdir()):
-            if not window_dir.is_dir() or "_" not in window_dir.name:
-                continue
-            for clip_dir in sorted(window_dir.iterdir()):
-                if clip_dir.is_dir() and clip_dir.name.startswith("clip_start_"):
-                    all_clips.append(clip_dir)
+    if control_source == "online_warp":
+        raw_clip_stride = int(args.online_warp_raw_clip_stride)
+        if raw_clip_stride <= 0:
+            raw_clip_stride = int(args.online_warp_window_frames) - int(args.online_warp_overlap_frames)
+        raw_clip_stride = max(1, int(raw_clip_stride))
+        all_clips = _build_raw_online_warp_clip_paths(
+            rgb_root=rgb_root,
+            street_split=str(args.street_split),
+            street_dir=str(args.street_dir),
+            clip_length=int(args.clip_length),
+            stride=int(raw_clip_stride),
+            pose_frame_ids_by_scene={
+                scene_name: set(scene_index.rt_by_frame_id.keys())
+                for scene_name, scene_index in pose_index_by_scene.items()
+            },
+            scene_pose_index_by_scene=pose_index_by_scene,
+            pose_filter_translation_ratio=float(args.online_warp_pose_filter_translation_ratio),
+            pose_filter_max_rotation_deg=float(args.online_warp_pose_filter_max_rotation_deg),
+        )
+        logger.info(
+            "Enumerated %d raw online-warp clips (split=%s stride=%d clip_length=%d pose_filter_translation_ratio=%.3f pose_filter_max_rotation_deg=%.3f)",
+            len(all_clips),
+            str(args.street_split),
+            int(raw_clip_stride),
+            int(args.clip_length),
+            float(args.online_warp_pose_filter_translation_ratio),
+            float(args.online_warp_pose_filter_max_rotation_deg),
+        )
+    else:
+        assert mask_root is not None
+        street_dirs = [mask_root / args.street_dir] if args.street_dir else [
+            p for p in sorted(mask_root.iterdir()) if p.is_dir()
+        ]
+        for street_dir in street_dirs:
+            for window_dir in sorted(street_dir.iterdir()):
+                if not window_dir.is_dir() or "_" not in window_dir.name:
+                    continue
+                for clip_dir in sorted(window_dir.iterdir()):
+                    if clip_dir.is_dir() and clip_dir.name.startswith("clip_start_"):
+                        all_clips.append(clip_dir)
 
     if int(args.max_samples) > 0 and bool(args.max_samples_global) and int(
             args.world_size) > 1:
@@ -1097,12 +2596,18 @@ def main() -> None:
         except Exception:
             continue
 
-        cap_files = _list_caption_files(clip_dir, str(args.caption_pattern))
-        if not cap_files:
-            continue
-        prompt = _prompt_clean(_read_caption_json(cap_files[-1], str(args.caption_key)))
-        if not prompt:
-            continue
+        if control_source == "online_warp":
+            prompt = _build_online_warp_prompt(
+                str(args.online_warp_default_prompt),
+                street_name,
+            )
+        else:
+            cap_files = _list_caption_files(clip_dir, str(args.caption_pattern))
+            if not cap_files:
+                continue
+            prompt = _prompt_clean(_read_caption_json(cap_files[-1], str(args.caption_key)))
+            if not prompt:
+                continue
 
         rgb_cache_key = (str(rgb_root), str(args.street_split), street_name)
         if rgb_cache_key not in rgb_files_cache:
@@ -1144,20 +2649,24 @@ def main() -> None:
         clip_start_global = int(clip_start)
         clip_start_mode = "window_slice"
         if bool(args.use_clip_start_global_ids):
-            clip_start_global, clip_start_mode = _resolve_clip_start_global_id_for_sampling(
-                clip_start=int(clip_start),
-                window_start=int(window_start),
-                window_end=int(window_end),
-            )
-            if clip_start_mode != "global_id":
-                logger.warning(
-                    "auto-fix clip_start semantics for %s: window=%s clip_start=%d -> global_start=%d (%s)",
-                    clip_dir,
-                    window_dir.name,
-                    int(clip_start),
-                    int(clip_start_global),
-                    clip_start_mode,
+            if control_source == "online_warp":
+                clip_start_global = int(clip_start)
+                clip_start_mode = "raw_online_warp_global_id"
+            else:
+                clip_start_global, clip_start_mode = _resolve_clip_start_global_id_for_sampling(
+                    clip_start=int(clip_start),
+                    window_start=int(window_start),
+                    window_end=int(window_end),
                 )
+                if clip_start_mode != "global_id":
+                    logger.warning(
+                        "auto-fix clip_start semantics for %s: window=%s clip_start=%d -> global_start=%d (%s)",
+                        clip_dir,
+                        window_dir.name,
+                        int(clip_start),
+                        int(clip_start_global),
+                        clip_start_mode,
+                    )
         target_frame_ids = [int(clip_start_global) + i for i in range(int(args.clip_length))]
         window_files: list[Path] = []
         depth_window: list[Path] = []
@@ -1260,54 +2769,84 @@ def main() -> None:
                     clip_dir,
                 )
 
-        mask_dir = clip_dir / "mask"
-        if not mask_dir.is_dir():
-            continue
-        mask_files_map: dict[int, Path] = {}
-        for p in mask_dir.iterdir():
-            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-                idx = _frame_index_from_stem(p.stem)
-                if idx is not None:
-                    mask_files_map[idx] = p
-        if not mask_files_map:
-            continue
-        idx_cands = [
-            0,
-            int(clip_start),
-            int(clip_start_global),
-            int(window_start),
-            int(clip_start_in_window),
-        ]
-        mask_paths = _pick_indexed_files(
-            mask_files_map,
-            int(args.clip_length),
-            offset_candidates=idx_cands,
-        )
-
-        masked_rgb_dir = clip_dir / "masked_rgb"
+        mask_paths: list[Path] | None = None
         masked_rgb_paths: list[Path] | None = None
-        if masked_rgb_dir.is_dir():
-            mr_map: dict[int, Path] = {}
-            for p in masked_rgb_dir.iterdir():
+        if control_source == "precomputed":
+            mask_dir = clip_dir / "mask"
+            if not mask_dir.is_dir():
+                continue
+            mask_files_map: dict[int, Path] = {}
+            for p in mask_dir.iterdir():
                 if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
                     idx = _frame_index_from_stem(p.stem)
                     if idx is not None:
-                        mr_map[idx] = p
-            if mr_map:
-                idx_cands = [
-                    0,
-                    int(clip_start),
-                    int(clip_start_global),
-                    int(window_start),
-                    int(clip_start_in_window),
-                ]
-                masked_rgb_paths = _pick_indexed_files(
-                    mr_map,
-                    int(args.clip_length),
-                    offset_candidates=idx_cands,
+                        mask_files_map[idx] = p
+            if not mask_files_map:
+                continue
+            idx_cands = [
+                0,
+                int(clip_start),
+                int(clip_start_global),
+                int(window_start),
+                int(clip_start_in_window),
+            ]
+            mask_paths = _pick_indexed_files(
+                mask_files_map,
+                int(args.clip_length),
+                offset_candidates=idx_cands,
+            )
+            if bool(args.require_full_control_sequence):
+                unique_mask_count = _count_unique_selected_paths(mask_paths)
+                if unique_mask_count < int(args.clip_length):
+                    logger.warning(
+                        "skip clip due to incomplete mask coverage: %s unique_mask_frames=%d clip_length=%d",
+                        clip_dir,
+                        int(unique_mask_count),
+                        int(args.clip_length),
+                    )
+                    continue
+
+            masked_rgb_dir = clip_dir / "masked_rgb"
+            if masked_rgb_dir.is_dir():
+                mr_map: dict[int, Path] = {}
+                for p in masked_rgb_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+                        idx = _frame_index_from_stem(p.stem)
+                        if idx is not None:
+                            mr_map[idx] = p
+                if mr_map:
+                    idx_cands = [
+                        0,
+                        int(clip_start),
+                        int(clip_start_global),
+                        int(window_start),
+                        int(clip_start_in_window),
+                    ]
+                    masked_rgb_paths = _pick_indexed_files(
+                        mr_map,
+                        int(args.clip_length),
+                        offset_candidates=idx_cands,
+                    )
+                    if bool(args.require_full_control_sequence):
+                        unique_masked_rgb_count = _count_unique_selected_paths(masked_rgb_paths)
+                        if unique_masked_rgb_count < int(args.clip_length):
+                            logger.warning(
+                                "skip clip due to incomplete masked_rgb coverage: %s unique_masked_rgb_frames=%d clip_length=%d",
+                                clip_dir,
+                                int(unique_masked_rgb_count),
+                                int(args.clip_length),
+                            )
+                            continue
+            if bool(args.require_masked_rgb) and masked_rgb_paths is None:
+                continue
+        else:
+            if street_name not in pose_index_by_scene:
+                logger.warning(
+                    "skip clip due to missing MatrixCity pose index for scene=%s clip=%s",
+                    street_name,
+                    clip_dir,
                 )
-        if bool(args.require_masked_rgb) and masked_rgb_paths is None:
-            continue
+                continue
 
         normal_paths: list[Path] | None = None
         # Priority 1: normal under the clip directory.
@@ -1412,13 +2951,14 @@ def main() -> None:
                                                      int(args.clip_length)]
                         break
 
-        mm_rgb_mask = _count_pair_id_mismatch(rgb_paths, mask_paths)
-        if mm_rgb_mask > 0:
-            logger.warning(
-                "rgb-mask frame-id mismatch=%d for %s",
-                int(mm_rgb_mask),
-                clip_dir,
-            )
+        if mask_paths is not None:
+            mm_rgb_mask = _count_pair_id_mismatch(rgb_paths, mask_paths)
+            if mm_rgb_mask > 0:
+                logger.warning(
+                    "rgb-mask frame-id mismatch=%d for %s",
+                    int(mm_rgb_mask),
+                    clip_dir,
+                )
         if masked_rgb_paths is not None:
             mm_rgb_masked = _count_pair_id_mismatch(rgb_paths, masked_rgb_paths)
             if mm_rgb_masked > 0:
@@ -1453,7 +2993,9 @@ def main() -> None:
             text_emb = text_emb[0]
         text_emb = text_emb.detach().to("cpu", dtype=torch.float32).numpy()
 
-        if str(args.first_frame_source) == "masked_rgb":
+        if (not bool(args.bootstrap_only)
+                and str(args.first_frame_source) == "masked_rgb"
+                and control_source == "precomputed"):
             if masked_rgb_paths is None:
                 # Only possible when require_masked_rgb is False.
                 first_rgb = _load_rgb_frame(rgb_paths[0], int(args.max_height), int(args.max_width))
@@ -1473,50 +3015,9 @@ def main() -> None:
         first_lat = first_lat[0, :, 0].unsqueeze(0)
         first_lat_np = first_lat.to("cpu", dtype=torch.float32).numpy()
 
-        depth_tchw = _load_depth_sequence(
-            depth_paths,
-            int(args.max_height),
-            int(args.max_width),
-            pmin=float(args.depth_percentile_min),
-            pmax=float(args.depth_percentile_max),
-            invert_depth=bool(args.depth_invert),
-        )
-        if bool(args.debug_timing):
-            logger.info("[timing] %s depth_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
-        mask_tchw = torch.stack(
-            [
-                _load_mask_frame(
-                    p,
-                    int(args.max_height),
-                    int(args.max_width),
-                    threshold=None if float(args.mask_threshold) < 0 else float(args.mask_threshold),
-                    invert=bool(args.mask_invert),
-                )
-                for p in mask_paths
-            ],
-            dim=0,
-        )
-        if bool(args.debug_timing):
-            logger.info("[timing] %s mask_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
-        rgb_tchw = None
-        if masked_rgb_paths is not None:
-            masked_rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in masked_rgb_paths], dim=0)
-        else:
-            if bool(args.require_masked_rgb):
-                continue
-            rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths], dim=0)
-            masked_rgb_tchw = rgb_tchw * mask_tchw
-        normal_tchw = None
-        if normal_paths is not None:
-            normal_tchw = torch.stack(
-                [_load_normal_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
-                dim=0,
-            )
-        if bool(args.debug_timing):
-            logger.info("[timing] %s normal_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
-
         vae_lat_np = None
         if bool(args.write_vae_latent):
+            rgb_tchw = None
             if rgb_tchw is None:
                 rgb_tchw = torch.stack(
                     [
@@ -1526,7 +3027,7 @@ def main() -> None:
                         for p in rgb_paths
                     ],
                     dim=0,
-                )
+            )
             rgb_bcthw = _to_vae_input(rgb_tchw, normalize=True).to(
                 device=device, dtype=compute_dtype)
             vae_lat = _encode_video_latents(vae,
@@ -1538,97 +3039,208 @@ def main() -> None:
             if bool(args.debug_timing):
                 logger.info("[timing] %s rgb_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)
 
-        if normal_tchw is not None:
-            video_n = torch.cat(
-                [
-                    _to_vae_input(depth_tchw, normalize=False),
-                    # Keep consistent with existing union preprocess in repo.
-                    _to_vae_input(normal_tchw, normalize=False),
-                    _to_vae_input(masked_rgb_tchw, normalize=True),
-                    _to_vae_input(mask_tchw, normalize=False),
-                ],
-                dim=0,
-            ).to(device=device, dtype=compute_dtype)
-            lat_n = _encode_video_latents(vae,
-                                          video_n,
-                                          sample_mode="mode",
-                                          compute_dtype=compute_dtype).to(
-                "cpu", dtype=torch.float32
-            )
-            depth_lat = lat_n[0]
-            normal_lat = lat_n[1]
-            masked_lat = lat_n[2]
-            mask_lat = lat_n[3]
-        else:
-            video_n = torch.cat(
-                [
-                    _to_vae_input(depth_tchw, normalize=False),
-                    _to_vae_input(masked_rgb_tchw, normalize=True),
-                    _to_vae_input(mask_tchw, normalize=False),
-                ],
-                dim=0,
-            ).to(device=device, dtype=compute_dtype)
-            lat_n = _encode_video_latents(vae,
-                                          video_n,
-                                          sample_mode="mode",
-                                          compute_dtype=compute_dtype).to(
-                "cpu", dtype=torch.float32
-            )
-            depth_lat = lat_n[0]
-            masked_lat = lat_n[1]
-            mask_lat = lat_n[2]
-        if latent_repeat != 1:
-            depth_lat = depth_lat.repeat(latent_repeat, 1, 1, 1)
-            if normal_tchw is not None:
-                normal_lat = normal_lat.repeat(latent_repeat, 1, 1, 1)
-            masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
-            mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
-        depth_lat = _align_latent_channels(
-            depth_lat, target_num_channels_latents, "depth_lat"
-        )
-        if normal_tchw is not None:
-            normal_lat = _align_latent_channels(
-                normal_lat, target_num_channels_latents, "normal_lat"
-            )
-        masked_lat = _align_latent_channels(
-            masked_lat, target_num_channels_latents, "masked_lat"
-        )
-        mask_lat = _align_latent_channels(mask_lat, target_num_channels_latents, "mask_lat")
-        branch_c = int(target_num_channels_latents)
-        bad_shape_reason = ""
-        if int(depth_lat.shape[0]) != branch_c:
-            bad_shape_reason = f"depth_lat C={int(depth_lat.shape[0])} expected={branch_c}"
-        elif int(masked_lat.shape[0]) != branch_c:
-            bad_shape_reason = f"masked_lat C={int(masked_lat.shape[0])} expected={branch_c}"
-        elif int(mask_lat.shape[0]) != branch_c:
-            bad_shape_reason = f"mask_lat C={int(mask_lat.shape[0])} expected={branch_c}"
-        elif normal_tchw is not None and int(normal_lat.shape[0]) != branch_c:
-            bad_shape_reason = f"normal_lat C={int(normal_lat.shape[0])} expected={branch_c}"
-        if bad_shape_reason:
-            logger.warning(
-                "Skip clip due to latent channel mismatch: %s clip=%s",
-                bad_shape_reason,
-                clip_dir,
-            )
-            continue
-        if normal_tchw is not None:
-            control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
-        else:
-            control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
-        expected_total_c = branch_c * (4 if normal_tchw is not None else 3)
-        if int(control_lat.shape[0]) != int(expected_total_c):
-            logger.warning(
-                "Skip clip due to control_lat total channel mismatch: got=%d expected=%d clip=%s",
-                int(control_lat.shape[0]),
-                int(expected_total_c),
-                clip_dir,
-            )
-            continue
-        control_lat_np = control_lat.numpy()
-        if bool(args.debug_timing):
-            logger.info("[timing] %s control_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)
-
         empty_lat = np.zeros((0,), dtype=np.float32)
+        control_lat_np = empty_lat
+        depth_lat_np = empty_lat
+        normal_lat_np = empty_lat
+        num_frames_value = int(args.clip_length)
+        if bool(args.bootstrap_only):
+            if control_source == "online_warp":
+                depth_lat_np, normal_lat_np = _build_online_warp_full_cached_branch_latents(
+                    vae=vae,
+                    depth_paths=depth_paths,
+                    normal_paths=normal_paths,
+                    target_height=int(args.max_height),
+                    target_width=int(args.max_width),
+                    target_c=int(target_num_channels_latents),
+                    latent_repeat=int(latent_repeat),
+                    inference_device=device,
+                    compute_dtype=compute_dtype,
+                    depth_normalization_mode=str(
+                        args.online_warp_depth_normalization_mode),
+                )
+                if bool(args.debug_timing):
+                    logger.info(
+                        "[timing] %s bootstrap_full_depth_normal_cached %.2fs",
+                        clip_dir,
+                        time.perf_counter() - t_clip0,
+                    )
+            if (bool(args.bootstrap_cache_first_window_control_latent)
+                    and control_source == "online_warp"):
+                control_lat_np = _build_online_warp_first_window_control_latent(
+                    vae=vae,
+                    rgb_paths=rgb_paths,
+                    depth_paths=depth_paths,
+                    normal_paths=normal_paths,
+                    frame_ids=target_frame_ids,
+                    scene_pose_index=pose_index_by_scene[street_name],
+                    target_height=int(args.max_height),
+                    target_width=int(args.max_width),
+                    window_frames=int(args.online_warp_window_frames),
+                    overlap_frames=int(args.online_warp_overlap_frames),
+                    num_keyframes=int(args.online_warp_num_keyframes),
+                    num_target_samples=int(args.online_warp_selection_num_target_samples),
+                    selection_voxel_size=float(args.online_warp_selection_voxel_size),
+                    target_c=int(target_num_channels_latents),
+                    inference_device=device,
+                    compute_dtype=compute_dtype,
+                    depth_normalization_mode=str(
+                        args.online_warp_depth_normalization_mode),
+                )
+                if bool(args.debug_timing):
+                    logger.info(
+                        "[timing] %s bootstrap_first_window_control_cached %.2fs",
+                        clip_dir,
+                        time.perf_counter() - t_clip0,
+                    )
+        else:
+            depth_tchw = _load_depth_sequence(
+                depth_paths,
+                int(args.max_height),
+                int(args.max_width),
+                pmin=float(args.depth_percentile_min),
+                pmax=float(args.depth_percentile_max),
+                invert_depth=bool(args.depth_invert),
+                normalization_mode=(
+                    str(args.online_warp_depth_normalization_mode)
+                    if control_source == "online_warp"
+                    else "percentile"
+                ),
+            )
+            if bool(args.debug_timing):
+                logger.info("[timing] %s depth_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
+            rgb_tchw = None
+            if control_source == "online_warp":
+                mask_tchw, masked_rgb_tchw = _build_online_warp_controls_for_clip(
+                    rgb_paths=rgb_paths,
+                    depth_paths=depth_paths,
+                    frame_ids=target_frame_ids,
+                    scene_pose_index=pose_index_by_scene[street_name],
+                    target_height=int(args.max_height),
+                    target_width=int(args.max_width),
+                    window_frames=int(args.online_warp_window_frames),
+                    overlap_frames=int(args.online_warp_overlap_frames),
+                    num_keyframes=int(args.online_warp_num_keyframes),
+                    num_target_samples=int(args.online_warp_selection_num_target_samples),
+                    selection_voxel_size=float(args.online_warp_selection_voxel_size),
+                    control_policy=str(args.online_warp_control_policy),
+                )
+            else:
+                assert mask_paths is not None
+                mask_tchw = torch.stack(
+                    [
+                        _load_mask_frame(
+                            p,
+                            int(args.max_height),
+                            int(args.max_width),
+                            threshold=None if float(args.mask_threshold) < 0 else float(args.mask_threshold),
+                            invert=bool(args.mask_invert),
+                        )
+                        for p in mask_paths
+                    ],
+                    dim=0,
+                )
+                if masked_rgb_paths is not None:
+                    masked_rgb_tchw = torch.stack(
+                        [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in masked_rgb_paths],
+                        dim=0,
+                    )
+                else:
+                    if bool(args.require_masked_rgb):
+                        continue
+                    rgb_tchw = torch.stack(
+                        [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths],
+                        dim=0,
+                    )
+                    masked_rgb_tchw = rgb_tchw * mask_tchw
+            if bool(args.debug_timing):
+                logger.info("[timing] %s mask_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
+            normal_tchw = None
+            if normal_paths is not None:
+                normal_tchw = torch.stack(
+                    [_load_normal_frame(p, int(args.max_height), int(args.max_width)) for p in normal_paths],
+                    dim=0,
+                )
+            if bool(args.debug_timing):
+                logger.info("[timing] %s normal_loaded %.2fs", clip_dir, time.perf_counter() - t_clip0)
+
+            depth_lat = _encode_control_branch_latent(
+                vae,
+                depth_tchw,
+                normalize=False,
+                target_num_channels_latents=target_num_channels_latents,
+                latent_repeat=latent_repeat,
+                name="depth_lat",
+                device=device,
+                compute_dtype=compute_dtype,
+            )
+            if normal_tchw is not None:
+                normal_lat = _encode_control_branch_latent(
+                    vae,
+                    normal_tchw,
+                    normalize=False,
+                    target_num_channels_latents=target_num_channels_latents,
+                    latent_repeat=latent_repeat,
+                    name="normal_lat",
+                    device=device,
+                    compute_dtype=compute_dtype,
+                )
+            masked_lat = _encode_control_branch_latent(
+                vae,
+                masked_rgb_tchw,
+                normalize=True,
+                target_num_channels_latents=target_num_channels_latents,
+                latent_repeat=latent_repeat,
+                name="masked_lat",
+                device=device,
+                compute_dtype=compute_dtype,
+            )
+            mask_lat = _encode_control_branch_latent(
+                vae,
+                mask_tchw,
+                normalize=False,
+                target_num_channels_latents=target_num_channels_latents,
+                latent_repeat=latent_repeat,
+                name="mask_lat",
+                device=device,
+                compute_dtype=compute_dtype,
+            )
+            branch_c = int(target_num_channels_latents)
+            bad_shape_reason = ""
+            if int(depth_lat.shape[0]) != branch_c:
+                bad_shape_reason = f"depth_lat C={int(depth_lat.shape[0])} expected={branch_c}"
+            elif int(masked_lat.shape[0]) != branch_c:
+                bad_shape_reason = f"masked_lat C={int(masked_lat.shape[0])} expected={branch_c}"
+            elif int(mask_lat.shape[0]) != branch_c:
+                bad_shape_reason = f"mask_lat C={int(mask_lat.shape[0])} expected={branch_c}"
+            elif normal_tchw is not None and int(normal_lat.shape[0]) != branch_c:
+                bad_shape_reason = f"normal_lat C={int(normal_lat.shape[0])} expected={branch_c}"
+            if bad_shape_reason:
+                logger.warning(
+                    "Skip clip due to latent channel mismatch: %s clip=%s",
+                    bad_shape_reason,
+                    clip_dir,
+                )
+                continue
+            if normal_tchw is not None:
+                control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
+            else:
+                control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+            expected_total_c = branch_c * (4 if normal_tchw is not None else 3)
+            if int(control_lat.shape[0]) != int(expected_total_c):
+                logger.warning(
+                    "Skip clip due to control_lat total channel mismatch: got=%d expected=%d clip=%s",
+                    int(control_lat.shape[0]),
+                    int(expected_total_c),
+                    clip_dir,
+                )
+                continue
+            control_lat_np = control_lat.numpy()
+            num_frames_value = (int(control_lat_np.shape[1])
+                                if len(control_lat_np.shape) > 1 else 0)
+            if bool(args.debug_timing):
+                logger.info("[timing] %s control_vae_done %.2fs", clip_dir, time.perf_counter() - t_clip0)
+
         record_id = f"{street_name}/{window_dir.name}/{clip_dir.name}"
         if bool(args.skip_existing_ids) and record_id in existing_ids:
             continue
@@ -1646,12 +3258,20 @@ def main() -> None:
             "control_latent_bytes": control_lat_np.tobytes(),
             "control_latent_shape": list(control_lat_np.shape),
             "control_latent_dtype": "float32",
+            "depth_latent_bytes": depth_lat_np.tobytes(),
+            "depth_latent_shape": list(depth_lat_np.shape),
+            "depth_latent_dtype": ("float32" if int(depth_lat_np.size) > 0 else ""),
+            "normal_latent_bytes": normal_lat_np.tobytes(),
+            "normal_latent_shape": list(normal_lat_np.shape),
+            "normal_latent_dtype": ("float32" if int(normal_lat_np.size) > 0 else ""),
             "file_name": record_id,
             "caption": prompt,
             "media_type": "video",
+            "clip_start_global_id": int(clip_start_global),
+            "clip_start_mode": clip_start_mode,
             "width": int(args.max_width),
             "height": int(args.max_height),
-            "num_frames": int(control_lat_np.shape[1]) if len(control_lat_np.shape) > 1 else 0,
+            "num_frames": int(num_frames_value),
             "duration_sec": float(int(args.clip_length)) / float(args.fps) if int(args.fps) > 0 else 0.0,
             "fps": float(args.fps),
         }

@@ -746,6 +746,9 @@ class TrainingArgs(FastVideoArgs):
     ema_decay: float = 0.0
     ema_start_step: int = 0
     training_cfg_rate: float = 0.0
+    fixed_text_embedding_data_path: str = ""
+    fixed_text_embedding_row_idx: int = 0
+    fixed_text_embedding_caption: str = ""
     precondition_outputs: bool = False
 
     # validation & logs
@@ -883,7 +886,32 @@ class TrainingArgs(FastVideoArgs):
     same_step_across_blocks: bool = False  # Use same exit timestep for all blocks
     last_step_only: bool = False  # Only use the last timestep for training
     context_noise: int = 0  # Context noise level for cache updates
+    # Causal attention overrides for training-loaded transformer/controlnet.
+    # Measured in latent frames, matching inference-side semantics.
+    local_attn_size: int = -1
+    sink_size: int = 0
+    # Student/generator attention mode for ControlNet self-forcing DMD.
+    # - causal: chunk-wise rollout with KV cache (current phase-3 default)
+    # - bidirectional: full-sequence rollout with teacher-init student
+    student_attention_mode: str = "causal"
     negative_prompt: str = ""  # Optional negative prompt for teacher CFG
+    online_warp_training: bool = False
+    online_warp_raw_root: str = ""
+    online_warp_street_split: str = "train_dense"
+    online_warp_camera_mode: str = "B_inv"
+    online_warp_window_frames: int = 81
+    online_warp_overlap_frames: int = 1
+    online_warp_num_keyframes: int = 4
+    online_warp_selection_num_target_samples: int = 3
+    online_warp_selection_voxel_size: float = 0.1
+    online_warp_depth_normalization_mode: str = "md_align"
+    online_warp_require_normal: bool = True
+    online_warp_use_bootstrap_control_for_first_window: bool = False
+    online_warp_rollout_min_windows: int = 2
+    online_warp_rollout_max_windows: int = 0  # 0 means use all windows available in the clip
+    online_warp_rollout_window_weights: str = ""  # optional comma-separated probabilities aligned to [min_windows, ..., max_windows]
+    online_warp_supervised_window_policy: str = "final"  # final, first, or random
+    online_warp_supervised_window_weights: str = ""  # optional comma-separated weights aligned to rollout windows [window1, window2, ...]
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "TrainingArgs":
@@ -1045,6 +1073,26 @@ class TrainingArgs(FastVideoArgs):
         parser.add_argument("--training-cfg-rate",
                             type=float,
                             help="Classifier-free guidance scale")
+        parser.add_argument(
+            "--fixed-text-embedding-data-path",
+            type=str,
+            help=
+            "Optional parquet root/file used to override training text embeddings with a fixed reference embedding.",
+        )
+        parser.add_argument(
+            "--fixed-text-embedding-row-idx",
+            type=int,
+            default=TrainingArgs.fixed_text_embedding_row_idx,
+            help=
+            "Global row index inside fixed_text_embedding_data_path used as the fixed reference text embedding.",
+        )
+        parser.add_argument(
+            "--fixed-text-embedding-caption",
+            type=str,
+            default="",
+            help=
+            "Optional caption label used for logging when fixed_text_embedding_data_path is enabled.",
+        )
         parser.add_argument(
             "--precondition-outputs",
             action=StoreBoolean,
@@ -1451,6 +1499,16 @@ class TrainingArgs(FastVideoArgs):
             default=TrainingArgs.num_frame_per_block,
             help="Number of frames per block for causal generation")
         parser.add_argument(
+            "--student-attention-mode",
+            type=str,
+            choices=["causal", "bidirectional"],
+            default=TrainingArgs.student_attention_mode,
+            help=
+            "Student/generator attention mode for self-forcing DMD. "
+            "'causal' keeps the chunk-wise KV-cache rollout; "
+            "'bidirectional' switches the student to full-sequence rollout.",
+        )
+        parser.add_argument(
             "--independent-first-frame",
             action=StoreBoolean,
             help="Whether the first frame is independent in causal generation")
@@ -1479,6 +1537,109 @@ class TrainingArgs(FastVideoArgs):
                             type=int,
                             default=TrainingArgs.context_noise,
                             help="Context noise level for cache updates")
+        parser.add_argument(
+            "--local-attn-size",
+            type=int,
+            default=TrainingArgs.local_attn_size,
+            help=
+            "Override causal local attention window for training-loaded transformer/controlnet, measured in latent frames (-1 keeps checkpoint/default setting)."
+        )
+        parser.add_argument(
+            "--sink-size",
+            type=int,
+            default=TrainingArgs.sink_size,
+            help=
+            "Override causal KV-cache sink for training-loaded transformer/controlnet, measured in latent frames."
+        )
+        parser.add_argument(
+            "--online-warp-training",
+            action=StoreBoolean,
+            help="Enable phase-3 online-warp rollout training from raw MatrixCity rgb/depth/normal/pose.")
+        parser.add_argument(
+            "--online-warp-raw-root",
+            type=str,
+            default=TrainingArgs.online_warp_raw_root,
+            help="Raw MatrixCity root used to reconstruct rgb/depth/normal/pose for online-warp training.")
+        parser.add_argument(
+            "--online-warp-street-split",
+            type=str,
+            default=TrainingArgs.online_warp_street_split,
+            help="MatrixCity split under raw root for online-warp training.")
+        parser.add_argument(
+            "--online-warp-camera-mode",
+            type=str,
+            default=TrainingArgs.online_warp_camera_mode,
+            help="MatrixCity camera transform variant for online-warp training.")
+        parser.add_argument(
+            "--online-warp-window-frames",
+            type=int,
+            default=TrainingArgs.online_warp_window_frames,
+            help="Video-frame window size used by training-time online warp.")
+        parser.add_argument(
+            "--online-warp-overlap-frames",
+            type=int,
+            default=TrainingArgs.online_warp_overlap_frames,
+            help="Video-frame overlap used by training-time online warp.")
+        parser.add_argument(
+            "--online-warp-num-keyframes",
+            type=int,
+            default=TrainingArgs.online_warp_num_keyframes,
+            help="Number of generated history keyframes used to warp the next training window.")
+        parser.add_argument(
+            "--online-warp-selection-num-target-samples",
+            type=int,
+            default=TrainingArgs.online_warp_selection_num_target_samples,
+            help="Number of target views sampled for complementary keyframe selection during online-warp training.")
+        parser.add_argument(
+            "--online-warp-selection-voxel-size",
+            type=float,
+            default=TrainingArgs.online_warp_selection_voxel_size,
+            help="Voxel size for complementary keyframe selection during online-warp training.")
+        parser.add_argument(
+            "--online-warp-depth-normalization-mode",
+            type=str,
+            default=TrainingArgs.online_warp_depth_normalization_mode,
+            help=
+            "Depth normalization mode used by training-time online warp (for example: md_align or percentile)."
+        )
+        parser.add_argument(
+            "--online-warp-require-normal",
+            action=StoreBoolean,
+            help="Require raw normal frames when online-warp training is enabled.")
+        parser.add_argument(
+            "--online-warp-use-bootstrap-control-for-first-window",
+            action=StoreBoolean,
+            help="Reuse parquet-cached first-window control_latent during online-warp training. "
+            "Disabled by default so window 0 is rebuilt from raw first-frame/depth/normal semantics.")
+        parser.add_argument(
+            "--online-warp-rollout-min-windows",
+            type=int,
+            default=TrainingArgs.online_warp_rollout_min_windows,
+            help="Minimum number of online-warp windows to roll out before supervising the final 21-latent window.")
+        parser.add_argument(
+            "--online-warp-rollout-max-windows",
+            type=int,
+            default=TrainingArgs.online_warp_rollout_max_windows,
+            help="Maximum number of online-warp windows to roll out before supervising the final 21-latent window. 0 uses all available windows.")
+        parser.add_argument(
+            "--online-warp-rollout-window-weights",
+            type=str,
+            default=TrainingArgs.online_warp_rollout_window_weights,
+            help="Optional comma-separated sampling weights aligned to [min_windows, ..., max_windows]. "
+            "Example: with min=1 and max=3, '0.7,0.2,0.1' biases supervision toward window 1.")
+        parser.add_argument(
+            "--online-warp-supervised-window-policy",
+            type=str,
+            default=TrainingArgs.online_warp_supervised_window_policy,
+            help="Which rollout window receives loss during online-warp training. "
+            "Supported values: final, first, random.")
+        parser.add_argument(
+            "--online-warp-supervised-window-weights",
+            type=str,
+            default=TrainingArgs.online_warp_supervised_window_weights,
+            help="Optional comma-separated weights aligned to rollout windows [window1, window2, ...] "
+            "when --online-warp-supervised-window-policy=random. "
+            "Example: for 2 windows, '1.0,1.0' samples the first or second window with equal probability.")
 
         return parser
 

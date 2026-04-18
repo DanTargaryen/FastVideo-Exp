@@ -6,10 +6,10 @@ Long causal TI2V + ControlNet inference with online warp-generated mask/masked_r
 Behavior:
 - First window: use only frame0 RGB as the source keyframe and warp to the first
   `causal_window_frames` targets. Frame0 itself is forced visible.
-- Later windows: keep a 1-frame visual overlap. The overlap frame is inherited
-  directly from the previous chunk output, while the remaining
-  `causal_window_frames - 1` frames are warped from the previous chunk's last
-  4 generated frames and merged.
+- Later windows: keep a configurable visual overlap. The overlap prefix is
+  inherited directly from the previous chunk output, while the remaining
+  `causal_window_frames - causal_overlap_frames` frames are warped from recent
+  generated keyframes and merged.
 - Temporal continuity is carried by the overlap frame, multi-keyframe warp, and
   the causal KV-cache.
 
@@ -123,6 +123,53 @@ def _pad_tchw(x: torch.Tensor, target_len: int) -> torch.Tensor:
         raise ValueError("cannot pad empty frame tensor")
     pad = x[-1:].repeat(int(target_len) - int(x.shape[0]), 1, 1, 1)
     return torch.cat([x, pad], dim=0)
+
+
+def _encode_rgb_prefix_latent(
+    *,
+    vae,
+    prefix_rgb_tchw: torch.Tensor,
+    target_c: int,
+    inference_device: torch.device,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    if prefix_rgb_tchw.ndim != 4 or int(prefix_rgb_tchw.shape[0]) <= 0:
+        raise ValueError(
+            "prefix_rgb_tchw must be [T,C,H,W] with T>0, "
+            f"got shape={tuple(prefix_rgb_tchw.shape)}")
+    prefix_bcthw = base._to_vae_input(prefix_rgb_tchw, normalize=True).to(
+        device=inference_device, dtype=compute_dtype)
+    prefix_lat = base._encode_video_latents(
+        vae,
+        prefix_bcthw,
+        sample_mode="mode",
+        compute_dtype=compute_dtype,
+    )
+    prefix_lat_cf = base._align_latent_channels(prefix_lat[0], target_c, "prefix_frame_lat")
+    return prefix_lat_cf.unsqueeze(0)
+
+
+def _apply_boundary_soft_blend(
+    *,
+    frames_tchw: torch.Tensor,
+    masked_rgb_tchw: torch.Tensor,
+    mask_tchw: torch.Tensor,
+    blend_frames: int,
+    blend_strength: float,
+) -> torch.Tensor:
+    n_blend = min(int(max(0, blend_frames)), int(frames_tchw.shape[0]))
+    strength = float(max(0.0, min(1.0, blend_strength)))
+    if n_blend <= 0 or strength <= 0.0:
+        return frames_tchw
+
+    out = frames_tchw.clone()
+    for k in range(n_blend):
+        alpha = strength * (1.0 - float(k) / float(n_blend + 1))
+        if alpha <= 0.0:
+            continue
+        weight = (mask_tchw[k:k + 1].clamp(0, 1) * alpha).to(dtype=out.dtype)
+        out[k:k + 1] = weight * masked_rgb_tchw[k:k + 1] + (1.0 - weight) * out[k:k + 1]
+    return out
 
 
 def _compute_num_windows(total_frames: int, window_frames: int, overlap_frames: int) -> int:
@@ -484,6 +531,94 @@ def _load_raw_long_sequence_nomask(
     )
 
 
+def _initialize_long_rollout_caches(
+    *,
+    transformer,
+    controlnet,
+    prompt_embeds: torch.Tensor,
+    dtype: torch.dtype,
+    rollout_device: torch.device,
+    frame_seq_length: int,
+    total_latent_frames: int,
+    use_guidance: bool,
+):
+    kv_cache = base._initialize_kv_cache(
+        model=transformer,
+        batch_size=1,
+        dtype=dtype,
+        device=rollout_device,
+        frame_seq_length=frame_seq_length,
+        sliding_window_num_frames_override=total_latent_frames,
+    )
+    crossattn_cache = base._initialize_crossattn_cache(
+        model=transformer,
+        batch_size=1,
+        max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
+        dtype=dtype,
+        device=rollout_device,
+    )
+    control_kv_cache = base._initialize_kv_cache(
+        model=controlnet,
+        batch_size=1,
+        dtype=dtype,
+        device=rollout_device,
+        frame_seq_length=frame_seq_length,
+        sliding_window_num_frames_override=total_latent_frames,
+    )
+    control_crossattn_cache = base._initialize_crossattn_cache(
+        model=controlnet,
+        batch_size=1,
+        max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
+        dtype=dtype,
+        device=rollout_device,
+    )
+    kv_cache_uncond = None
+    crossattn_cache_uncond = None
+    control_kv_cache_uncond = None
+    control_crossattn_cache_uncond = None
+    if use_guidance:
+        kv_cache_uncond = base._initialize_kv_cache(
+            model=transformer,
+            batch_size=1,
+            dtype=dtype,
+            device=rollout_device,
+            frame_seq_length=frame_seq_length,
+            sliding_window_num_frames_override=total_latent_frames,
+        )
+        crossattn_cache_uncond = base._initialize_crossattn_cache(
+            model=transformer,
+            batch_size=1,
+            max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
+            dtype=dtype,
+            device=rollout_device,
+        )
+        control_kv_cache_uncond = base._initialize_kv_cache(
+            model=controlnet,
+            batch_size=1,
+            dtype=dtype,
+            device=rollout_device,
+            frame_seq_length=frame_seq_length,
+            sliding_window_num_frames_override=total_latent_frames,
+        )
+        control_crossattn_cache_uncond = base._initialize_crossattn_cache(
+            model=controlnet,
+            batch_size=1,
+            max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
+            dtype=dtype,
+            device=rollout_device,
+        )
+    return (
+        kv_cache,
+        crossattn_cache,
+        kv_cache_uncond,
+        crossattn_cache_uncond,
+        control_kv_cache,
+        control_crossattn_cache,
+        control_kv_cache_uncond,
+        control_crossattn_cache_uncond,
+    )
+
+
 @torch.no_grad()
 def _run_long_rollout_firstframe_warp(
     *,
@@ -512,12 +647,13 @@ def _run_long_rollout_firstframe_warp(
     total_required = int(args.num_frames)
     window_frames = int(args.causal_window_frames)
     overlap_frames = int(args.causal_overlap_frames)
-    if overlap_frames != 1:
+    if overlap_frames <= 0 or overlap_frames >= window_frames:
         raise ValueError(
-            f"This script currently expects causal_overlap_frames=1, got {overlap_frames}"
+            f"This script expects 0 < causal_overlap_frames < causal_window_frames, got overlap={overlap_frames}, window={window_frames}"
         )
     stride = int(window_frames - overlap_frames)
     num_windows = _compute_num_windows(total_required, window_frames, overlap_frames)
+    cache_reset_interval = max(0, int(getattr(args, "cache_reset_interval_windows", 0)))
 
     prompt_embeds = sequence.text_embedding_bld.to(device="cuda", dtype=dtype)
     negative_prompt_embeds = None
@@ -547,7 +683,7 @@ def _run_long_rollout_firstframe_warp(
     saved_controls: dict[str, torch.Tensor] | None = None
     if bool(args.save_control_outputs):
         saved_controls = {
-            "depth": torch.empty((total_required, 1, H, W), dtype=torch.float32),
+            "depth": torch.empty((total_required, 3, H, W), dtype=torch.float32),
             "mask": torch.empty((total_required, 1, H, W), dtype=torch.float32),
             "masked_rgb": torch.empty((total_required, 3, H, W), dtype=torch.float32),
         }
@@ -558,8 +694,7 @@ def _run_long_rollout_firstframe_warp(
     processed_frame_ids: set[int] = set()
     visibility_map = _GlobalVoxelVisibilityMap(voxel_size=float(args.selection_voxel_size))
 
-    carry_keyframes_tchw: torch.Tensor | None = None
-    carry_keyframe_ids: list[int] | None = None
+    carry_prefix_tchw: torch.Tensor | None = None
     warped_masked_rgb_next: torch.Tensor | None = None
     warped_mask_next: torch.Tensor | None = None
 
@@ -570,8 +705,9 @@ def _run_long_rollout_firstframe_warp(
     batch.num_frames = window_frames
 
     frame_seq_length: int | None = None
-    global_start_latent = 0
+    cache_global_start_latent = 0
     latent_stride_t: int | None = None
+    total_latent_frames: int | None = None
     kv_cache = None
     crossattn_cache = None
     kv_cache_uncond = None
@@ -587,17 +723,27 @@ def _run_long_rollout_firstframe_warp(
         if valid_window <= 0:
             break
         end_pos_valid = int(start_pos + valid_window)
-        window_first_rgb = global_first_rgb if win_idx == 0 else carry_keyframes_tchw[-1]
+        window_prefix_tchw = (
+            global_first_rgb.unsqueeze(0)
+            if win_idx == 0
+            else carry_prefix_tchw
+        )
+        if window_prefix_tchw is None or int(window_prefix_tchw.shape[0]) <= 0:
+            raise RuntimeError("Missing prefix frames for window > 0")
         window_first_frame_latent = (
             global_first_frame_latent
             if win_idx == 0
-            else base._encode_first_frame_latent(
+            else _encode_rgb_prefix_latent(
                 vae=vae,
-                first_rgb_chw=window_first_rgb,
+                prefix_rgb_tchw=window_prefix_tchw,
                 target_c=target_c,
                 inference_device=inference_device,
                 compute_dtype=dtype,
             ).to(device="cuda", dtype=dtype)
+        )
+        window_anchor_latent_frames = max(
+            int(args.first_frame_anchor_latent_frames),
+            int(window_first_frame_latent.shape[2]),
         )
 
         depth_window_paths = _pad_paths(sequence.depth_paths[start_pos:end_pos_valid], window_frames)
@@ -645,22 +791,21 @@ def _run_long_rollout_firstframe_warp(
             )
         else:
             if (
-                carry_keyframes_tchw is None
-                or carry_keyframe_ids is None
+                carry_prefix_tchw is None
                 or warped_masked_rgb_next is None
                 or warped_mask_next is None
             ):
                 raise RuntimeError("Missing carry-over warp state for window > 0")
             mask_tchw = torch.cat(
                 [
-                    torch.ones((1, 1, H, W), dtype=torch.float32),
+                    torch.ones((overlap_frames, 1, H, W), dtype=torch.float32),
                     warped_mask_next,
                 ],
                 dim=0,
             )
             masked_rgb_tchw = torch.cat(
                 [
-                    carry_keyframes_tchw[-1:],
+                    carry_prefix_tchw,
                     warped_masked_rgb_next,
                 ],
                 dim=0,
@@ -673,6 +818,7 @@ def _run_long_rollout_firstframe_warp(
             pmin=float(args.raw_depth_percentile_min),
             pmax=float(args.raw_depth_percentile_max),
             invert_depth=bool(args.raw_depth_invert),
+            normalization_mode=str(args.raw_depth_normalization_mode),
         )
         normal_tchw = None
         if normal_window_paths is not None:
@@ -717,67 +863,57 @@ def _run_long_rollout_firstframe_warp(
                 )
             frame_seq_length = latent_seq_length // patch_ratio
             total_latent_frames = latent_t + max(0, num_windows - 1) * latent_stride_t
-            kv_cache = base._initialize_kv_cache(
-                model=transformer,
-                batch_size=1,
+            (
+                kv_cache,
+                crossattn_cache,
+                kv_cache_uncond,
+                crossattn_cache_uncond,
+                control_kv_cache,
+                control_crossattn_cache,
+                control_kv_cache_uncond,
+                control_crossattn_cache_uncond,
+            ) = _initialize_long_rollout_caches(
+                transformer=transformer,
+                controlnet=controlnet,
+                prompt_embeds=prompt_embeds,
                 dtype=dtype,
-                device=rollout_device,
-                frame_seq_length=frame_seq_length,
-                sliding_window_num_frames_override=total_latent_frames,
+                rollout_device=rollout_device,
+                frame_seq_length=int(frame_seq_length),
+                total_latent_frames=int(total_latent_frames),
+                use_guidance=(float(args.guidance_scale) != 1.0),
             )
-            crossattn_cache = base._initialize_crossattn_cache(
-                model=transformer,
-                batch_size=1,
-                max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
+            cache_global_start_latent = 0
+        elif (
+            cache_reset_interval > 0
+            and total_latent_frames is not None
+            and win_idx > 0
+            and win_idx % cache_reset_interval == 0
+        ):
+            logger.info(
+                "resetting rollout caches before window=%s interval=%s",
+                int(win_idx),
+                int(cache_reset_interval),
+            )
+            (
+                kv_cache,
+                crossattn_cache,
+                kv_cache_uncond,
+                crossattn_cache_uncond,
+                control_kv_cache,
+                control_crossattn_cache,
+                control_kv_cache_uncond,
+                control_crossattn_cache_uncond,
+            ) = _initialize_long_rollout_caches(
+                transformer=transformer,
+                controlnet=controlnet,
+                prompt_embeds=prompt_embeds,
                 dtype=dtype,
-                device=rollout_device,
+                rollout_device=rollout_device,
+                frame_seq_length=int(frame_seq_length),
+                total_latent_frames=int(total_latent_frames),
+                use_guidance=(float(args.guidance_scale) != 1.0),
             )
-            control_kv_cache = base._initialize_kv_cache(
-                model=controlnet,
-                batch_size=1,
-                dtype=dtype,
-                device=rollout_device,
-                frame_seq_length=frame_seq_length,
-                sliding_window_num_frames_override=total_latent_frames,
-            )
-            control_crossattn_cache = base._initialize_crossattn_cache(
-                model=controlnet,
-                batch_size=1,
-                max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
-                dtype=dtype,
-                device=rollout_device,
-            )
-            if float(args.guidance_scale) != 1.0:
-                kv_cache_uncond = base._initialize_kv_cache(
-                    model=transformer,
-                    batch_size=1,
-                    dtype=dtype,
-                    device=rollout_device,
-                    frame_seq_length=frame_seq_length,
-                    sliding_window_num_frames_override=total_latent_frames,
-                )
-                crossattn_cache_uncond = base._initialize_crossattn_cache(
-                    model=transformer,
-                    batch_size=1,
-                    max_text_len=int(getattr(transformer, "text_len", prompt_embeds.shape[1])),
-                    dtype=dtype,
-                    device=rollout_device,
-                )
-                control_kv_cache_uncond = base._initialize_kv_cache(
-                    model=controlnet,
-                    batch_size=1,
-                    dtype=dtype,
-                    device=rollout_device,
-                    frame_seq_length=frame_seq_length,
-                    sliding_window_num_frames_override=total_latent_frames,
-                )
-                control_crossattn_cache_uncond = base._initialize_crossattn_cache(
-                    model=controlnet,
-                    batch_size=1,
-                    max_text_len=int(getattr(controlnet, "text_len", prompt_embeds.shape[1])),
-                    dtype=dtype,
-                    device=rollout_device,
-                )
+            cache_global_start_latent = 0
 
         latents = base._causal_dmd_rollout_one_window_with_cache(
             transformer=transformer,
@@ -801,11 +937,11 @@ def _run_long_rollout_firstframe_warp(
             first_frame_timestep_zero=bool(args.first_frame_timestep_zero) or condition_mode != "md_align",
             expand_timesteps=bool(getattr(fastvideo_args.pipeline_config, "expand_timesteps", False)),
             disable_cache_update=bool(args.disable_cache_update),
-            first_frame_anchor_latent_frames=int(args.first_frame_anchor_latent_frames),
+            first_frame_anchor_latent_frames=int(window_anchor_latent_frames),
             first_frame_condition_mode=condition_mode,
             seed=int(args.seed + win_idx),
             dtype=dtype,
-            global_start_latent=int(global_start_latent),
+            global_start_latent=int(cache_global_start_latent),
             frame_seq_length=int(frame_seq_length),
             batch=batch,
             kv_cache=kv_cache,
@@ -817,13 +953,13 @@ def _run_long_rollout_firstframe_warp(
             control_kv_cache_uncond=control_kv_cache_uncond,
             control_crossattn_cache_uncond=control_crossattn_cache_uncond,
         )
-        global_start_latent += int(latent_stride_t)
+        cache_global_start_latent += int(latent_stride_t)
 
         decoded_window = decoding.decode(latents, fastvideo_args).cpu().float()
         decoded_window_tchw = decoded_window[0].permute(1, 0, 2, 3).contiguous()
         decoded_window_tchw = decoded_window_tchw.clone()
         if condition_mode == "hard_replace":
-            decoded_window_tchw[0] = window_first_rgb
+            decoded_window_tchw[:int(window_prefix_tchw.shape[0])] = window_prefix_tchw
         if win_idx == 0:
             blend_frames = int(max(0, int(args.first_frame_blend_frames)))
             if blend_frames > 0:
@@ -850,6 +986,13 @@ def _run_long_rollout_firstframe_warp(
                 if normal_tchw is not None
                 else None
             )
+            write_frames = _apply_boundary_soft_blend(
+                frames_tchw=write_frames,
+                masked_rgb_tchw=masked_rgb_write,
+                mask_tchw=mask_write,
+                blend_frames=int(args.boundary_blend_frames),
+                blend_strength=float(args.boundary_blend_strength),
+            )
 
         write_count = int(write_frames.shape[0])
         final_tchw[write_ptr:write_ptr + write_count] = write_frames
@@ -873,6 +1016,10 @@ def _run_long_rollout_firstframe_warp(
 
         if win_idx < num_windows - 1:
             last_frame_id = int(sequence.frame_ids[end_pos_valid - 1])
+            prefix_keep = min(overlap_frames, valid_window)
+            carry_prefix_tchw = decoded_window_tchw[
+                valid_window - prefix_keep:valid_window
+            ].clone()
 
             next_chunk_start = max(0, int(end_pos_valid - overlap_frames))
             next_chunk_end = min(next_chunk_start + window_frames, total_required)
@@ -899,14 +1046,6 @@ def _run_long_rollout_firstframe_warp(
                 [int(x) for x in selected_keyframe_ids],
             )
             keyframe_rgbs_u8 = [history_rgbs_u8[int(fid)] for fid in selected_keyframe_ids]
-            carry_keyframe_ids = [int(fid) for fid in selected_keyframe_ids]
-            carry_keyframes_tchw = torch.stack(
-                [
-                    torch.from_numpy(rgb.astype(base.np.float32) / 255.0).permute(2, 0, 1).contiguous()
-                    for rgb in keyframe_rgbs_u8
-                ],
-                dim=0,
-            )
 
             next_start = int(end_pos_valid)
             next_valid_new = min(stride, total_required - next_start)
@@ -914,7 +1053,7 @@ def _run_long_rollout_firstframe_warp(
 
             warped_masked_rgb_next_valid, warped_mask_next_valid = _warp_maskrgb_from_keyframes_md_aligned(
                 keyframe_rgbs_u8=keyframe_rgbs_u8,
-                keyframe_frame_ids=carry_keyframe_ids,
+                keyframe_frame_ids=selected_keyframe_ids,
                 target_frame_ids=target_ids_next,
                 depth_path_by_frame_id=depth_path_by_id,
                 camera_k_aligned=sequence.camera_k_aligned,
@@ -954,6 +1093,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cam_rt_dir", default="")
     p.add_argument("--raw_depth_percentile_min", type=float, default=2.0)
     p.add_argument("--raw_depth_percentile_max", type=float, default=98.0)
+    p.add_argument(
+        "--raw_depth_normalization_mode",
+        type=str,
+        default="md_align",
+        choices=["md_align", "percentile"],
+    )
     p.add_argument("--raw_depth_invert", action="store_true")
     p.add_argument("--no_raw_depth_invert", action="store_false", dest="raw_depth_invert")
 
@@ -980,10 +1125,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--selection_voxel_size", type=float, default=0.1)
     p.add_argument("--context_noise", type=int, default=0)
     p.add_argument("--disable_cache_update", action="store_true")
+    p.add_argument("--cache_reset_interval_windows", type=int, default=0)
     p.add_argument("--first_frame_timestep_zero", action="store_true")
     p.add_argument("--first_frame_condition_mode", default="hard_replace", choices=["hard_replace", "noise_init", "md_align"])
     p.add_argument("--first_frame_anchor_latent_frames", type=int, default=1)
     p.add_argument("--first_frame_blend_frames", type=int, default=0)
+    p.add_argument("--boundary_blend_frames", type=int, default=0)
+    p.add_argument("--boundary_blend_strength", type=float, default=1.0)
     p.add_argument("--flow_shift", type=float, default=5.0)
     p.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default="bf16")
     p.add_argument("--seed", type=int, default=42)

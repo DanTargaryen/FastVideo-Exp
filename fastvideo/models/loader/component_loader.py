@@ -65,6 +65,33 @@ def _validate_union_controlnet_weights(
         )
 
 
+def _apply_causal_attn_overrides(model_config, fastvideo_args: FastVideoArgs,
+                                 component_name: str) -> None:
+    arch_config = getattr(model_config, "arch_config", None)
+    if arch_config is None:
+        return
+
+    changes: list[str] = []
+    local_attn_size = getattr(fastvideo_args, "local_attn_size", None)
+    sink_size = getattr(fastvideo_args, "sink_size", None)
+
+    if hasattr(arch_config, "local_attn_size") and local_attn_size is not None:
+        local_attn_size = int(local_attn_size)
+        if int(getattr(arch_config, "local_attn_size")) != local_attn_size:
+            arch_config.local_attn_size = local_attn_size
+            changes.append(f"local_attn_size={local_attn_size}")
+
+    if hasattr(arch_config, "sink_size") and sink_size is not None:
+        sink_size = int(sink_size)
+        if int(getattr(arch_config, "sink_size")) != sink_size:
+            arch_config.sink_size = sink_size
+            changes.append(f"sink_size={sink_size}")
+
+    if changes:
+        logger.info("Applied causal attention override to %s: %s",
+                    component_name, ", ".join(changes))
+
+
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
@@ -476,6 +503,7 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes fastvideo's model config
         dit_config = fastvideo_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
+        _apply_causal_attn_overrides(dit_config, fastvideo_args, "transformer")
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -580,6 +608,8 @@ class ControlNetLoader(ComponentLoader):
             logger.info("Ignoring %d unsupported ControlNet config keys (e.g. %s)",
                         len(ignored), ignored[:5])
         controlnet_config.update_model_arch(filtered)
+        _apply_causal_attn_overrides(controlnet_config, fastvideo_args,
+                                     "controlnet")
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 

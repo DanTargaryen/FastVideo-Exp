@@ -147,7 +147,10 @@ def collate_rows_from_parquet_schema(rows,
                 shape = row[shape_key]
                 bytes_data = row[bytes_key]
 
-                if len(bytes_data) == 0:
+                if (shape is None or bytes_data is None
+                        or (dtype_key in row and row[dtype_key] is None)):
+                    tensor = torch.zeros(0, dtype=torch.bfloat16)
+                elif len(bytes_data) == 0:
                     tensor = torch.zeros(0, dtype=torch.bfloat16)
                 else:
                     # Convert bytes to tensor using float32 as default

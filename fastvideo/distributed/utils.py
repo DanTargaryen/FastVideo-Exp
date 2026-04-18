@@ -6,6 +6,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
+import math
 import pickle
 import time
 from collections import deque
@@ -18,6 +19,92 @@ from torch.distributed import TCPStore
 from fastvideo.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class SequenceParallelBlockPartition:
+    block_start: int
+    block_end: int
+    frame_start: int
+    frame_end: int
+    padded_frame_end: int
+    num_blocks: int
+    num_frames: int
+    padded_num_frames: int
+    total_blocks: int
+    total_blocks_padded: int
+
+
+def get_sequence_parallel_block_partition(
+    num_frames: int,
+    num_frame_per_block: int,
+    *,
+    sp_world_size: int | None = None,
+    sp_rank: int | None = None,
+) -> SequenceParallelBlockPartition:
+    """Partition frames into contiguous block groups for sequence parallel.
+
+    Frames are divided into blocks of `num_frame_per_block` contiguous frames,
+    except for a possible shorter tail block. Those blocks are then split
+    contiguously across the SP ranks.
+    """
+    if num_frame_per_block <= 0:
+        raise ValueError(
+            f"num_frame_per_block must be positive, got {num_frame_per_block}")
+    if num_frames < 0:
+        raise ValueError(f"num_frames must be non-negative, got {num_frames}")
+
+    if sp_world_size is None:
+        if torch.distributed.is_initialized():
+            from fastvideo.distributed.parallel_state import (
+                get_sp_world_size, model_parallel_is_initialized)
+            if model_parallel_is_initialized():
+                sp_world_size = get_sp_world_size()
+            else:
+                sp_world_size = 1
+        else:
+            sp_world_size = 1
+    if sp_rank is None:
+        if torch.distributed.is_initialized():
+            from fastvideo.distributed.parallel_state import (
+                get_sp_parallel_rank, model_parallel_is_initialized)
+            if model_parallel_is_initialized():
+                sp_rank = get_sp_parallel_rank()
+            else:
+                sp_rank = 0
+        else:
+            sp_rank = 0
+
+    if sp_world_size <= 0:
+        raise ValueError(
+            f"sp_world_size must be positive, got {sp_world_size}")
+    if sp_rank < 0 or sp_rank >= sp_world_size:
+        raise ValueError(
+            f"sp_rank must be in [0, {sp_world_size}), got {sp_rank}")
+
+    total_blocks = math.ceil(num_frames / num_frame_per_block) if num_frames > 0 else 0
+    total_blocks_padded = math.ceil(total_blocks / sp_world_size) * sp_world_size
+    num_blocks = total_blocks_padded // sp_world_size if sp_world_size > 0 else 0
+    block_start = sp_rank * num_blocks
+    block_end = block_start + num_blocks
+
+    frame_start = min(block_start * num_frame_per_block, num_frames)
+    frame_end = min(block_end * num_frame_per_block, num_frames)
+    padded_frame_end = block_end * num_frame_per_block
+
+    return SequenceParallelBlockPartition(
+        block_start=block_start,
+        block_end=block_end,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        padded_frame_end=padded_frame_end,
+        num_blocks=num_blocks,
+        num_frames=max(frame_end - frame_start, 0),
+        padded_num_frames=max(padded_frame_end - block_start * num_frame_per_block,
+                              0),
+        total_blocks=total_blocks,
+        total_blocks_padded=total_blocks_padded,
+    )
 
 
 def ensure_divisibility(numerator, denominator) -> None:
