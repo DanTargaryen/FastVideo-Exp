@@ -32,6 +32,11 @@ env
 **.txt
 *.log
 weights/
+*.bundle
+.env
+.env.*
+outputs_dmd/
+tmp/
 
 # Distribution / packaging
 build/
