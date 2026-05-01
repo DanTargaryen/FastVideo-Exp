@@ -4555,6 +4555,10 @@ def main() -> None:
         vae_cpu_offload=False,
         pin_cpu_memory=True,
     )
+    # Keep loader precision aligned with the requested runtime precision.
+    # Otherwise component loaders instantiate DiT/ControlNet with the pipeline
+    # default (bf16) and later force runtime tensors back to that dtype.
+    fastvideo_args.pipeline_config.dit_precision = str(args.dtype)
     use_union_controlnet = _controlnet_dir_is_union(args.controlnet_dir)
     if args.attention_mode == "bidirectional":
         fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
