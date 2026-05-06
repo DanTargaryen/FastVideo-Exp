@@ -24,7 +24,9 @@ Window stitch format:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -47,6 +49,63 @@ import tools.infer_wan_controlnet_ti2v as base
 import tools.infer_wan_controlnet_ti2v_long_firstframe_warp as longwarp
 
 logger = init_logger(__name__)
+
+
+def _write_run_manifest(
+    *,
+    out_dir: Path,
+    args: argparse.Namespace,
+    sample_id: str,
+    prompt: str,
+    output_path: Path,
+) -> None:
+    manifest = {
+        "sample_id": str(sample_id),
+        "prompt": str(prompt),
+        "output_path": str(output_path),
+        "argv": [str(x) for x in sys.argv],
+        "paths": {
+            "base_model": str(args.base_model),
+            "transformer_dir": str(args.transformer_dir),
+            "controlnet_dir": str(args.controlnet_dir),
+            "raw_sample_root": str(args.raw_sample_root),
+            "data_path": str(args.data_path),
+            "cam_k": str(args.cam_k),
+            "cam_rt_dir": str(args.cam_rt_dir),
+        },
+        "sampling": {
+            "input_mode": str(args.input_mode),
+            "scheduler": str(args.scheduler),
+            "schedule_num_inference_steps": int(args.schedule_num_inference_steps),
+            "full_schedule": bool(args.full_schedule),
+            "guidance_scale": float(args.guidance_scale),
+            "negative_prompt": str(args.negative_prompt),
+            "flow_shift": float(args.flow_shift),
+            "seed": int(args.seed),
+            "dtype": str(args.dtype),
+        },
+        "shape": {
+            "height": int(args.height),
+            "width": int(args.width),
+            "num_frames": int(args.num_frames),
+            "fps": int(args.fps),
+            "window_frames": int(args.causal_window_frames),
+            "overlap_frames": int(args.causal_overlap_frames),
+        },
+        "raw_preprocess": {
+            "raw_depth_normalization_mode": str(args.raw_depth_normalization_mode),
+            "raw_depth_invert": bool(args.raw_depth_invert),
+            "raw_require_normal": bool(args.raw_require_normal),
+        },
+        "bidir": {
+            "bidir_first_frame_timestep_zero": bool(args.bidir_first_frame_timestep_zero),
+            "bidir_sync_first_frame_state": bool(args.bidir_sync_first_frame_state),
+        },
+    }
+    manifest_path = out_dir / f"{sample_id}_run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+    logger.info("saved run manifest: %s", str(manifest_path))
 
 
 def _slice_or_pad_latent_t(latent_bcfhw: torch.Tensor, *, start_t: int,
@@ -149,7 +208,7 @@ def _run_bidirectional_window(
         full_schedule=bool(full_schedule),
         first_frame_timestep_zero=bool(bidir_first_frame_timestep_zero),
         bidir_sync_first_frame_state=bool(bidir_sync_first_frame_state),
-        expand_timesteps=False,
+        expand_timesteps=True,
         trace_jsonl_path=None,
         trace_sample_id=str(trace_sample_id),
         seed=int(seed),
@@ -329,6 +388,7 @@ def _run_windowed_bidirectional_raw(
     W = int(args.width)
     inference_device = torch.device(
         f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+    use_precomputed_mask = sequence.mask_paths is not None
 
     global_first_rgb = base._load_rgb_frame(sequence.rgb_paths[0], H, W)
     global_first_frame_latent = base._encode_first_frame_latent(
@@ -405,7 +465,48 @@ def _run_windowed_bidirectional_raw(
                                 int(window_frames))
             if sequence.normal_paths is not None else None)
 
-        if win_idx == 0:
+        if use_precomputed_mask:
+            assert sequence.mask_paths is not None
+            mask_window_paths = longwarp._pad_paths(
+                sequence.mask_paths[start_pos:end_pos_valid],
+                int(window_frames),
+            )
+            mask_tchw = torch.stack(
+                [
+                    base._load_mask_frame(
+                        p,
+                        H,
+                        W,
+                        threshold=(
+                            None if float(getattr(args, "raw_mask_threshold", -1.0)) < 0
+                            else float(getattr(args, "raw_mask_threshold", -1.0))
+                        ),
+                        invert=bool(getattr(args, "raw_mask_invert", False)),
+                    )
+                    for p in mask_window_paths
+                ],
+                dim=0,
+            )
+            if sequence.masked_rgb_paths is not None:
+                masked_rgb_window_paths = longwarp._pad_paths(
+                    sequence.masked_rgb_paths[start_pos:end_pos_valid],
+                    int(window_frames),
+                )
+                masked_rgb_tchw = torch.stack(
+                    [base._load_rgb_frame(p, H, W) for p in masked_rgb_window_paths],
+                    dim=0,
+                )
+            else:
+                rgb_window_paths = longwarp._pad_paths(
+                    sequence.rgb_paths[start_pos:end_pos_valid],
+                    int(window_frames),
+                )
+                rgb_tchw_for_mask = torch.stack(
+                    [base._load_rgb_frame(p, H, W) for p in rgb_window_paths],
+                    dim=0,
+                )
+                masked_rgb_tchw = rgb_tchw_for_mask * mask_tchw.repeat(1, 3, 1, 1)
+        elif win_idx == 0:
             first_rgb_u8 = longwarp._chw_float_to_u8(global_first_rgb)
             target_ids = sequence.frame_ids[start_pos + 1:end_pos_valid]
             if len(target_ids) > 0:
@@ -463,6 +564,7 @@ def _run_windowed_bidirectional_raw(
             pmax=float(args.raw_depth_percentile_max),
             invert_depth=bool(args.raw_depth_invert),
             normalization_mode=str(args.raw_depth_normalization_mode),
+            crop_params=sequence.crop_params,
         )
         normal_tchw = None
         if normal_window_paths is not None:
@@ -561,24 +663,26 @@ def _run_windowed_bidirectional_raw(
                                          )
         write_ptr += write_count
 
-        current_frame_ids = [
-            int(fid) for fid in sequence.frame_ids[start_pos:end_pos_valid]
-        ]
-        longwarp._update_history_and_visibility(
-            sequence=sequence,
-            frame_ids=current_frame_ids,
-            frames_tchw=decoded_window_tchw[:valid_window],
-            history_rgbs_u8=history_rgbs_u8,
-            processed_frame_ids=processed_frame_ids,
-            visibility_map=visibility_map,
-        )
-
         if win_idx < num_windows - 1:
             last_frame_id = int(sequence.frame_ids[end_pos_valid - 1])
             prefix_keep = min(int(overlap_frames), int(valid_window))
             carry_prefix_tchw = decoded_window_tchw[int(valid_window) -
                                                     prefix_keep:int(
                                                         valid_window)].clone()
+            if use_precomputed_mask:
+                continue
+
+            current_frame_ids = [
+                int(fid) for fid in sequence.frame_ids[start_pos:end_pos_valid]
+            ]
+            longwarp._update_history_and_visibility(
+                sequence=sequence,
+                frame_ids=current_frame_ids,
+                frames_tchw=decoded_window_tchw[:valid_window],
+                history_rgbs_u8=history_rgbs_u8,
+                processed_frame_ids=processed_frame_ids,
+                visibility_map=visibility_map,
+            )
 
             next_chunk_start = max(0, int(end_pos_valid - overlap_frames))
             next_chunk_end = min(int(next_chunk_start + window_frames),
@@ -662,6 +766,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--raw_mask_dir", default="")
     p.add_argument("--raw_masked_rgb_dir", default="")
     p.add_argument("--raw_require_normal", action="store_true")
+    p.add_argument("--raw_mask_threshold", type=float, default=-1.0)
+    p.add_argument("--raw_mask_invert", action="store_true")
     p.add_argument("--raw_prompt", default="")
     p.add_argument("--raw_caption_path", default="")
     p.add_argument("--raw_caption_key", default="Video_Caption")
@@ -694,7 +800,7 @@ def parse_args() -> argparse.Namespace:
                    default="euler_dt")
     p.add_argument("--full_schedule", action="store_true")
     p.add_argument("--warp_denoising_step", action="store_true", default=True)
-    p.add_argument("--guidance_scale", type=float, default=1.0)
+    p.add_argument("--guidance_scale", type=float, default=6.0)
     p.add_argument("--negative_prompt",
                    type=str,
                    default="bad quality, worst quality")
@@ -791,15 +897,19 @@ def main() -> None:
         pin_cpu_memory=True,
     )
     use_union_controlnet = base._controlnet_dir_is_union(args.controlnet_dir)
+    # Match Diff-Factory fp32 pipeline behavior when --dtype fp32 is requested.
+    # Without this, FastVideo's loader instantiates DiT/ControlNet in the pipeline
+    # default bf16 and runtime tensors are later forced back to bf16.
+    fastvideo_args.pipeline_config.dit_precision = str(args.dtype)
     fastvideo_args.override_transformer_cls_name = "WanTransformer3DModel"
     fastvideo_args.override_controlnet_cls_name = (
         "WanControlnetUnion3DModel" if use_union_controlnet else
         "WanControlnet3DModel")
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     if hasattr(fastvideo_args.pipeline_config, "expand_timesteps"):
-        fastvideo_args.pipeline_config.expand_timesteps = False
+        fastvideo_args.pipeline_config.expand_timesteps = True
     if hasattr(fastvideo_args.pipeline_config, "dit_config"):
-        fastvideo_args.pipeline_config.dit_config.expand_timesteps = False
+        fastvideo_args.pipeline_config.dit_config.expand_timesteps = True
     fastvideo_args.pipeline_config.warp_denoising_step = bool(
         args.warp_denoising_step)
     fastvideo_args.pipeline_config.dmd_denoising_steps = dmd_steps_list or []
@@ -850,7 +960,10 @@ def main() -> None:
         )
 
     if args.scheduler == "unipc":
-        scheduler = FlowUniPCMultistepScheduler(shift=float(args.flow_shift))
+        scheduler = base.DiffusersUniPCMultistepScheduler.from_pretrained(
+            args.base_model, subfolder="scheduler")
+        scheduler = base.DiffusersUniPCMultistepScheduler.from_config(
+            scheduler.config, flow_shift=float(args.flow_shift))
     else:
         scheduler = FlowMatchEulerDiscreteScheduler(shift=float(args.flow_shift))
 
@@ -894,6 +1007,13 @@ def main() -> None:
         )
         out_path = out_dir / f"{sequence.sample_id}_windowed_bidir.mp4"
         base._save_mp4(decoded, str(out_path), fps=int(sequence.fps))
+        _write_run_manifest(
+            out_dir=out_dir,
+            args=args,
+            sample_id=sequence.sample_id,
+            prompt=sequence.prompt,
+            output_path=out_path,
+        )
         if bool(args.save_frames):
             base._save_frames_png(decoded,
                                   str(out_dir / "frames" / sequence.sample_id),
@@ -934,9 +1054,14 @@ def main() -> None:
         out_path = out_dir / (
             f"{sample.sample_id.replace('/', '__')}_windowed_bidir_o{int(args.causal_overlap_frames)}.mp4"
         )
-        base._save_mp4(decoded, str(out_path),
-                       fps=int(sample.fps) if int(sample.fps) > 0 else
-                       int(args.fps))
+        base._save_mp4(decoded, str(out_path), fps=int(args.fps))
+        _write_run_manifest(
+            out_dir=out_dir,
+            args=args,
+            sample_id=sample.sample_id.replace("/", "__"),
+            prompt=sample.caption,
+            output_path=out_path,
+        )
         if bool(args.save_frames):
             base._save_frames_png(decoded,
                                   str(out_dir / "frames" / sample.sample_id),

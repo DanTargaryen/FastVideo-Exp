@@ -15,6 +15,7 @@ Inputs:
 
 Output:
   - Parquet dataset directory compatible with `pyarrow_schema_ti2v_controlnet`.
+  - `vae_latent_*` stores the full RGB video VAE latent.
 
 Notes:
   - If Wan VAE latent channel size is `C_lat` (aka z_dim), then each of (depth/normal/masked_rgb/mask)
@@ -625,6 +626,20 @@ def main(args: argparse.Namespace) -> None:
         first_lat = first_lat[0, :, 0].unsqueeze(0)  # 1,16,h,w (F,C,H,W)
         first_lat_np = first_lat.to("cpu", dtype=torch.float32).numpy()
 
+        # ---- full RGB video latent ----
+        rgb_tchw = torch.stack([
+            _load_rgb_frame(os.path.join(video_dir, f"{int(i):06d}.png"),
+                            args.max_height, args.max_width)
+            for i in frame_indices
+        ],
+                               dim=0)
+        rgb_bcthw = _to_vae_input(rgb_tchw, normalize=True).to(device=device,
+                                                               dtype=torch.float32)
+        vae_lat = _encode_video_latents(vae,
+                                        rgb_bcthw,
+                                        sample_mode="mode")  # 1,C,T_lat,h,w
+        vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
+
         # ---- control latents ----
         depth_tchw = _load_depth_frames_from_folder(
             control_dir,
@@ -688,12 +703,6 @@ def main(args: argparse.Namespace) -> None:
                     os.path.join(mask_dir, f"{int(frame_indices[0]):06d}.png")):
                 mask_dir = os.path.join(mask_dir, scene_name)
 
-            rgb_tchw = torch.stack([
-                _load_rgb_frame(os.path.join(video_dir, f"{int(i):06d}.png"),
-                                args.max_height, args.max_width)
-                for i in frame_indices
-            ],
-                                   dim=0)
             mask_tchw = torch.stack([
                 _load_mask_frame(
                     os.path.join(mask_dir, f"{int(i):06d}.png"),
@@ -765,18 +774,15 @@ def main(args: argparse.Namespace) -> None:
                                     dim=0)  # 48,T_lat,h,w
         control_lat_np = control_lat.numpy()
 
-        # Optional: no GT video latents for self-forcing (simulate_generator_forward=True)
-        empty_lat = np.zeros((0,), dtype=np.float32)
-
         record_id = f"{scene_name}__{idx:06d}"
         record = {
             "id": record_id,
             "text_embedding_bytes": text_emb.tobytes(),
             "text_embedding_shape": list(text_emb.shape),
             "text_embedding_dtype": "float32",
-            "vae_latent_bytes": empty_lat.tobytes(),
-            "vae_latent_shape": [],
-            "vae_latent_dtype": "",
+            "vae_latent_bytes": vae_lat_np.tobytes(),
+            "vae_latent_shape": list(vae_lat_np.shape),
+            "vae_latent_dtype": "float32",
             "first_frame_latent_bytes": first_lat_np.tobytes(),
             "first_frame_latent_shape": list(first_lat_np.shape),
             "first_frame_latent_dtype": "float32",

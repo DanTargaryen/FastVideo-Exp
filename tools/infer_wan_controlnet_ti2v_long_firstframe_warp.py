@@ -55,6 +55,8 @@ class RawLongSequenceNoMask:
     rgb_paths: list[Path]
     depth_paths: list[Path]
     normal_paths: list[Path] | None
+    mask_paths: list[Path] | None
+    masked_rgb_paths: list[Path] | None
     frame_ids: list[int]
     camera_k_aligned: base.np.ndarray
     camera_rt_dir: Path
@@ -346,13 +348,14 @@ def _warp_maskrgb_from_keyframes_md_aligned(
     target_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Align the warp kernel to run_wan_controlnet_union_long_w_selection.md:
-    - each source keyframe is independently back-projected and projected
+    Align the warp kernel to Diff-Factory backwarp inference:
+    - each target frame is backward-warped through target depth into source views
+    - RGB uses bilinear remap while depth consistency uses nearest-depth sampling
     - per-target results are merged in keyframe order
     - mask is a hard visibility union over all warped sources
     """
     warper = base._PointCloudWarper()
-    source_clouds: list[tuple[base.np.ndarray, base.np.ndarray]] = []
+    source_views: list[tuple[base.np.ndarray, base.np.ndarray, base.np.ndarray]] = []
     for src_rgb, src_id in zip(keyframe_rgbs_u8, keyframe_frame_ids):
         if int(src_id) not in depth_path_by_frame_id:
             raise KeyError(f"Missing depth path for source frame id {int(src_id)}")
@@ -365,13 +368,7 @@ def _warp_maskrgb_from_keyframes_md_aligned(
         src_rt = base._load_camera_matrix(
             base._resolve_camera_rt_path(camera_rt_dir, int(src_id))
         )
-        points_world, colors = warper.back_project(
-            src_rgb,
-            src_depth,
-            camera_k_aligned,
-            src_rt,
-        )
-        source_clouds.append((points_world, colors))
+        source_views.append((src_rgb, src_depth, src_rt))
 
     merged_rgb_tensors: list[torch.Tensor] = []
     merged_mask_tensors: list[torch.Tensor] = []
@@ -390,15 +387,15 @@ def _warp_maskrgb_from_keyframes_md_aligned(
 
         merged_rgb = base.np.zeros((int(target_height), int(target_width), 3), dtype=base.np.uint8)
         merged_mask = base.np.zeros((int(target_height), int(target_width)), dtype=base.np.uint8)
-        for points_world, colors in source_clouds:
-            w_rgb, w_mask = warper.project_to_view(
-                points_world,
-                colors,
-                camera_k_aligned,
-                tgt_rt,
-                int(target_height),
-                int(target_width),
-                target_depth=tgt_depth,
+        for src_rgb, src_depth, src_rt in source_views:
+            w_rgb, w_mask = warper.backward_warp(
+                tgt_depth=tgt_depth,
+                tgt_K=camera_k_aligned,
+                tgt_Rt=tgt_rt,
+                src_rgb=src_rgb,
+                src_depth=src_depth,
+                src_K=camera_k_aligned,
+                src_Rt=src_rt,
             )
             valid_area = w_mask > 127.5
             merged_rgb[valid_area] = w_rgb[valid_area]
@@ -424,7 +421,7 @@ def _load_raw_long_sequence_nomask(
     inference_device: torch.device,
     dtype: torch.dtype,
 ) -> RawLongSequenceNoMask:
-    rgb_dir, depth_dir, normal_dir, _mask_dir, _masked_rgb_dir = base._resolve_raw_dirs(
+    rgb_dir, depth_dir, normal_dir, mask_dir, masked_rgb_dir = base._resolve_raw_dirs(
         sample_root=sample_root, args=args
     )
 
@@ -450,6 +447,24 @@ def _load_raw_long_sequence_nomask(
         raise FileNotFoundError(
             f"--raw_require_normal is set but normal dir is missing/empty: {normal_dir}"
         )
+    mask_all: list[Path] | None = None
+    if mask_dir.is_dir():
+        mfiles = base._sorted_files(
+            mask_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        )
+        if mfiles:
+            mask_all = mfiles
+    if str(getattr(args, "raw_mask_dir", "")).strip() and mask_all is None:
+        raise FileNotFoundError(
+            f"--raw_mask_dir is set but mask dir is missing/empty: {mask_dir}"
+        )
+    masked_rgb_all: list[Path] | None = None
+    if masked_rgb_dir.is_dir():
+        mr_files = base._sorted_files(
+            masked_rgb_dir, (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        )
+        if mr_files:
+            masked_rgb_all = mr_files
 
     total_required = int(args.num_frames)
     if len(rgb_all) < total_required:
@@ -463,6 +478,14 @@ def _load_raw_long_sequence_nomask(
     if normal_all is not None and len(normal_all) < total_required:
         raise ValueError(
             f"raw normal frames are insufficient: need {total_required}, got {len(normal_all)}"
+        )
+    if mask_all is not None and len(mask_all) < total_required:
+        raise ValueError(
+            f"raw mask frames are insufficient: need {total_required}, got {len(mask_all)}"
+        )
+    if masked_rgb_all is not None and len(masked_rgb_all) < total_required:
+        raise ValueError(
+            f"raw masked_rgb frames are insufficient: need {total_required}, got {len(masked_rgb_all)}"
         )
 
     rgb_paths = rgb_all[:total_required]
@@ -487,6 +510,10 @@ def _load_raw_long_sequence_nomask(
     depth_paths = depth_all[:total_required]
     frame_ids = base._extract_frame_ids(depth_paths, name="depth")
     normal_paths = normal_all[:total_required] if normal_all is not None else None
+    mask_paths = mask_all[:total_required] if mask_all is not None else None
+    masked_rgb_paths = (
+        masked_rgb_all[:total_required] if masked_rgb_all is not None else None
+    )
 
     prompt = base._resolve_raw_prompt(sample_root, args)
     max_text_len = int(getattr(transformer, "text_len", 226))
@@ -499,22 +526,32 @@ def _load_raw_long_sequence_nomask(
         target_device=inference_device,
     )
 
-    cam_k_path = Path(str(args.cam_k)).expanduser() if str(args.cam_k).strip() else (
-        sample_root / "camera" / "camera_K.txt"
-    )
-    camera_rt_dir = Path(str(args.cam_rt_dir)).expanduser() if str(args.cam_rt_dir).strip() else (
-        sample_root / "camera"
-    )
-    if not camera_rt_dir.is_dir():
-        raise FileNotFoundError(f"camera RT dir not found: {camera_rt_dir}")
-    camera_k = base._load_camera_matrix(cam_k_path).astype(base.np.float32)
-
     ref_img = base.Image.open(rgb_paths[0]).convert("RGB")
     src_w, src_h = ref_img.size
     crop_params = base._get_crop_params(src_w, src_h, int(args.width), int(args.height))
-    camera_k_aligned = base._adjust_intrinsics(
-        camera_k, crop_params, int(args.width), int(args.height)
-    )
+    if mask_paths is None:
+        cam_k_path = Path(str(args.cam_k)).expanduser() if str(args.cam_k).strip() else (
+            sample_root / "camera" / "camera_K.txt"
+        )
+        camera_rt_dir = Path(str(args.cam_rt_dir)).expanduser() if str(args.cam_rt_dir).strip() else (
+            sample_root / "camera"
+        )
+        if not (camera_rt_dir.is_dir() or (
+                camera_rt_dir.is_file()
+                and camera_rt_dir.suffix.lower() == ".json")):
+            raise FileNotFoundError(f"camera RT dir not found: {camera_rt_dir}")
+        camera_k = base._load_camera_matrix(cam_k_path).astype(base.np.float32)
+        camera_k_aligned = base._adjust_intrinsics(
+            camera_k, crop_params, int(args.width), int(args.height)
+        )
+    else:
+        camera_rt_dir = sample_root
+        camera_k_aligned = base.np.eye(3, dtype=base.np.float32)
+        logger.info(
+            "raw precomputed mask enabled: using %d mask frames from %s",
+            len(mask_paths),
+            mask_dir,
+        )
 
     return RawLongSequenceNoMask(
         sample_id=sample_root.name,
@@ -524,6 +561,8 @@ def _load_raw_long_sequence_nomask(
         rgb_paths=rgb_paths,
         depth_paths=depth_paths,
         normal_paths=normal_paths,
+        mask_paths=mask_paths,
+        masked_rgb_paths=masked_rgb_paths,
         frame_ids=frame_ids,
         camera_k_aligned=camera_k_aligned,
         camera_rt_dir=camera_rt_dir,
@@ -819,6 +858,7 @@ def _run_long_rollout_firstframe_warp(
             pmax=float(args.raw_depth_percentile_max),
             invert_depth=bool(args.raw_depth_invert),
             normalization_mode=str(args.raw_depth_normalization_mode),
+            crop_params=sequence.crop_params,
         )
         normal_tchw = None
         if normal_window_paths is not None:

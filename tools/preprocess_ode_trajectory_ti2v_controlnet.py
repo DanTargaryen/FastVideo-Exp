@@ -75,8 +75,8 @@ def _compute_negative_prompt_embeddings(
             return_tensors="pt",
         )
         prompt_embeds = text_encoder(
-            tokens.input_ids.to(encoder_device),
-            tokens.attention_mask.to(encoder_device),
+            input_ids=tokens.input_ids.to(encoder_device),
+            attention_mask=tokens.attention_mask.to(encoder_device),
         ).last_hidden_state
 
     seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())

@@ -23,6 +23,7 @@ where local_idx is 0..clip_length-1.
 Output:
   <output_dir>/rank_XX/worker_*/data_chunk_*.parquet compatible with
   fastvideo.dataset.dataloader.schema.py: pyarrow_schema_ti2v_controlnet
+  `vae_latent_*` stores the full RGB video VAE latent.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import argparse
 import html
 import json
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from fastvideo import PipelineConfig
+from fastvideo.configs.models.vaes import WanVAEConfig
 from fastvideo.dataset.dataloader.parquet_io import ParquetDatasetWriter, records_to_table
 from fastvideo.dataset.dataloader.schema import pyarrow_schema_ti2v_controlnet
 from fastvideo.distributed.parallel_state import (
@@ -118,6 +121,20 @@ def _load_rgb_frame(path: Path, height: int, width: int) -> torch.Tensor:
     img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
     arr = np.asarray(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # 3HW in [0,1]
+
+
+def _load_normal_frame(path: Path, height: int, width: int, *, normal_format: str) -> torch.Tensor:
+    img = Image.open(path).convert("RGB")
+    img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
+    arr = np.asarray(img).astype(np.float32)
+    arr = (arr / 255.0) * 2.0 - 1.0
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    arr = np.clip(arr, -1.0, 1.0)
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    if str(normal_format) == "opencv":
+        t[1] = -t[1]
+        t[2] = -t[2]
+    return t
 
 
 def _load_mask_frame(path: Path, height: int, width: int, *, threshold: float | None) -> torch.Tensor:
@@ -311,6 +328,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rank", type=int, default=0, help="Shard rank (0-based).")
     p.add_argument("--world_size", type=int, default=1, help="Number of shards.")
     p.add_argument("--scene_key", type=str, default="", help="Optional single scene key to process.")
+    p.add_argument("--max_samples", type=int, default=0, help="Process at most this many clips before rank sharding. 0 means all clips.")
+    p.add_argument("--target_records", type=int, default=0, help="Stop after writing this many valid records on this rank. 0 means no record-count limit.")
+    p.add_argument("--shuffle", action="store_true", help="Shuffle candidate clips before sharding/processing.")
+    p.add_argument("--seed", type=int, default=20260506, help="Random seed used when --shuffle is enabled.")
     p.add_argument("--clip_length", type=int, default=81, help="Number of RGB frames per clip.")
     p.add_argument("--fps", type=int, default=16, help="FPS metadata.")
     p.add_argument("--max_width", type=int, default=512)
@@ -318,6 +339,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_threshold", type=float, default=0.5, help="Binarization threshold; set <0 to keep soft.")
     p.add_argument("--depth_percentile_min", type=float, default=5.0)
     p.add_argument("--depth_percentile_max", type=float, default=95.0)
+    p.add_argument("--use_normal", action="store_true", help="Include normal0/data as an extra ControlNet branch.")
+    p.add_argument("--require_normal", action="store_true", help="Skip clips whose normal0/data is missing or empty.")
+    p.add_argument("--normal_format", type=str, default="opencv", choices=["opencv", "opengl"], help="Normal encoding. 'opencv' flips Y/Z to OpenGL.")
     p.add_argument("--caption_pattern", type=str, default="caption*.json")
     p.add_argument("--caption_key", type=str, default="Video_Caption", help="Which field under captions{} to use as prompt.")
     p.add_argument("--samples_per_file", type=int, default=8)
@@ -400,6 +424,11 @@ def main() -> None:
 
     # Pipeline config + modules (same as v1_preprocess_omnigame_ti2v_controlnet.py)
     pipeline_config = PipelineConfig.from_pretrained(model_path)
+    pipeline_config.update_config_from_dict({
+        "vae_precision": "fp32",
+        "vae_config": WanVAEConfig(load_encoder=True, load_decoder=False),
+        "text_encoder_cpu_offload": False,
+    })
     fastvideo_args = FastVideoArgs(
         model_path=model_path,
         num_gpus=1,
@@ -465,6 +494,24 @@ def main() -> None:
                 if clip_dir.is_dir() and clip_dir.name.startswith("clip_start_"):
                     all_clips.append(clip_dir)
 
+    if bool(args.shuffle):
+        rng = random.Random(int(args.seed))
+        rng.shuffle(all_clips)
+        logger.info(
+            "Shuffled %d candidate clips with seed=%d before filtering/sharding",
+            len(all_clips),
+            int(args.seed),
+        )
+
+    if int(args.max_samples) > 0:
+        before = len(all_clips)
+        all_clips = all_clips[:int(args.max_samples)]
+        logger.info(
+            "Max-sample filter: %d -> %d clips before rank sharding",
+            before,
+            len(all_clips),
+        )
+
     clips = [p for i, p in enumerate(all_clips) if (i % int(args.world_size)) == int(args.rank)]
     if bool(args.skip_existing_ids) and existing_ids:
         before = len(clips)
@@ -481,6 +528,7 @@ def main() -> None:
             before - len(clips),
         )
     pbar = tqdm(clips, desc=f"interiornet->parquet[r{args.rank}/{args.world_size}]")
+    written_records = 0
 
     for clip_dir in pbar:
         window_dir = clip_dir.parent
@@ -516,6 +564,7 @@ def main() -> None:
         hd, scene_id, seq_id = _parse_scene_key(scene_key)
         cam_dir = data_root / hd / scene_id / seq_id / "cam0" / "data"
         depth_dir = data_root / hd / scene_id / seq_id / "depth0" / "data"
+        normal_dir = data_root / hd / scene_id / seq_id / "normal0" / "data"
         if not depth_dir.is_dir():
             continue
 
@@ -529,6 +578,13 @@ def main() -> None:
         depth_files = sorted([p for p in depth_dir.iterdir() if p.is_file()], key=lambda p: p.name)
         if not depth_files:
             continue
+        normal_files: list[Path] | None = None
+        if bool(args.use_normal) and normal_dir.is_dir():
+            normal_files = sorted([p for p in normal_dir.iterdir() if p.is_file()], key=lambda p: p.name)
+            if not normal_files:
+                normal_files = None
+        if bool(args.require_normal) and normal_files is None:
+            continue
 
         # Build dense per-frame paths for this clip (with clamp).
         clip_global_start = window_start + clip_start
@@ -538,6 +594,12 @@ def main() -> None:
 
         global_indices = [clip_global_start + t for t in range(int(args.clip_length))]
         depth_paths = [depth_files[min(max(gi, 0), len(depth_files) - 1)] for gi in global_indices]
+        normal_paths: list[Path] | None = None
+        if normal_files is not None:
+            normal_paths = [normal_files[min(max(gi, 0), len(normal_files) - 1)] for gi in global_indices]
+        rgb_paths: list[Path] | None = None
+        if rgb_files:
+            rgb_paths = [rgb_files[min(max(gi, 0), len(rgb_files) - 1)] for gi in global_indices]
 
         # Load mask/masked_rgb from clip dir; allow sparse indices by nearest-fill.
         mask_dir = clip_dir / "mask"
@@ -581,26 +643,31 @@ def main() -> None:
         text_emb = text_emb.detach().to("cpu", dtype=torch.float32).numpy()
 
         # ---- first frame latent ----
+        if rgb_paths is None:
+            continue
+        rgb_tchw = torch.stack(
+            [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths],
+            dim=0,
+        )
         if str(args.first_frame_source) == "masked_rgb":
             if masked_rgb_paths is None:
                 # Only possible when require_masked_rgb is False.
-                if not rgb_files:
-                    continue
-                rgb_paths = [rgb_files[min(max(gi, 0), len(rgb_files) - 1)] for gi in global_indices]
-                first_rgb = _load_rgb_frame(rgb_paths[0], int(args.max_height), int(args.max_width))
+                first_rgb = rgb_tchw[0]
             else:
                 first_rgb = _load_rgb_frame(masked_rgb_paths[0], int(args.max_height), int(args.max_width))
         else:
-            if not rgb_files:
-                continue
-            rgb_paths = [rgb_files[min(max(gi, 0), len(rgb_files) - 1)] for gi in global_indices]
-            first_rgb = _load_rgb_frame(rgb_paths[0], int(args.max_height), int(args.max_width))
+            first_rgb = rgb_tchw[0]
         first_bcthw = _to_vae_input(first_rgb[None, ...], normalize=True).to(device=device, dtype=torch.float32)
         first_lat = _encode_video_latents(vae, first_bcthw, sample_mode="mode")
         if latent_repeat != 1:
             first_lat = first_lat.repeat(1, latent_repeat, 1, 1, 1)
         first_lat = first_lat[0, :, 0].unsqueeze(0)  # 1,C,H,W
         first_lat_np = first_lat.to("cpu", dtype=torch.float32).numpy()
+
+        # ---- full RGB video latent ----
+        rgb_bcthw = _to_vae_input(rgb_tchw, normalize=True).to(device=device, dtype=torch.float32)
+        vae_lat = _encode_video_latents(vae, rgb_bcthw, sample_mode="mode")
+        vae_lat_np = vae_lat[0].to("cpu", dtype=torch.float32).numpy()
 
         # ---- control latents (depth, masked_rgb, mask) ----
         depth_tchw = _load_depth_sequence(
@@ -622,6 +689,20 @@ def main() -> None:
             ],
             dim=0,
         )
+        normal_tchw = None
+        if normal_paths is not None:
+            normal_tchw = torch.stack(
+                [
+                    _load_normal_frame(
+                        p,
+                        int(args.max_height),
+                        int(args.max_width),
+                        normal_format=str(args.normal_format),
+                    )
+                    for p in normal_paths
+                ],
+                dim=0,
+            )
         if masked_rgb_paths is not None:
             masked_rgb_tchw = torch.stack(
                 [_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in masked_rgb_paths],
@@ -630,32 +711,39 @@ def main() -> None:
         else:
             if bool(args.require_masked_rgb):
                 continue
-            if not rgb_files:
-                continue
-            rgb_paths = [rgb_files[min(max(gi, 0), len(rgb_files) - 1)] for gi in global_indices]
-            rgb_tchw = torch.stack([_load_rgb_frame(p, int(args.max_height), int(args.max_width)) for p in rgb_paths], dim=0)
             masked_rgb_tchw = rgb_tchw * mask_tchw
 
-        video_n = torch.cat(
+        control_inputs = [_to_vae_input(depth_tchw, normalize=False)]
+        if normal_tchw is not None:
+            control_inputs.append(_to_vae_input(normal_tchw, normalize=False))
+        control_inputs.extend(
             [
-                _to_vae_input(depth_tchw, normalize=False),
                 _to_vae_input(masked_rgb_tchw, normalize=True),
                 _to_vae_input(mask_tchw, normalize=False),
-            ],
-            dim=0,
-        ).to(device=device, dtype=torch.float32)
+            ]
+        )
+        video_n = torch.cat(control_inputs, dim=0).to(device=device, dtype=torch.float32)
         lat_n = _encode_video_latents(vae, video_n, sample_mode="mode").to("cpu", dtype=torch.float32)
         depth_lat = lat_n[0]
-        masked_lat = lat_n[1]
-        mask_lat = lat_n[2]
+        if normal_tchw is not None:
+            normal_lat = lat_n[1]
+            masked_lat = lat_n[2]
+            mask_lat = lat_n[3]
+        else:
+            masked_lat = lat_n[1]
+            mask_lat = lat_n[2]
         if latent_repeat != 1:
             depth_lat = depth_lat.repeat(latent_repeat, 1, 1, 1)
+            if normal_tchw is not None:
+                normal_lat = normal_lat.repeat(latent_repeat, 1, 1, 1)
             masked_lat = masked_lat.repeat(latent_repeat, 1, 1, 1)
             mask_lat = mask_lat.repeat(latent_repeat, 1, 1, 1)
-        control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
+        if normal_tchw is not None:
+            control_lat = torch.cat([depth_lat, normal_lat, masked_lat, mask_lat], dim=0)
+        else:
+            control_lat = torch.cat([depth_lat, masked_lat, mask_lat], dim=0)
         control_lat_np = control_lat.numpy()
 
-        empty_lat = np.zeros((0,), dtype=np.float32)
         record_id = f"{scene_key}/{window_dir.name}/{clip_dir.name}"
         if bool(args.skip_existing_ids) and record_id in existing_ids:
             continue
@@ -664,9 +752,9 @@ def main() -> None:
             "text_embedding_bytes": text_emb.tobytes(),
             "text_embedding_shape": list(text_emb.shape),
             "text_embedding_dtype": "float32",
-            "vae_latent_bytes": empty_lat.tobytes(),
-            "vae_latent_shape": [],
-            "vae_latent_dtype": "",
+            "vae_latent_bytes": vae_lat_np.tobytes(),
+            "vae_latent_shape": list(vae_lat_np.shape),
+            "vae_latent_dtype": "float32",
             "first_frame_latent_bytes": first_lat_np.tobytes(),
             "first_frame_latent_shape": list(first_lat_np.shape),
             "first_frame_latent_dtype": "float32",
@@ -683,6 +771,9 @@ def main() -> None:
             "fps": float(args.fps),
         }
         buffer.append(record)
+        written_records += 1
+        if int(args.target_records) > 0:
+            pbar.set_postfix(written=written_records, target=int(args.target_records))
         if bool(args.skip_existing_ids):
             existing_ids.add(record_id)
 
@@ -691,6 +782,14 @@ def main() -> None:
             writer.append_table(table)
             writer.flush(num_workers=1, write_remainder=False)
             buffer = []
+
+        if int(args.target_records) > 0 and written_records >= int(args.target_records):
+            logger.info(
+                "Reached target_records=%d on rank_%02d; stopping.",
+                int(args.target_records),
+                int(args.rank),
+            )
+            break
 
     if buffer:
         table = records_to_table(buffer, pyarrow_schema_ti2v_controlnet)

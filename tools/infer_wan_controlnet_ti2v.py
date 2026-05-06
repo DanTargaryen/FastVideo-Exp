@@ -79,6 +79,9 @@ from fastvideo.pipelines.stages.decoding import DecodingStage
 
 logger = init_logger(__name__)
 
+_MATRIXCITY_TRANSFORMS_CACHE: dict[str, dict] = {}
+_MATRIXCITY_RT_FRAME_HINT_BY_PATH: dict[str, int] = {}
+
 
 def _enable_opencv_openexr_if_needed() -> None:
     # OpenCV disables EXR support by default in some builds unless this env var
@@ -451,7 +454,13 @@ def _resize_for_crop_pil(img: Image.Image, crop_h: int, crop_w: int) -> Image.Im
 
 def _load_rgb_frame(path: Path, height: int, width: int) -> torch.Tensor:
     img = Image.open(path).convert("RGB")
-    img = _resize_for_crop_pil(img, crop_h=int(height), crop_w=int(width))
+    src_w, src_h = img.size
+    top, left, crop_h, crop_w = _get_crop_params(src_w, src_h, int(width),
+                                                 int(height))
+    # Match Diff-Factory raw inference: crop in source resolution, then resize
+    # the cropped frame with bilinear sampling.
+    img = img.crop((left, top, left + crop_w, top + crop_h)).resize(
+        (int(width), int(height)), Image.Resampling.BILINEAR)
     arr = np.asarray(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
@@ -583,30 +592,31 @@ def _load_normal_frame(path: Path, height: int, width: int) -> torch.Tensor:
         raise ValueError(f"Invalid normal shape from {path}: {tuple(n.shape)}")
     n = n[..., :3].astype(np.float32)
 
-    h0, w0 = n.shape[:2]
-    target_ratio = float(width) / float(height)
-    current_ratio = float(w0) / float(h0)
-    if current_ratio > target_ratio:
-        new_w = int(h0 * target_ratio)
-        left = max(0, (w0 - new_w) // 2)
-        n = n[:, left:left + new_w, :]
-    else:
-        new_h = int(w0 / target_ratio)
-        top = max(0, (h0 - new_h) // 2)
-        n = n[top:top + new_h, :, :]
+    # Match Diff-Factory process_normal:
+    # [0,255] -> [-1,1], OpenCV->OpenGL y/z flip, then resized crop with
+    # bilinear antialiasing.
+    if float(np.nanmax(n)) > 1.5:
+        n = n / 127.5 - 1.0
+    n[..., 1] *= -1
+    n[..., 2] *= -1
 
-    t = torch.from_numpy(n).permute(2, 0, 1).contiguous().unsqueeze(0)
-    t = torch.nn.functional.interpolate(t,
-                                        size=(int(height), int(width)),
-                                        mode="bilinear",
-                                        align_corners=False)
-    t = t[0]
-    # Match md process_normal:
-    # [0,255] -> [-1,1], then OpenCV->OpenGL style coordinate flip (y,z).
-    if float(t.max().item()) > 1.5:
-        t = t / 127.5 - 1.0
-    t[1] = -t[1]
-    t[2] = -t[2]
+    src_h, src_w = n.shape[:2]
+    top, left, crop_h, crop_w = _get_crop_params(src_w, src_h, int(width),
+                                                 int(height))
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TVF
+
+    t = torch.from_numpy(n).permute(2, 0, 1).float().contiguous()
+    t = TVF.resized_crop(
+        t,
+        int(top),
+        int(left),
+        int(crop_h),
+        int(crop_w),
+        (int(height), int(width)),
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=True,
+    )
     return t
 
 
@@ -619,6 +629,7 @@ def _load_depth_sequence(
     pmax: float,
     invert_depth: bool,
     normalization_mode: str = "md_align",
+    crop_params: tuple[int, int, int, int] | None = None,
 ) -> torch.Tensor:
     mode = str(normalization_mode).strip().lower() or "md_align"
     if mode not in {"md_align", "percentile"}:
@@ -626,6 +637,52 @@ def _load_depth_sequence(
             "normalization_mode must be one of {'md_align', 'percentile'}, "
             f"got {normalization_mode!r}"
         )
+    if mode == "md_align" and crop_params is not None:
+        # Match Diff-Factory process_depth exactly for raw MatrixCity-style data:
+        # read raw physical/normalized depth, compute global min/max before crop,
+        # then resized-crop the normalized depth condition with bilinear sampling.
+        depths_np: list[np.ndarray] = []
+        for p in depth_paths:
+            d = _read_depth_any(p).astype(np.float32)
+            if np.isfinite(d).any() and float(np.nanmax(d)) > 1.5:
+                d = d / 65535.0
+            depths_np.append(d)
+
+        stacked = np.stack(depths_np, axis=0)
+        finite = np.isfinite(stacked)
+        if finite.any():
+            stacked = np.where(finite, stacked, float(np.nanmax(stacked[finite])))
+            global_min = float(np.nanmin(stacked))
+            global_max = float(np.nanmax(stacked))
+        else:
+            stacked = np.zeros_like(stacked, dtype=np.float32)
+            global_min, global_max = 0.0, 1.0
+
+        top, left, crop_h, crop_w = crop_params
+        outputs = []
+        denom = float(global_max - global_min) + 1e-8
+        for d in stacked:
+            dn = (d - global_min) / denom
+            dn = np.nan_to_num(dn, nan=1.0)
+            dn = dn * 2.0 - 1.0
+            if invert_depth:
+                dn = -dn
+            from torchvision.transforms import InterpolationMode
+            from torchvision.transforms import functional as TVF
+
+            t = torch.from_numpy(dn).float().unsqueeze(0)
+            t = TVF.resized_crop(
+                t,
+                int(top),
+                int(left),
+                int(crop_h),
+                int(crop_w),
+                (int(height), int(width)),
+                interpolation=InterpolationMode.BILINEAR,
+            )[0]
+            outputs.append(t.unsqueeze(0).repeat(3, 1, 1))
+        return torch.stack(outputs, dim=0)
+
     target_ratio = float(width) / float(height)
     depths: list[np.ndarray] = []
     for p in depth_paths:
@@ -697,6 +754,15 @@ def _to_vae_input(video_tchw: torch.Tensor, *, normalize: bool) -> torch.Tensor:
 
 
 def _postprocess_vae_latents(vae, latents: torch.Tensor) -> torch.Tensor:
+    if (hasattr(vae, "config") and hasattr(vae.config, "latents_mean")
+            and hasattr(vae.config, "latents_std")):
+        mean = torch.tensor(vae.config.latents_mean,
+                            device=latents.device,
+                            dtype=latents.dtype).view(1, -1, 1, 1, 1)
+        std = torch.tensor(vae.config.latents_std,
+                           device=latents.device,
+                           dtype=latents.dtype).view(1, -1, 1, 1, 1)
+        return (latents - mean) / std
     if hasattr(vae, "shift_factor") and vae.shift_factor is not None:
         shift = vae.shift_factor
         if isinstance(shift, torch.Tensor):
@@ -1504,9 +1570,52 @@ def _get_crop_params(src_w: int, src_h: int,
     return int(top), int(left), int(crop_h), int(crop_w)
 
 
+def _load_matrixcity_transforms(path: Path) -> dict:
+    key = str(path.resolve())
+    if key not in _MATRIXCITY_TRANSFORMS_CACHE:
+        _MATRIXCITY_TRANSFORMS_CACHE[key] = json.loads(path.read_text(encoding="utf-8"))
+    return _MATRIXCITY_TRANSFORMS_CACHE[key]
+
+
+def _load_matrixcity_intrinsics(path: Path) -> np.ndarray:
+    obj = _load_matrixcity_transforms(path)
+    w = float(obj.get("w", obj.get("width", 512.0)))
+    h = float(obj.get("h", obj.get("height", 512.0)))
+    angle_x = float(obj["camera_angle_x"])
+    fl_x = float(0.5 * w / np.tan(0.5 * angle_x))
+    return np.array([[fl_x, 0.0, w / 2.0], [0.0, fl_x, h / 2.0],
+                     [0.0, 0.0, 1.0]],
+                    dtype=np.float32)
+
+
+def _load_matrixcity_w2c(path: Path, frame_idx: int) -> np.ndarray:
+    obj = _load_matrixcity_transforms(path)
+    frames = obj.get("frames", [])
+    frame = None
+    for cand in frames:
+        if int(cand.get("frame_index", -1)) == int(frame_idx):
+            frame = cand
+            break
+    if frame is None:
+        raise FileNotFoundError(
+            f"MatrixCity transforms frame_index={int(frame_idx)} not found in {path}"
+        )
+    c2w = np.array(frame["rot_mat"], dtype=np.float32)
+    # Match UniDataset MatrixcitySequence.load_scene_meta.
+    c2w[:3, :3] *= 100.0
+    c2w[:3, 3] /= 100.0
+    return np.linalg.inv(c2w).astype(np.float32)
+
+
 def _load_camera_matrix(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"camera matrix not found: {path}")
+    if path.suffix.lower() == ".json":
+        key = str(path.resolve())
+        frame_idx = _MATRIXCITY_RT_FRAME_HINT_BY_PATH.pop(key, None)
+        if frame_idx is not None:
+            return _load_matrixcity_w2c(path, int(frame_idx))
+        return _load_matrixcity_intrinsics(path)
     if path.suffix.lower() == ".npy":
         return np.load(path)
     return np.loadtxt(path)
@@ -1561,6 +1670,9 @@ def _aligned_physical_depth(
 
 
 def _resolve_camera_rt_path(camera_rt_dir: Path, frame_idx: int) -> Path:
+    if camera_rt_dir.is_file() and camera_rt_dir.suffix.lower() == ".json":
+        _MATRIXCITY_RT_FRAME_HINT_BY_PATH[str(camera_rt_dir.resolve())] = int(frame_idx)
+        return camera_rt_dir
     candidates = [
         camera_rt_dir / f"camera_RT_{int(frame_idx):04d}.txt",
         camera_rt_dir / f"{int(frame_idx):04d}.txt",
@@ -1701,6 +1813,100 @@ class _PointCloudWarper:
         mask[v_v[sort_idx], u_v[sort_idx]] = 255
         return img, mask
 
+    @staticmethod
+    def backward_warp(
+        tgt_depth: np.ndarray,
+        tgt_K: np.ndarray,
+        tgt_Rt: np.ndarray,
+        src_rgb: np.ndarray,
+        src_depth: np.ndarray,
+        src_K: np.ndarray,
+        src_Rt: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Match Diff-Factory backwarp: target depth -> source image remap."""
+        import cv2
+
+        out_h, out_w = tgt_depth.shape
+        u_tgt, v_tgt = np.meshgrid(np.arange(out_w), np.arange(out_h))
+
+        finite_tgt = np.isfinite(tgt_depth)
+        bg_val = float(np.nanmax(tgt_depth[finite_tgt])) if np.any(finite_tgt) else 0.0
+        valid_tgt_mask = finite_tgt & (tgt_depth > 0.0)
+        if bg_val > 1e-8:
+            valid_tgt_mask = valid_tgt_mask & (tgt_depth < bg_val * 0.99)
+
+        u_tgt_v = u_tgt[valid_tgt_mask]
+        v_tgt_v = v_tgt[valid_tgt_mask]
+        z_tgt_v = tgt_depth[valid_tgt_mask]
+        if len(u_tgt_v) == 0:
+            return (np.zeros((out_h, out_w, 3), dtype=np.uint8),
+                    np.zeros((out_h, out_w), dtype=np.float32))
+
+        fx_t, fy_t = tgt_K[0, 0], tgt_K[1, 1]
+        cx_t, cy_t = tgt_K[0, 2], tgt_K[1, 2]
+        x_cam_tgt = (u_tgt_v - cx_t) * z_tgt_v / fx_t
+        y_cam_tgt = -((v_tgt_v - cy_t) * z_tgt_v / fy_t)
+        z_cam_tgt = -z_tgt_v
+        p_cam_tgt = np.stack((x_cam_tgt, y_cam_tgt, z_cam_tgt), axis=-1)
+
+        R_tgt = tgt_Rt[:3, :3]
+        T_tgt = tgt_Rt[:3, 3]
+        points_world = (p_cam_tgt - T_tgt[None, :]) @ np.linalg.inv(R_tgt).T
+
+        R_src = src_Rt[:3, :3]
+        T_src = src_Rt[:3, 3]
+        p_cam_src = (points_world @ R_src.T) + T_src[None, :]
+
+        fx_s, fy_s = src_K[0, 0], src_K[1, 1]
+        cx_s, cy_s = src_K[0, 2], src_K[1, 2]
+        zs_src = -p_cam_src[:, 2]
+        valid_proj = np.isfinite(zs_src) & (zs_src > 0.05)
+        zs_safe = np.where(valid_proj, zs_src, 1e-6)
+        u_src_proj = fx_s * (p_cam_src[:, 0] / zs_safe) + cx_s
+        v_src_proj = fy_s * (-p_cam_src[:, 1] / zs_safe) + cy_s
+
+        map_u = np.full((out_h, out_w), -1.0, dtype=np.float32)
+        map_v = np.full((out_h, out_w), -1.0, dtype=np.float32)
+        map_u[valid_tgt_mask] = u_src_proj.astype(np.float32)
+        map_v[valid_tgt_mask] = v_src_proj.astype(np.float32)
+
+        warped_rgb = cv2.remap(
+            src_rgb,
+            map_u,
+            map_v,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        sampled_src_depth = cv2.remap(
+            src_depth,
+            map_u,
+            map_v,
+            interpolation=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        zs_s_full = np.zeros((out_h, out_w), dtype=np.float32)
+        zs_s_full[valid_tgt_mask] = zs_src.astype(np.float32)
+
+        finite_src = np.isfinite(src_depth)
+        src_bg_val = float(np.nanmax(src_depth[finite_src])) if np.any(finite_src) else 0.0
+        is_src_valid_geometry = np.isfinite(sampled_src_depth) & (sampled_src_depth > 0.0)
+        if src_bg_val > 1e-8:
+            is_src_valid_geometry = is_src_valid_geometry & (
+                sampled_src_depth < src_bg_val * 0.99)
+        margin = np.minimum(sampled_src_depth * 0.02, 0.1)
+        depth_matched = (
+            (zs_s_full <= sampled_src_depth + margin)
+            & (zs_s_full >= sampled_src_depth - margin)
+        )
+        is_front = zs_s_full > 0.05
+
+        final_mask = valid_tgt_mask & is_src_valid_geometry & depth_matched & is_front
+        warped_rgb[~final_mask] = 0
+        return warped_rgb.astype(np.uint8), final_mask.astype(np.float32) * 255.0
+
 
 def _warp_maskrgb_from_keyframes(
     *,
@@ -1716,7 +1922,7 @@ def _warp_maskrgb_from_keyframes(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     warper = _PointCloudWarper()
 
-    source_clouds: list[tuple[np.ndarray, np.ndarray]] = []
+    source_views: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     for src_rgb, src_id in zip(keyframe_rgbs_u8, keyframe_frame_ids):
         if int(src_id) not in depth_path_by_frame_id:
             raise KeyError(f"Missing depth path for source frame id {int(src_id)}")
@@ -1728,8 +1934,7 @@ def _warp_maskrgb_from_keyframes(
         )
         src_rt = _load_camera_matrix(
             _resolve_camera_rt_path(camera_rt_dir, int(src_id)))
-        source_clouds.append(
-            warper.back_project(src_rgb, src_depth, camera_k_aligned, src_rt))
+        source_views.append((src_rgb, src_depth, src_rt))
 
     merged_rgb_tensors: list[torch.Tensor] = []
     merged_mask_tensors: list[torch.Tensor] = []
@@ -1747,15 +1952,15 @@ def _warp_maskrgb_from_keyframes(
 
         merged_rgb = np.zeros((target_height, target_width, 3), dtype=np.uint8)
         merged_mask = np.zeros((target_height, target_width), dtype=np.uint8)
-        for points_world, colors in source_clouds:
-            w_rgb, w_mask = warper.project_to_view(
-                points_world,
-                colors,
-                camera_k_aligned,
-                tgt_rt,
-                target_height,
-                target_width,
-                target_depth=tgt_depth,
+        for src_rgb, src_depth, src_rt in source_views:
+            w_rgb, w_mask = warper.backward_warp(
+                tgt_depth=tgt_depth,
+                tgt_K=camera_k_aligned,
+                tgt_Rt=tgt_rt,
+                src_rgb=src_rgb,
+                src_depth=src_depth,
+                src_K=camera_k_aligned,
+                src_Rt=src_rt,
             )
             valid = w_mask > 127
             merged_rgb[valid] = w_rgb[valid]
@@ -1952,7 +2157,9 @@ def _load_raw_long_sequence(
     ) if str(args.cam_k).strip() else (sample_root / "camera" / "camera_K.txt")
     camera_rt_dir = Path(str(args.cam_rt_dir)).expanduser(
     ) if str(args.cam_rt_dir).strip() else (sample_root / "camera")
-    if not camera_rt_dir.is_dir():
+    if not (camera_rt_dir.is_dir() or (
+            camera_rt_dir.is_file()
+            and camera_rt_dir.suffix.lower() == ".json")):
         raise FileNotFoundError(f"camera RT dir not found: {camera_rt_dir}")
     camera_k = _load_camera_matrix(cam_k_path).astype(np.float32)
 
@@ -2259,31 +2466,21 @@ def _causal_dmd_rollout_one_window_with_cache(
 
                 if guidance_scale != 1.0:
                     if (negative_prompt_embeds_list is None or
-                            kv_cache_uncond is None or crossattn_cache_uncond is None
-                            or control_kv_cache_uncond is None
-                            or control_crossattn_cache_uncond is None):
+                            kv_cache_uncond is None or crossattn_cache_uncond is None):
                         raise ValueError(
                             "guidance_scale != 1.0 requires unconditional embeddings and caches."
                         )
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        control_res_uncond = controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=negative_prompt_embeds_list,
-                            timestep=timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache_uncond,
-                            crossattn_cache=control_crossattn_cache_uncond,
-                            current_start=current_start_abs,
-                            start_frame=start_frame_abs,
-                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_uncond,
+                            # Diff-Factory computes ControlNet once with the
+                            # positive prompt and reuses the same residual for
+                            # the CFG negative branch.
+                            block_controlnet_hidden_states=control_res_cond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=current_start_abs,
@@ -2467,9 +2664,7 @@ def _causal_dmd_rollout_one_window_with_cache(
                 )
                 if guidance_scale != 1.0:
                     if (negative_prompt_embeds_list is None or
-                            kv_cache_uncond is None or crossattn_cache_uncond is None
-                            or control_kv_cache_uncond is None
-                            or control_crossattn_cache_uncond is None):
+                            kv_cache_uncond is None or crossattn_cache_uncond is None):
                         raise ValueError(
                             "guidance_scale != 1.0 requires unconditional embeddings and caches."
                         )
@@ -2679,6 +2874,7 @@ def _run_causal_long_warp_rollout(
             invert_depth=bool(args.raw_depth_invert),
             normalization_mode=str(getattr(args, "raw_depth_normalization_mode",
                                            "md_align")),
+            crop_params=sequence.crop_params,
         )
         normal_tchw = None
         if sequence.normal_paths is not None:
@@ -3339,22 +3535,14 @@ def _causal_dmd_rollout_ti2v_controlnet(
                     with set_forward_context(current_timestep=int(step_index),
                                              attn_metadata=None,
                                              forward_batch=batch):
-                        control_res_uncond = controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=negative_prompt_embeds_list,
-                            timestep=timestep,
-                            **_build_controlnet_kwargs(controlnet, control_chunk,
-                                                       num_channels_latents),
-                            kv_cache=control_kv_cache_uncond,
-                            crossattn_cache=control_crossattn_cache_uncond,
-                            current_start=start_index * frame_seq_length,
-                            start_frame=start_index,
-                        )
                         pred_flow_uncond_btchw = transformer(
                             latent_model_input,
                             negative_prompt_embeds_list,
                             timestep,
-                            block_controlnet_hidden_states=control_res_uncond,
+                            # Match Diff-Factory Wan ControlNet CFG: the
+                            # uncond branch uses the same ControlNet residual
+                            # computed from the positive prompt.
+                            block_controlnet_hidden_states=control_res_cond,
                             kv_cache=kv_cache_uncond,
                             crossattn_cache=crossattn_cache_uncond,
                             current_start=start_index * frame_seq_length,
@@ -3776,13 +3964,9 @@ def _bidirectional_dmd_rollout_ti2v_controlnet(
             noise_uncond = None
             control_res_uncond = None
             if float(guidance_scale) != 1.0:
-                control_res_uncond = controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=negative_prompt_embeds_list,
-                    timestep=timestep,
-                    **_build_controlnet_kwargs(controlnet, control_latent_bcfhw,
-                                               num_channels_latents),
-                )
+                # Diff-Factory runs ControlNet only once with the positive
+                # prompt, then reuses that residual for the negative branch.
+                control_res_uncond = control_res
                 noise_uncond = transformer(
                     latent_model_input,
                     negative_prompt_embeds_list,
@@ -3889,8 +4073,8 @@ def _compute_negative_prompt_embeddings(
             return_tensors="pt",
         )
         prompt_embeds = text_encoder(
-            tokens.input_ids.to(encoder_device),
-            tokens.attention_mask.to(encoder_device),
+            input_ids=tokens.input_ids.to(encoder_device),
+            attention_mask=tokens.attention_mask.to(encoder_device),
         ).last_hidden_state
 
     seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())
@@ -3926,8 +4110,8 @@ def _compute_prompt_embeddings(
             return_tensors="pt",
         )
         prompt_embeds = text_encoder(
-            tokens.input_ids.to(encoder_device),
-            tokens.attention_mask.to(encoder_device),
+            input_ids=tokens.input_ids.to(encoder_device),
+            attention_mask=tokens.attention_mask.to(encoder_device),
         ).last_hidden_state
 
     seq_len = int(tokens.attention_mask.sum(dim=1)[0].item())
@@ -4575,13 +4759,16 @@ def main() -> None:
     # Ensure we don't trigger Wan2.2 "transformer_2" boundary logic for TI2V.
     fastvideo_args.pipeline_config.dit_config.boundary_ratio = None
     if args.attention_mode == "bidirectional":
-        # Diff-Factory Wan Union inference defaults to the non-expanded TI2V path.
+        # Diff-Factory Wan Union inference inherits the base Wan2.2 TI2V
+        # pipeline setting (`model_index.json`: expand_timesteps=true).
+        # This injects the first-frame latent through a framewise timestep mask
+        # instead of concatenating an image-latent channel branch.
         if hasattr(fastvideo_args.pipeline_config, "expand_timesteps"):
-            fastvideo_args.pipeline_config.expand_timesteps = False
+            fastvideo_args.pipeline_config.expand_timesteps = True
         if hasattr(fastvideo_args.pipeline_config, "dit_config"):
-            fastvideo_args.pipeline_config.dit_config.expand_timesteps = False
+            fastvideo_args.pipeline_config.dit_config.expand_timesteps = True
         logger.info(
-            "bidir alignment: forcing expand_timesteps=False to match Diff-Factory Wan ControlNet inference."
+            "bidir alignment: forcing expand_timesteps=True to match Diff-Factory Wan2.2 TI2V inference."
         )
     fastvideo_args.pipeline_config.warp_denoising_step = bool(
         args.warp_denoising_step)

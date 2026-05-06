@@ -356,14 +356,12 @@ def main() -> None:
     decoded_depth = _decode(depth_lat)
     decoded_masked = _decode(masked_lat)
     decoded_mask = _decode(mask_lat)
+    # Mask is encoded from a repeated 3-channel image; average channels for a
+    # stable grayscale visualization, both before binarization and in raw mode.
+    decoded_mask = decoded_mask.mean(dim=1, keepdim=True)
     if float(args.mask_binarize_threshold) >= 0.0:
         thr = float(args.mask_binarize_threshold)
-        # Aggregate channels before thresholding for stable binary masks.
-        # mask was encoded from repeated 3-channel input, but decode may have
-        # small per-channel deviations.
-        decoded_mask_1c = decoded_mask.mean(dim=1, keepdim=True)
-        decoded_mask_1c = (decoded_mask_1c >= thr).to(decoded_mask.dtype)
-        decoded_mask = decoded_mask_1c.repeat(1, decoded_mask.shape[1], 1, 1, 1)
+        decoded_mask = (decoded_mask >= thr).to(decoded_mask.dtype)
 
     _save_video(decoded_depth, out_dir / "depth.mp4", args.fps, as_gray=True)
     _save_video(decoded_masked, out_dir / "masked_rgb.mp4", args.fps, as_gray=False)
